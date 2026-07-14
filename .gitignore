@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.env
+.env.docker
+.env.local
+keys/
+storage/
+*.log
+.DS_Store

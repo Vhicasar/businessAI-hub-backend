@@ -1,0 +1,70 @@
+# BusinessHub AI (product) — production stack.
+#
+# Runs its OWN Postgres + the API (GHCR image) + the web app (GHCR image). The
+# API syncs pricing from the Vhicasar Admin (ADMIN_API_URL). The web app's nginx
+# proxies /api and /socket.io to the API, so it's served on one domain.
+#
+# On the shared VPS, prefer ADDING these three services to your existing
+# docker-compose.yml (the one with Caddy) so Caddy can reverse_proxy
+# `agentv-web:80` by name. This file is the standalone/reference version.
+#
+#   cp deploy/.env.example .env      # fill values on the VPS
+#   docker compose -f deploy/docker-compose.prod.yml --env-file .env up -d
+#   # first-time only — seed permissions/roles/plans:
+#   docker compose -f deploy/docker-compose.prod.yml --env-file .env \
+#     run --rm agentv-backend npm run seed
+
+services:
+  agentv-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: businesshub
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: businesshub
+    volumes:
+      - agentv_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U businesshub -d businesshub"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  agentv-backend:
+    image: ghcr.io/${GHCR_OWNER}/agentv-backend:latest
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "4000"
+      DATABASE_URL: postgresql://businesshub:${DB_PASSWORD}@agentv-postgres:5432/businesshub?schema=public
+      API_BASE_URL: https://${APP_DOMAIN}
+      WEB_APP_URL: https://${APP_DOMAIN}
+      CORS_ORIGINS: https://${APP_DOMAIN}
+      JWT_ALG: HS256
+      JWT_SECRET: ${JWT_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      AI_PROVIDER: ${AI_PROVIDER:-none}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-}
+      BILLING_CURRENCY: ${BILLING_CURRENCY:-NGN}
+      PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY:-}
+      PAYSTACK_PUBLIC_KEY: ${PAYSTACK_PUBLIC_KEY:-}
+      # Reads pricing + quota limits from the Vhicasar Admin.
+      ADMIN_API_URL: ${ADMIN_API_URL:-https://admin.vhicasar.com}
+      ADMIN_TENANT_SLUG: businesshub-ai
+      ADMIN_PLAN_SYNC: "true"
+    depends_on:
+      agentv-postgres:
+        condition: service_healthy
+
+  agentv-web:
+    image: ghcr.io/${GHCR_OWNER}/agentv-web:latest
+    restart: unless-stopped
+    environment:
+      # nginx template proxies /api + /socket.io to this upstream.
+      API_UPSTREAM: agentv-backend:4000
+    depends_on:
+      - agentv-backend
+
+volumes:
+  agentv_pgdata:

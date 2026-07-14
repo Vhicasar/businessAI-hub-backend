@@ -1,0 +1,64 @@
+name: CD
+
+# BusinessHub AI backend: build → publish image to GHCR → deploy to VPS.
+# (CI tests live in ci.yml.)
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  publish:
+    name: Build & push image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute lowercase image name
+        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to VPS
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check VPS secrets
+        id: cfg
+        run: |
+          if [ -n "${{ secrets.VPS_HOST }}" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Image published to GHCR, but VPS deploy was skipped — set VPS_HOST/VPS_USER/VPS_SSH_KEY (and GHCR_TOKEN) secrets in THIS repo to enable auto-deploy."
+          fi
+      - name: SSH — pull & restart agentv-backend
+        if: steps.cfg.outputs.ready == 'true'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          script: |
+            cd ${{ secrets.VPS_APP_DIR || '/opt/vhicasar-admin' }}
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker compose pull agentv-backend
+            docker compose up -d agentv-backend
+            docker image prune -f
