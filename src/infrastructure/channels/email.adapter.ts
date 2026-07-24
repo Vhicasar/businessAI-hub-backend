@@ -39,7 +39,7 @@ export class EmailAdapter implements ChannelAdapter {
     const info = await transport.sendMail({
       from: c.fromAddress || c.smtpUser || c.imapUser,
       to: payload.recipientExternalId,
-      subject: 'Re: your message',
+      subject: payload.subject || (payload.isMarketing ? 'Update from our team' : 'Re: your message'),
       text: payload.text,
     });
     return { providerMessageId: info.messageId ?? `mail_${Date.now()}` };

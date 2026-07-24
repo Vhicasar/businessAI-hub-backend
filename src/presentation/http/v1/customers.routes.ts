@@ -3,7 +3,10 @@ import { validate } from '../middleware/validate';
 import { authenticate, requireTenant } from '../middleware/authenticate';
 import { requirePermission } from '../middleware/require-permission';
 import { enforceLimit } from '../middleware/plan-guard';
+import { z } from 'zod';
+import type { ChannelType } from '@prisma/client';
 import { customersService } from '../../../application/customers/customers.service';
+import { inboxService } from '../../../application/inbox/inbox.service';
 import {
   addressSchema,
   createCustomerSchema,
@@ -47,6 +50,39 @@ customersRoutes.get(
   requirePermission('customers.read'),
   wrap(async (req, res) => {
     const data = await customersService.get(req.params.id as string);
+    res.json({ success: true, data });
+  })
+);
+
+customersRoutes.get(
+  '/:id/overview',
+  requirePermission('customers.read'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await customersService.overview(req.params.id as string) });
+  })
+);
+
+// Communication channels linked to this customer + their conversations.
+customersRoutes.get(
+  '/:id/channels',
+  requirePermission('customers.read', 'inbox.read'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await inboxService.customerChannels(req.params.id as string) });
+  })
+);
+
+// Start or continue a conversation with this customer on a channel.
+customersRoutes.post(
+  '/:id/chat',
+  requirePermission('inbox.reply'),
+  validate({ body: z.object({ channelType: z.string().min(1), text: z.string().trim().min(1).max(4000) }) }),
+  wrap(async (req, res) => {
+    const data = await inboxService.startOrContinue(
+      req.params.id as string,
+      req.body.channelType as ChannelType,
+      req.body.text,
+      req.auth!.userId
+    );
     res.json({ success: true, data });
   })
 );

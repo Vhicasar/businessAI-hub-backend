@@ -19,6 +19,10 @@ export interface OutboundPayload {
   /** Conversation partner's provider-side id. */
   recipientExternalId: string;
   text: string;
+  subject?: string;
+  isMarketing?: boolean;
+  templateName?: string;
+  templateLanguage?: string;
 }
 
 export interface SendResult {
@@ -29,6 +33,7 @@ export interface WebhookRequestLike {
   headers: Record<string, string | string[] | undefined>;
   body: unknown;
   query: Record<string, unknown>;
+  rawBody?: Buffer;
 }
 
 export interface ChannelAccountRef {

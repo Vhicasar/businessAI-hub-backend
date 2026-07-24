@@ -5,9 +5,13 @@ import { env } from '../../shared/config/env';
 import { logger } from '../../shared/logger';
 import { AppError, NotFoundError } from '../../shared/errors';
 import { paystack } from '../../infrastructure/payments/paystack';
+import { toPriceBook } from '../../shared/billing-currency';
+import { exchangeRates, type MoneyConversion } from '../../shared/exchange-rates';
 import { resolveEntitlements, currentOrgId } from './entitlements';
 import { usageService, USAGE_METRICS } from './usage.service';
 import { ensureFreshPlans } from './plan-sync';
+import { smsWalletService } from './sms-wallet.service';
+import { addOnsService } from './add-ons.service';
 
 export const checkoutSchema = z.object({
   planSlug: z.string().min(1),
@@ -39,12 +43,32 @@ function planDto(p: Plan) {
       maxProducts: p.maxProducts,
       maxChannels: p.maxChannels,
       maxContacts: p.maxContacts,
+      maxMarketingReach: p.maxMarketingReach,
       aiCreditsMonthly: p.aiCreditsMonthly,
     },
     features: Array.isArray(p.features) ? (p.features as string[]) : [],
     isPublic: p.isPublic,
     isActive: p.isActive,
     position: p.position,
+  };
+}
+
+async function preferredPlanDto(p: Plan, currency: string) {
+  const book = toPriceBook(p.prices);
+  const exact = book[currency];
+  const monthly = exact
+    ? exact.monthly
+    : (await exchangeRates.convert(Number(p.priceMonthly), p.currency, currency)).amount;
+  const yearly = exact
+    ? exact.yearly
+    : (await exchangeRates.convert(Number(p.priceYearly), p.currency, currency)).amount;
+  return {
+    ...planDto(p),
+    priceMonthly: monthly,
+    priceYearly: yearly,
+    currency,
+    sourceCurrency: p.currency,
+    converted: p.currency !== currency && !exact,
   };
 }
 
@@ -69,7 +93,11 @@ export const billingService = {
       where: { isActive: true },
       orderBy: { position: 'asc' },
     });
-    return plans.map(planDto);
+    const org = await prismaUnscoped.organization.findUniqueOrThrow({
+      where: { id: currentOrgId() },
+      select: { currency: true },
+    });
+    return Promise.all(plans.map((plan) => preferredPlanDto(plan, org.currency)));
   },
 
   /** Current subscription + plan + live usage/limits for the billing page. */
@@ -79,21 +107,32 @@ export const billingService = {
     const ent = await resolveEntitlements(orgId);
 
     const period = { organizationId: orgId, periodStart: ent.periodStart, periodEnd: ent.periodEnd };
-    const [aiUsed, users, channels, contacts, products, branches, plan] = await Promise.all([
+    const [aiUsed, users, channels, contacts, products, smsCredits, marketingReach, plan, latestSubscription] = await Promise.all([
       usageService.get(USAGE_METRICS.AI_RESPONSE, period),
       prismaUnscoped.membership.count({ where: { organizationId: orgId, isActive: true, deletedAt: null } }),
       prismaUnscoped.channelAccount.count({ where: { organizationId: orgId } }),
       prismaUnscoped.customer.count({ where: { organizationId: orgId, deletedAt: null } }),
       prismaUnscoped.product.count({ where: { organizationId: orgId } }),
-      prismaUnscoped.branch.count({ where: { organizationId: orgId } }),
+      smsWalletService.usage(orgId, ent.periodStart, ent.periodEnd),
+      usageService.get(USAGE_METRICS.MARKETING_RECIPIENT, period),
       prismaUnscoped.plan.findUnique({ where: { id: ent.planId } }).catch(() => null),
+      prismaUnscoped.subscription.findFirst({
+        where: { organizationId: orgId },
+        orderBy: { createdAt: 'desc' },
+        include: { plan: true },
+      }),
     ]);
 
+    const org = await prismaUnscoped.organization.findUniqueOrThrow({
+      where: { id: orgId },
+      select: { currency: true },
+    });
     return {
-      plan: plan ? planDto(plan) : { name: ent.planName, slug: ent.planSlug },
+      plan: plan ? await preferredPlanDto(plan, org.currency) : { name: ent.planName, slug: ent.planSlug },
       status: ent.status,
       period: { start: ent.periodStart, end: ent.periodEnd },
       subscription: ent.subscription ? subscriptionDto(ent.subscription) : null,
+      lastSubscription: !ent.subscription && latestSubscription ? subscriptionDto(latestSubscription) : null,
       features: [...ent.features],
       usage: {
         aiResponses: { used: aiUsed, limit: ent.limits.aiCreditsMonthly },
@@ -101,7 +140,8 @@ export const billingService = {
         channels: { used: channels, limit: ent.limits.maxChannels },
         contacts: { used: contacts, limit: ent.limits.maxContacts },
         products: { used: products, limit: ent.limits.maxProducts },
-        branches: { used: branches, limit: ent.limits.maxBranches },
+        smsCredits,
+        marketingReach: { used: marketingReach, limit: plan?.maxMarketingReach ?? null },
       },
       paystackEnabled: env.billing.paystackEnabled,
     };
@@ -110,21 +150,32 @@ export const billingService = {
   /** Billing history (paid invoices) for the current org. */
   async history() {
     const orgId = currentOrgId();
-    const records = await prismaUnscoped.billingRecord.findMany({
-      where: { subscription: { organizationId: orgId } },
-      orderBy: { createdAt: 'desc' },
-      take: 50,
-    });
-    return records.map((r) => ({
-      id: r.id,
-      amount: Number(r.amount),
-      currency: r.currency,
-      status: r.status,
-      periodStart: r.periodStart,
-      periodEnd: r.periodEnd,
-      provider: r.provider,
-      paidAt: r.paidAt,
-      createdAt: r.createdAt,
+    const [records, org] = await Promise.all([
+      prismaUnscoped.billingRecord.findMany({
+        where: { subscription: { organizationId: orgId } },
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+      }),
+      prismaUnscoped.organization.findUniqueOrThrow({
+        where: { id: orgId },
+        select: { currency: true },
+      }),
+    ]);
+    return Promise.all(records.map(async (r) => {
+      const converted = await exchangeRates.convert(Number(r.amount), r.currency, org.currency);
+      return {
+        id: r.id,
+        amount: converted.amount,
+        currency: converted.currency,
+        chargedAmount: Number(r.amount),
+        chargedCurrency: r.currency,
+        status: r.status,
+        periodStart: r.periodStart,
+        periodEnd: r.periodEnd,
+        provider: r.provider,
+        paidAt: r.paidAt,
+        createdAt: r.createdAt,
+      };
     }));
   },
 
@@ -140,7 +191,36 @@ export const billingService = {
       throw new AppError('CONTACT_SALES', 400, 'This plan is custom — please contact sales.');
     }
 
-    const price = Number(dto.interval === 'YEARLY' ? plan.priceYearly : plan.priceMonthly);
+    const org = await prismaUnscoped.organization.findUnique({
+      where: { id: orgId },
+      select: { currency: true },
+    });
+    const preferredCurrency = org?.currency.toUpperCase() ?? plan.currency.toUpperCase();
+    if (!env.billing.chargeCurrencies.includes(preferredCurrency)) {
+      throw new AppError(
+        'PREFERRED_CURRENCY_NOT_SETTLEABLE',
+        400,
+        `Checkout in ${preferredCurrency} is not enabled for this payment account. Ask an administrator to enable ${preferredCurrency} settlement or choose another preferred currency.`,
+      );
+    }
+    const book = toPriceBook(plan.prices);
+    const exact = book[preferredCurrency];
+    const exactAmount = exact
+      ? (dto.interval === 'YEARLY' ? exact.yearly : exact.monthly)
+      : null;
+    const baseAmount = dto.interval === 'YEARLY' ? Number(plan.priceYearly) : Number(plan.priceMonthly);
+    const charge: MoneyConversion = exactAmount !== null
+      ? {
+          amount: exactAmount,
+          currency: preferredCurrency,
+          sourceAmount: exactAmount,
+          sourceCurrency: preferredCurrency,
+          rate: 1,
+          snapshotId: null,
+          asOf: new Date(),
+        }
+      : await exchangeRates.convert(baseAmount, plan.currency, preferredCurrency, { forCharge: true });
+    const price = charge.amount;
 
     // Free plan → activate right away, no payment.
     if (price <= 0) {
@@ -160,16 +240,31 @@ export const billingService = {
     const reference = `bh_${orgId.slice(0, 8)}_${Date.now().toString(36)}`;
     const init = await paystack.initializeTransaction({
       email,
-      amount: Math.round(price * 100), // kobo
+      // Paystack takes the smallest unit (kobo, cents, pesewas).
+      amount: Math.round(price * 100),
       reference,
-      currency: plan.currency,
-      metadata: { organizationId: orgId, planId: plan.id, interval: dto.interval, kind: 'subscription' },
+      currency: charge.currency,
+      metadata: {
+        organizationId: orgId,
+        planId: plan.id,
+        interval: dto.interval,
+        kind: 'subscription',
+        chargeCurrency: charge.currency,
+        sourceAmount: charge.sourceAmount,
+        sourceCurrency: charge.sourceCurrency,
+        exchangeRate: charge.rate,
+        exchangeRateSnapshotId: charge.snapshotId,
+        exchangeRateAsOf: charge.asOf.toISOString(),
+      },
     });
 
     return {
       type: 'checkout' as const,
       authorizationUrl: init.authorizationUrl,
       reference: init.reference,
+      // So the UI can say "charged in USD" before the customer is surprised.
+      amount: price,
+      currency: charge.currency,
     };
   },
 
@@ -188,6 +283,12 @@ export const billingService = {
     }
 
     const meta = (txn.metadata ?? {}) as Record<string, unknown>;
+    if (meta.kind === 'sms_wallet') {
+      return smsWalletService.verifyPurchase(reference);
+    }
+    if (meta.kind === 'add_on') {
+      return addOnsService.verify(reference);
+    }
     const organizationId = String(meta.organizationId ?? '');
     const planId = String(meta.planId ?? '');
     const interval = (meta.interval === 'YEARLY' ? 'YEARLY' : 'MONTHLY') as Interval;
@@ -202,6 +303,11 @@ export const billingService = {
       amount: txn.amount / 100,
       providerRef: reference,
       providerCustomerCode: txn.customerCode,
+      currency: txn.currency,
+      sourceAmount: Number(meta.sourceAmount ?? txn.amount / 100),
+      sourceCurrency: String(meta.sourceCurrency ?? txn.currency),
+      exchangeRate: Number(meta.exchangeRate ?? 1),
+      exchangeRateSnapshotId: meta.exchangeRateSnapshotId ? String(meta.exchangeRateSnapshotId) : null,
     });
     return { activated: true, alreadyProcessed: false };
   },
@@ -259,6 +365,11 @@ export const billingService = {
     amount: number;
     providerRef?: string;
     providerCustomerCode?: string | null;
+    currency?: string;
+    sourceAmount?: number;
+    sourceCurrency?: string;
+    exchangeRate?: number;
+    exchangeRateSnapshotId?: string | null;
   }): Promise<Subscription & { plan: Plan }> {
     const now = new Date();
     const end = addInterval(now, params.interval);
@@ -300,7 +411,11 @@ export const billingService = {
           data: {
             subscriptionId: sub.id,
             amount: params.amount,
-            currency: sub.plan.currency,
+            currency: params.currency ?? sub.plan.currency,
+            sourceAmount: params.sourceAmount,
+            sourceCurrency: params.sourceCurrency,
+            exchangeRate: params.exchangeRate,
+            exchangeRateSnapshotId: params.exchangeRateSnapshotId,
             status: 'PAID',
             periodStart: now,
             periodEnd: end,

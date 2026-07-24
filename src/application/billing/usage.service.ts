@@ -4,6 +4,7 @@ import { AppError } from '../../shared/errors';
 /** Metered usage counters (per org, per metric, per billing period). */
 export const USAGE_METRICS = {
   AI_RESPONSE: 'ai_response',
+  MARKETING_RECIPIENT: 'marketing_recipient',
 } as const;
 
 export type UsageMetric = (typeof USAGE_METRICS)[keyof typeof USAGE_METRICS];
@@ -70,7 +71,7 @@ export const usageService = {
       throw new AppError(
         'QUOTA_EXCEEDED',
         402,
-        `Monthly AI response limit reached (${limit}). Upgrade your plan or add more responses to continue.`,
+        `Usage limit reached (${limit}). Upgrade your plan to continue.`,
         { metric, limit, used: current }
       );
     }

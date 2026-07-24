@@ -8,10 +8,29 @@ import { getAdapter, supportedChannels } from '../../infrastructure/channels/reg
 
 export const connectChannelSchema = z.object({
   channelType: z.enum([
-    'TELEGRAM', 'WHATSAPP', 'FACEBOOK_MESSENGER', 'INSTAGRAM', 'WEB_CHAT', 'EMAIL',
+    'TELEGRAM', 'WHATSAPP', 'FACEBOOK_MESSENGER', 'INSTAGRAM', 'WEB_CHAT', 'EMAIL', 'SMS', 'TIKTOK',
   ]),
   name: z.string().trim().min(1).max(120),
   credentials: z.record(z.string()),
+}).superRefine((dto, ctx) => {
+  const required: Partial<Record<typeof dto.channelType, string[]>> = {
+    SMS: ['accountSid', 'authToken'],
+    TIKTOK: ['clientKey', 'clientSecret', 'accessToken', 'openId'],
+    WHATSAPP: ['accessToken', 'phoneNumberId', 'appSecret'],
+    EMAIL: ['imapHost', 'imapUser', 'imapPass', 'smtpHost'],
+  };
+  for (const key of required[dto.channelType] ?? []) {
+    if (!dto.credentials[key]?.trim()) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['credentials', key], message: `${key} is required` });
+    }
+  }
+  if (dto.channelType === 'SMS' && !dto.credentials.fromNumber && !dto.credentials.messagingServiceSid) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['credentials', 'fromNumber'],
+      message: 'A From number or Messaging Service SID is required',
+    });
+  }
 });
 
 /** Stable provider-side account id per channel type. */
@@ -26,6 +45,10 @@ function deriveExternalId(dto: ConnectChannelDto): string {
       return dto.credentials.pageId || randomUUID();
     case 'EMAIL':
       return (dto.credentials.imapUser ?? '').toLowerCase() || randomUUID();
+    case 'SMS':
+      return dto.credentials.messagingServiceSid || dto.credentials.fromNumber || randomUUID();
+    case 'TIKTOK':
+      return dto.credentials.openId || randomUUID();
     case 'WEB_CHAT':
     default:
       return randomUUID();
@@ -66,6 +89,7 @@ export const channelsService = {
 
     const account = await prisma.channelAccount.create({
       data: {
+        organizationId,
         channelType: dto.channelType,
         name: dto.name,
         externalId,

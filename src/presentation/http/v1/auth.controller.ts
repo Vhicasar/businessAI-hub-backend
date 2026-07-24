@@ -114,6 +114,29 @@ export const authController = {
     res.json({ success: true, data });
   }),
 
+  // ------------------------------------------------- multiple businesses
+  organizations: wrap(async (req, res) => {
+    const data = await authService.organizations(req.auth!.userId);
+    res.json({ success: true, data });
+  }),
+
+  switchOrganization: wrap(async (req, res) => {
+    const session = await authService.switchOrganization(
+      req.auth!.userId,
+      req.body.organizationId,
+      meta(req),
+    );
+    // A switch mints a new session, so the refresh cookie has to follow it.
+    setRefreshCookie(res, session.refreshToken);
+    res.json({ success: true, data: session });
+  }),
+
+  createOrganization: wrap(async (req, res) => {
+    const session = await authService.createOrganization(req.auth!.userId, req.body, meta(req));
+    setRefreshCookie(res, session.refreshToken);
+    res.status(201).json({ success: true, data: session });
+  }),
+
   sessions: wrap(async (req, res) => {
     const data = await authService.listSessions(req.auth!.userId);
     res.json({ success: true, data });

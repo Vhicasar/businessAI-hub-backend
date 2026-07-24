@@ -21,6 +21,14 @@ export const registerSchema = z.object({
   lastName: z.string().trim().min(1).max(80),
   email,
   password,
+  // Location hints from the browser. All optional — signup must never fail
+  // because we couldn't work out where someone is; it falls back to Naira.
+  /** IANA timezone, e.g. "Africa/Lagos". */
+  timezone: z.string().trim().max(64).optional(),
+  /** BCP-47 locale, e.g. "en-NG". */
+  locale: z.string().trim().max(35).optional(),
+  /** An explicit choice from the signup form; overrides detection. */
+  currency: z.string().trim().length(3).toUpperCase().optional(),
 });
 
 export const loginSchema = z.object({
@@ -55,7 +63,20 @@ export const twoFaDisableSchema = z.object({
   code: z.string().trim().regex(/^\d{6}$/, 'Provide the 6-digit code'),
 });
 
+/** Creating an additional business for an already-registered user. */
+export const createOrganizationSchema = registerSchema
+  .pick({ businessType: true, timezone: true, locale: true, currency: true })
+  .extend({
+    name: z.string().trim().min(2).max(120),
+  });
+
+export const switchOrganizationSchema = z.object({
+  organizationId: z.string().min(1),
+});
+
 export type RegisterDto = z.infer<typeof registerSchema>;
+export type CreateOrganizationDto = z.infer<typeof createOrganizationSchema>;
+export type SwitchOrganizationDto = z.infer<typeof switchOrganizationSchema>;
 export type LoginDto = z.infer<typeof loginSchema>;
 export type MfaVerifyDto = z.infer<typeof mfaVerifySchema>;
 export type ForgotPasswordDto = z.infer<typeof forgotPasswordSchema>;

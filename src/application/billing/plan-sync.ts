@@ -1,7 +1,9 @@
+import type { Prisma } from '@prisma/client';
 import { prismaUnscoped } from '../../infrastructure/database/prisma';
 import { env } from '../../shared/config/env';
 import { logger } from '../../shared/logger';
 import { PLAN_CATALOG, type FeatureKey } from '../../shared/plans';
+import { toPriceBook } from '../../shared/billing-currency';
 
 /**
  * Unifies pricing with the Vhicasar Admin: the admin is the single source of
@@ -21,6 +23,8 @@ interface AdminPlan {
   priceMonthly: number;
   priceYearly: number;
   currency: string;
+  /** Per-currency price book: { "USD": { "monthly": 9, "yearly": 86 } }. */
+  prices?: unknown;
   features: string[];
   limits: Record<string, number | null> | null;
   isPublic: boolean;
@@ -83,9 +87,14 @@ export async function syncPlansFromAdmin(): Promise<{ synced: number } | null> {
       priceMonthly: p.priceMonthly,
       priceYearly: p.priceYearly,
       currency: p.currency,
+      // The admin owns commercial terms, and that now includes what we charge
+      // in each currency. Normalised here so junk in the admin can't reach
+      // checkout; an absent book means "charge the base price", as before.
+      prices: (toPriceBook(p.prices) as Prisma.InputJsonValue) ?? undefined,
       maxUsers: num(limits.users),
       maxChannels: num(limits.channels),
       maxContacts: num(limits.contacts),
+      maxMarketingReach: num(limits.marketingReach),
       aiCreditsMonthly: num(limits.aiCredits),
       isPublic: p.isPublic,
       isActive: true,

@@ -14,9 +14,11 @@ export const rolesRoutes = Router();
 
 rolesRoutes.use(authenticate, requireTenant);
 
+// Also readable with employees.invite: choosing a role is part of inviting
+// someone, and an invite flow with an empty role list is useless.
 rolesRoutes.get(
   '/',
-  requirePermission('settings.manage_roles', 'settings.manage_users'),
+  requirePermission('settings.manage_roles', 'settings.manage_users', 'employees.invite'),
   wrap(async (_req, res) => {
     res.json({ success: true, data: await rolesService.list() });
   })

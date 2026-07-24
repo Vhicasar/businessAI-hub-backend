@@ -11,6 +11,12 @@ const envSchema = z
 
     DATABASE_URL: z.string().min(1),
 
+    /**
+     * Redis connection for BullMQ queues. When unset, workflow dispatch and
+     * campaign sends run inline (single-process) instead of async workers.
+     */
+    REDIS_URL: z.string().optional().or(z.literal('')),
+
     JWT_ALG: z.enum(['HS256', 'RS256']).default('HS256'),
     JWT_SECRET: z.string().min(32).optional(),
     JWT_PRIVATE_KEY_PATH: z.string().optional(),
@@ -34,8 +40,26 @@ const envSchema = z
     SMTP_PASS: z.string().optional().or(z.literal('')),
     MAIL_FROM: z.string().default('BusinessHub AI <no-reply@businesshub.local>'),
 
-    STORAGE_DRIVER: z.enum(['local', 's3']).default('local'),
-    STORAGE_LOCAL_ROOT: z.string().default('./storage'),
+    // --- File storage ---
+    // Cloudflare R2 in production (S3-compatible); local disk for dev so the
+    // upload features work with no cloud credentials. 'auto' picks R2 when its
+    // vars are set, else local.
+    STORAGE_DRIVER: z.enum(['local', 'r2', 'auto']).default('auto'),
+    R2_ACCOUNT_ID: z.string().optional().or(z.literal('')),
+    R2_ACCESS_KEY_ID: z.string().optional().or(z.literal('')),
+    R2_SECRET_ACCESS_KEY: z.string().optional().or(z.literal('')),
+    R2_BUCKET: z.string().optional().or(z.literal('')),
+    /** Public base URL for the bucket (a custom domain or the r2.dev URL). */
+    R2_PUBLIC_URL: z.string().url().optional().or(z.literal('')),
+    /**
+     * Base URL for locally-stored files. Defaults to the relative path
+     * "/uploads" so image URLs resolve against whatever origin serves the app
+     * (works in dev behind the Vite proxy and in prod behind one reverse proxy)
+     * — instead of a fixed API_BASE_URL that may be an ngrok/tunnel host.
+     */
+    STORAGE_LOCAL_BASE_URL: z.string().optional().or(z.literal('')),
+    UPLOAD_DIR: z.string().default('./uploads'),
+    MAX_UPLOAD_MB: z.coerce.number().int().min(1).max(50).default(10),
 
     // --- AI (provider-agnostic; 'none' disables all AI features gracefully) ---
     AI_PROVIDER: z.enum(['none', 'anthropic', 'openai']).default('none'),
@@ -50,6 +74,18 @@ const envSchema = z
     PAYSTACK_PUBLIC_KEY: z.string().optional().or(z.literal('')),
     /** Where Paystack redirects the customer after checkout. */
     BILLING_CALLBACK_URL: z.string().url().optional(),
+    /**
+     * Currencies this Paystack merchant account can actually settle. Defaults to
+     * the settlement currency only, so a charge is never initialized in a
+     * currency the merchant can't accept ("Currency not supported by merchant").
+     * Widen it (comma-separated) if your account supports more, e.g. "NGN,USD".
+     */
+    PAYSTACK_CHARGE_CURRENCIES: z.string().optional().or(z.literal('')),
+
+    // --- Foreign exchange ---
+    FX_PROVIDER_URL: z.string().url().default('https://open.er-api.com/v6/latest'),
+    FX_CACHE_TTL_MIN: z.coerce.number().int().min(1).default(60),
+    FX_MAX_STALE_HOURS: z.coerce.number().int().min(1).default(24),
 
     // --- Vhicasar Admin (plan catalog = single source of truth) ---
     // When enabled, plans (prices + quota limits) are synced from the admin's
@@ -59,6 +95,20 @@ const envSchema = z
     ADMIN_TENANT_SLUG: z.string().default('businesshub-ai'),
     ADMIN_PLAN_SYNC: z.string().default('true').transform((v) => v !== 'false'),
     ADMIN_SYNC_INTERVAL_MIN: z.coerce.number().int().min(0).default(10),
+    /**
+     * Pull the AI provider config (provider, model, decrypted key, baseUrl) from
+     * the admin's authenticated service API, overriding the local AI_* env. Needs
+     * SERVICE_API_KEY (the shared secret). Falls back to AI_* when the admin has
+     * nothing configured or is unreachable.
+     */
+    ADMIN_AI_SYNC: z.string().default('true').transform((v) => v !== 'false'),
+    /**
+     * Shared secret letting the Vhicasar Admin read this deployment's tenant
+     * roster (/v1/service/organizations). Unset = the endpoint is disabled
+     * entirely rather than open — an endpoint that lists every customer must
+     * fail closed, never default to permissive.
+     */
+    SERVICE_API_KEY: z.string().min(24).optional().or(z.literal('')),
 
     LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   })
@@ -116,6 +166,16 @@ export const env = {
     /** Paystack is usable only when a secret key is configured. */
     paystackEnabled: Boolean(raw.PAYSTACK_SECRET_KEY),
     callbackUrl: raw.BILLING_CALLBACK_URL || `${raw.WEB_APP_URL}/settings/billing`,
+    /** Currencies the merchant can settle; defaults to the settlement currency. */
+    chargeCurrencies: (raw.PAYSTACK_CHARGE_CURRENCIES || raw.BILLING_CURRENCY)
+      .split(',')
+      .map((c) => c.trim().toUpperCase())
+      .filter(Boolean),
+  },
+  fx: {
+    providerUrl: raw.FX_PROVIDER_URL.replace(/\/+$/, ''),
+    cacheTtlMs: raw.FX_CACHE_TTL_MIN * 60_000,
+    maxStaleMs: raw.FX_MAX_STALE_HOURS * 3_600_000,
   },
   adminCatalog: {
     enabled: raw.ADMIN_PLAN_SYNC,
@@ -123,6 +183,40 @@ export const env = {
     tenantSlug: raw.ADMIN_TENANT_SLUG,
     intervalMin: raw.ADMIN_SYNC_INTERVAL_MIN,
   },
+  adminAi: {
+    // Needs the shared service key to authenticate to the admin's service API.
+    enabled: raw.ADMIN_AI_SYNC && Boolean(raw.SERVICE_API_KEY),
+    intervalMin: raw.ADMIN_SYNC_INTERVAL_MIN,
+  },
+  service: {
+    apiKey: raw.SERVICE_API_KEY || '',
+    /** The service API only exists when a key is configured. */
+    enabled: Boolean(raw.SERVICE_API_KEY),
+  },
+  storage: (() => {
+    const r2Ready = Boolean(
+      raw.R2_ACCOUNT_ID && raw.R2_ACCESS_KEY_ID && raw.R2_SECRET_ACCESS_KEY && raw.R2_BUCKET,
+    );
+    const driver = raw.STORAGE_DRIVER === 'auto' ? (r2Ready ? 'r2' : 'local') : raw.STORAGE_DRIVER;
+    return {
+      driver: driver as 'local' | 'r2',
+      maxBytes: raw.MAX_UPLOAD_MB * 1024 * 1024,
+      local: {
+        dir: raw.UPLOAD_DIR,
+        // Relative by default so URLs resolve against the serving origin (dev
+        // proxy or prod reverse proxy); override with STORAGE_LOCAL_BASE_URL.
+        baseUrl: (raw.STORAGE_LOCAL_BASE_URL || '/uploads').replace(/\/+$/, ''),
+      },
+      r2: {
+        accountId: raw.R2_ACCOUNT_ID || '',
+        accessKeyId: raw.R2_ACCESS_KEY_ID || '',
+        secretAccessKey: raw.R2_SECRET_ACCESS_KEY || '',
+        bucket: raw.R2_BUCKET || '',
+        publicUrl: raw.R2_PUBLIC_URL || '',
+        endpoint: raw.R2_ACCOUNT_ID ? `https://${raw.R2_ACCOUNT_ID}.r2.cloudflarestorage.com` : '',
+      },
+    };
+  })(),
   jwt: {
     alg: raw.JWT_ALG,
     signKey: keys.signKey,

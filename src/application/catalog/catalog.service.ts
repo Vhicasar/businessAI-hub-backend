@@ -1,6 +1,9 @@
 import { ConflictError, NotFoundError } from '../../shared/errors';
 import { prisma } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
+import { inventoryService } from '../inventory/inventory.service';
+import { filesService } from '../files/files.service';
+import { exchangeRates } from '../../shared/exchange-rates';
 
 /** Nested creates bypass the tenant extension's data injection. */
 function orgId(): string {
@@ -11,6 +14,7 @@ function orgId(): string {
 import type {
   CreateProductDto,
   ListProductsDto,
+  ProductImageDto,
   UpdateProductDto,
   VariantDto,
 } from './catalog.dto';
@@ -43,6 +47,10 @@ const productSelect = {
   createdAt: true,
   category: { select: { id: true, name: true } },
   brand: { select: { id: true, name: true } },
+  images: {
+    orderBy: { position: 'asc' as const },
+    select: { id: true, fileId: true, altText: true, position: true },
+  },
   variants: {
     where: { deletedAt: null },
     orderBy: { isDefault: 'desc' as const },
@@ -58,6 +66,7 @@ const productSelect = {
       currency: true,
       isDefault: true,
       isActive: true,
+      imageFileId: true,
       stockLevels: { select: { quantity: true, reserved: true } },
     },
   },
@@ -75,6 +84,60 @@ function withStockTotals<T extends { variants: { stockLevels: { quantity: unknow
       return { ...rest, stock: { onHand, reserved, available: onHand - reserved } };
     }),
   };
+}
+
+type ImageRow = { id: string; fileId: string; altText: string | null; position: number };
+type WithImages = {
+  images: ImageRow[];
+  variants: { imageFileId: string | null }[];
+};
+
+/**
+ * Turn File ids into browser URLs across a page of products in one batch — both
+ * the product gallery (`images[].url`) and each variant's own photo
+ * (`variant.imageUrl`). Signed R2 URLs are expensive to mint, so resolve every
+ * id for the whole page in a single `urlMap` call rather than one lookup per row.
+ */
+async function withImages<T extends WithImages>(products: T[]): Promise<(T & { images: (ImageRow & { url: string | null })[] })[]> {
+  const ids = new Set<string>();
+  for (const p of products) {
+    for (const img of p.images) ids.add(img.fileId);
+    for (const v of p.variants) if (v.imageFileId) ids.add(v.imageFileId);
+  }
+  const urls = await filesService.urlMap([...ids]);
+  return products.map((p) => ({
+    ...p,
+    images: p.images.map((img) => ({ ...img, url: urls.get(img.fileId) ?? null })),
+    variants: p.variants.map((v) => ({ ...v, imageUrl: v.imageFileId ? urls.get(v.imageFileId) ?? null : null })),
+  }));
+}
+
+async function inPreferredCurrency<T extends { variants: Array<{
+  price: unknown;
+  compareAtPrice: unknown | null;
+  costPrice: unknown | null;
+  currency: string;
+}> }>(products: T[]): Promise<T[]> {
+  const org = await prisma.organization.findUniqueOrThrow({
+    where: { id: orgId() },
+    select: { currency: true },
+  });
+  return Promise.all(products.map(async (product) => ({
+    ...product,
+    variants: await Promise.all(product.variants.map(async (variant) => {
+      const convert = async (value: unknown | null) => value === null
+        ? null
+        : (await exchangeRates.convert(Number(value), variant.currency, org.currency)).amount;
+      return {
+        ...variant,
+        price: await convert(variant.price),
+        compareAtPrice: await convert(variant.compareAtPrice),
+        costPrice: await convert(variant.costPrice),
+        currency: org.currency,
+        sourceCurrency: variant.currency,
+      };
+    })),
+  })));
 }
 
 export const catalogService = {
@@ -101,7 +164,9 @@ export const catalogService = {
       ...(dto.cursor ? { cursor: { id: dto.cursor }, skip: 1 } : {}),
     });
     const hasMore = rows.length > dto.limit;
-    const items = (hasMore ? rows.slice(0, dto.limit) : rows).map(withStockTotals);
+    const items = await withImages(await inPreferredCurrency(
+      (hasMore ? rows.slice(0, dto.limit) : rows).map(withStockTotals),
+    ));
     return { items, nextCursor: hasMore ? items[items.length - 1]?.id ?? null : null };
   },
 
@@ -111,7 +176,8 @@ export const catalogService = {
       select: productSelect,
     });
     if (!product) throw new NotFoundError('Product');
-    return withStockTotals(product);
+    const [resolved] = await withImages(await inPreferredCurrency([withStockTotals(product)]));
+    return resolved!;
   },
 
   async createProduct(dto: CreateProductDto, currency: string) {
@@ -124,34 +190,82 @@ export const catalogService = {
     const slug = await uniqueSlug('product', dto.name);
     const hasDefault = dto.variants.some((v) => v.isDefault);
 
-    const product = await prisma.product.create({
-      data: {
-        name: dto.name,
-        slug,
-        description: dto.description ?? null,
-        categoryId: dto.categoryId ?? null,
-        brandId: dto.brandId ?? null,
-        status: dto.status,
-        taxRate: dto.taxRate,
-        variants: {
-          create: dto.variants.map((v, i) => ({
-            organizationId: orgId(),
-            sku: v.sku,
-            barcode: v.barcode ?? null,
-            name: v.name ?? null,
-            options: v.options ?? undefined,
-            price: v.price,
-            compareAtPrice: v.compareAtPrice ?? null,
-            costPrice: v.costPrice ?? null,
-            currency,
-            isDefault: hasDefault ? Boolean(v.isDefault) : i === 0,
-            isActive: v.isActive ?? true,
-          })),
+    // Only touch inventory if some variant ships with opening stock.
+    const needsStock = dto.variants.some((v) => Number(v.initialStock ?? 0) > 0);
+    const warehouse = needsStock ? await inventoryService.ensureDefaultWarehouse() : null;
+    const org = orgId();
+
+    type CreatedProduct = {
+      images: ImageRow[];
+      variants: {
+        id: string;
+        sku: string;
+        imageFileId: string | null;
+        price: unknown;
+        compareAtPrice: unknown | null;
+        costPrice: unknown | null;
+        currency: string;
+        stockLevels: { quantity: unknown; reserved: unknown }[];
+      }[];
+    } & Record<string, unknown>;
+    const product = await prisma.$transaction(async (tx) => {
+      const created = (await tx.product.create({
+        data: {
+          name: dto.name,
+          slug,
+          description: dto.description ?? null,
+          categoryId: dto.categoryId ?? null,
+          brandId: dto.brandId ?? null,
+          status: dto.status,
+          taxRate: dto.taxRate,
+          customFields: dto.customFields ?? undefined,
+          variants: {
+            create: dto.variants.map((v, i) => ({
+              organizationId: org,
+              sku: v.sku,
+              barcode: v.barcode ?? null,
+              name: v.name ?? null,
+              options: v.options ?? undefined,
+              price: v.price,
+              compareAtPrice: v.compareAtPrice ?? null,
+              costPrice: v.costPrice ?? null,
+              currency,
+              isDefault: hasDefault ? Boolean(v.isDefault) : i === 0,
+              isActive: v.isActive ?? true,
+              imageFileId: v.imageFileId ?? null,
+            })),
+          },
         },
-      },
-      select: productSelect,
+        select: productSelect,
+      })) as unknown as CreatedProduct;
+
+      if (warehouse) {
+        for (const dv of dto.variants) {
+          const qty = Number(dv.initialStock ?? 0);
+          if (qty <= 0) continue;
+          // Variants share the SKU we just created — match on it to get the id.
+          const variant = created.variants.find((v) => v.sku === dv.sku);
+          if (!variant) continue;
+          await tx.stockLevel.create({
+            data: { organizationId: org, warehouseId: warehouse.id, variantId: variant.id, quantity: qty },
+          });
+          await tx.stockMovement.create({
+            data: {
+              organizationId: org,
+              warehouseId: warehouse.id,
+              variantId: variant.id,
+              type: 'ADJUSTMENT',
+              quantity: qty,
+              reason: 'Opening stock',
+              referenceType: 'ADJUSTMENT',
+            },
+          });
+        }
+      }
+      return created;
     });
-    return withStockTotals(product);
+    const [resolved] = await withImages(await inPreferredCurrency([withStockTotals(product)]));
+    return resolved!;
   },
 
   async updateProduct(id: string, dto: UpdateProductDto) {
@@ -168,7 +282,8 @@ export const catalogService = {
       },
       select: productSelect,
     });
-    return withStockTotals(product);
+    const [resolved] = await withImages(await inPreferredCurrency([withStockTotals(product)]));
+    return resolved!;
   },
 
   async deleteProduct(id: string) {
@@ -187,20 +302,45 @@ export const catalogService = {
     await this.getProduct(productId);
     const dup = await prisma.productVariant.findFirst({ where: { sku: dto.sku, deletedAt: null } });
     if (dup) throw new ConflictError(`SKU "${dto.sku}" is already in use`);
-    return prisma.productVariant.create({
-      data: {
-        productId,
-        sku: dto.sku,
-        barcode: dto.barcode ?? null,
-        name: dto.name ?? null,
-        options: dto.options ?? undefined,
-        price: dto.price,
-        compareAtPrice: dto.compareAtPrice ?? null,
-        costPrice: dto.costPrice ?? null,
-        currency,
-        isDefault: dto.isDefault ?? false,
-        isActive: dto.isActive ?? true,
-      },
+
+    const qty = Number(dto.initialStock ?? 0);
+    const warehouse = qty > 0 ? await inventoryService.ensureDefaultWarehouse() : null;
+    const org = orgId();
+
+    return prisma.$transaction(async (tx) => {
+      const variant = await tx.productVariant.create({
+        data: {
+          productId,
+          sku: dto.sku,
+          barcode: dto.barcode ?? null,
+          name: dto.name ?? null,
+          options: dto.options ?? undefined,
+          price: dto.price,
+          compareAtPrice: dto.compareAtPrice ?? null,
+          costPrice: dto.costPrice ?? null,
+          currency,
+          isDefault: dto.isDefault ?? false,
+          isActive: dto.isActive ?? true,
+          imageFileId: dto.imageFileId ?? null,
+        },
+      });
+      if (warehouse && qty > 0) {
+        await tx.stockLevel.create({
+          data: { organizationId: org, warehouseId: warehouse.id, variantId: variant.id, quantity: qty },
+        });
+        await tx.stockMovement.create({
+          data: {
+            organizationId: org,
+            warehouseId: warehouse.id,
+            variantId: variant.id,
+            type: 'ADJUSTMENT',
+            quantity: qty,
+            reason: 'Opening stock',
+            referenceType: 'ADJUSTMENT',
+          },
+        });
+      }
+      return variant;
     });
   },
 
@@ -215,7 +355,7 @@ export const catalogService = {
       });
       if (dup) throw new ConflictError(`SKU "${dto.sku}" is already in use`);
     }
-    return prisma.productVariant.update({
+    const updated = await prisma.productVariant.update({
       where: { id: variantId },
       data: {
         sku: dto.sku,
@@ -227,8 +367,14 @@ export const catalogService = {
         costPrice: dto.costPrice ?? null,
         ...(dto.isDefault !== undefined ? { isDefault: dto.isDefault } : {}),
         ...(dto.isActive !== undefined ? { isActive: dto.isActive } : {}),
+        ...(dto.imageFileId !== undefined ? { imageFileId: dto.imageFileId } : {}),
       },
     });
+    // Swapped the variant photo → delete the file it replaced so orphans don't pile up.
+    if (dto.imageFileId !== undefined && variant.imageFileId && variant.imageFileId !== dto.imageFileId) {
+      await filesService.remove(variant.imageFileId).catch(() => undefined);
+    }
+    return updated;
   },
 
   async deleteVariant(productId: string, variantId: string) {
@@ -244,6 +390,54 @@ export const catalogService = {
       where: { id: variantId },
       data: { deletedAt: new Date(), isActive: false },
     });
+  },
+
+  // ---------------------------------------------------- product gallery
+  /** Append an already-uploaded image to a product's gallery. */
+  async addProductImage(productId: string, dto: ProductImageDto) {
+    await this.getProduct(productId);
+    // New images go to the end; position is 1-based on the current count.
+    const count = await prisma.productImage.count({ where: { productId } });
+    const image = await prisma.productImage.create({
+      data: { productId, fileId: dto.fileId, altText: dto.altText ?? null, position: count },
+      select: { id: true, fileId: true, altText: true, position: true },
+    });
+    return { ...image, url: await filesService.urlFor(image.fileId) };
+  },
+
+  async removeProductImage(productId: string, imageId: string) {
+    const image = await prisma.productImage.findFirst({ where: { id: imageId, productId } });
+    if (!image) throw new NotFoundError('Image');
+    await prisma.productImage.delete({ where: { id: imageId } });
+    // The gallery row is gone; drop the backing file too.
+    await filesService.remove(image.fileId).catch(() => undefined);
+    return { deleted: true };
+  },
+
+  /** Persist a new gallery order. Ignores ids that aren't on this product. */
+  async reorderProductImages(productId: string, order: string[]) {
+    const images = await prisma.productImage.findMany({ where: { productId }, select: { id: true } });
+    const own = new Set(images.map((i) => i.id));
+    await prisma.$transaction(
+      order
+        .filter((id) => own.has(id))
+        .map((id, position) => prisma.productImage.update({ where: { id }, data: { position } }))
+    );
+    return this.getProduct(productId);
+  },
+
+  /** Attach or clear a single variant's photo, cleaning up any replaced file. */
+  async setVariantImage(productId: string, variantId: string, fileId: string | null) {
+    const variant = await prisma.productVariant.findFirst({
+      where: { id: variantId, productId, deletedAt: null },
+      select: { id: true, imageFileId: true },
+    });
+    if (!variant) throw new NotFoundError('Variant');
+    await prisma.productVariant.update({ where: { id: variantId }, data: { imageFileId: fileId } });
+    if (variant.imageFileId && variant.imageFileId !== fileId) {
+      await filesService.remove(variant.imageFileId).catch(() => undefined);
+    }
+    return { imageFileId: fileId, imageUrl: await filesService.urlFor(fileId) };
   },
 
   // -------------------------------------------------- categories & brands

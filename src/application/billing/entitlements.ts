@@ -19,6 +19,7 @@ export interface PlanLimits {
   maxProducts: number | null;
   maxChannels: number | null;
   maxContacts: number | null;
+  maxMarketingReach: number | null;
   aiCreditsMonthly: number | null;
 }
 
@@ -45,6 +46,7 @@ function limitsOf(plan: Plan): PlanLimits {
     maxProducts: plan.maxProducts,
     maxChannels: plan.maxChannels,
     maxContacts: plan.maxContacts,
+    maxMarketingReach: plan.maxMarketingReach,
     aiCreditsMonthly: plan.aiCreditsMonthly,
   };
 }
@@ -72,11 +74,24 @@ export function currentOrgId(): string {
 export async function resolveEntitlements(orgId?: string): Promise<Entitlements> {
   const organizationId = orgId ?? currentOrgId();
 
-  const subscription = await prismaUnscoped.subscription.findFirst({
+  let subscription = await prismaUnscoped.subscription.findFirst({
     where: { organizationId, status: { in: ACTIVE_STATUSES } },
     orderBy: { createdAt: 'desc' },
     include: { plan: true },
   });
+  if (
+    subscription &&
+    (
+      subscription.currentPeriodEnd <= new Date() ||
+      (subscription.status === 'TRIALING' && subscription.trialEndsAt && subscription.trialEndsAt <= new Date())
+    )
+  ) {
+    await prismaUnscoped.subscription.update({
+      where: { id: subscription.id },
+      data: { status: 'EXPIRED' },
+    });
+    subscription = null;
+  }
 
   const plan =
     subscription?.plan ??
@@ -97,6 +112,7 @@ export async function resolveEntitlements(orgId?: string): Promise<Entitlements>
         maxProducts: null,
         maxChannels: null,
         maxContacts: null,
+        maxMarketingReach: null,
         aiCreditsMonthly: null,
       },
       features: new Set(),
@@ -110,14 +126,38 @@ export async function resolveEntitlements(orgId?: string): Promise<Entitlements>
     ? { start: subscription.currentPeriodStart, end: subscription.currentPeriodEnd }
     : calendarMonthWindow();
 
+  const purchases = await prismaUnscoped.addOnPurchase.findMany({
+    where: { organizationId, OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
+    select: { entitlements: true },
+  });
+  const additions = purchases.reduce(
+    (sum, purchase) => {
+      const value = (purchase.entitlements ?? {}) as Record<string, unknown>;
+      sum.aiCredits += Number(value.aiCredits ?? 0);
+      sum.users += Number(value.maxUsers ?? 0);
+      sum.channels += Number(value.maxChannels ?? 0);
+      if (Array.isArray(value.features)) {
+        for (const feature of value.features) if (typeof feature === 'string') sum.features.add(feature);
+      }
+      return sum;
+    },
+    { aiCredits: 0, users: 0, channels: 0, features: new Set<string>() },
+  );
+  const limits = limitsOf(plan);
+  if (limits.maxUsers !== null) limits.maxUsers += additions.users;
+  if (limits.maxChannels !== null) limits.maxChannels += additions.channels;
+  if (limits.aiCreditsMonthly !== null) limits.aiCreditsMonthly += additions.aiCredits;
+  const features = featureSet(plan);
+  for (const feature of additions.features) features.add(feature);
+
   return {
     organizationId,
     planId: plan.id,
     planSlug: plan.slug,
     planName: plan.name,
     status: subscription?.status ?? 'NONE',
-    limits: limitsOf(plan),
-    features: featureSet(plan),
+    limits,
+    features,
     periodStart: window.start,
     periodEnd: window.end,
     subscription: subscription ?? null,

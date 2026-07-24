@@ -4,6 +4,7 @@ import { ConflictError, NotFoundError } from '../../shared/errors';
 import { prisma } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { logger } from '../../shared/logger';
+import { resolveEntitlements } from '../billing/entitlements';
 import {
   emitToConversation,
   emitToOrg,
@@ -171,7 +172,11 @@ export const inboxService = {
 
     // Async sentiment (no-op when AI is disabled; never blocks the webhook).
     if (inbound.text) {
-      void aiService.analyzeSentiment(conversation.id, inbound.text);
+      void resolveEntitlements(account.organizationId)
+        .then((ent) => ent.features.has('ai_insights')
+          ? aiService.analyzeSentiment(conversation.id, inbound.text!)
+          : undefined)
+        .catch((e) => logger.warn({ err: e }, 'AI sentiment check failed (non-fatal)'));
     }
 
     // Auto-reply bot (guarded; fire-and-forget).
@@ -194,7 +199,10 @@ export const inboxService = {
 
     const conversation = await prisma.conversation.findFirst({ where: { id: conversationId } });
     if (!conversation || conversation.status !== 'OPEN' || conversation.assignedToId) return;
-    if (conversation.aiSentiment === 'NEGATIVE') return;
+    // Negative sentiment used to silently drop the bot — which meant an upset
+    // customer asking for help or a ticket got nothing. The assistant now handles
+    // those by handing off to a human and/or opening a ticket (and notifying
+    // staff), so let it run and route them instead of going dark.
 
     const latest = await prisma.message.findFirst({
       where: { conversationId },
@@ -359,6 +367,90 @@ export const inboxService = {
       where: { id: conversationId },
       data: { unreadCount: 0 },
     });
+  },
+
+  /**
+   * Unread totals for the inbox badge: the sum across still-active conversations,
+   * plus a per-channel breakdown (WhatsApp, Live Chat, Email, …). Tenant-scoped.
+   */
+  async unreadCounts(): Promise<{ total: number; byChannel: Record<string, number> }> {
+    const rows = await prisma.conversation.findMany({
+      where: { status: { in: ['OPEN', 'PENDING'] }, unreadCount: { gt: 0 } },
+      select: { unreadCount: true, channelAccount: { select: { channelType: true } } },
+    });
+    let total = 0;
+    const byChannel: Record<string, number> = {};
+    for (const c of rows) {
+      total += c.unreadCount;
+      const ch = c.channelAccount.channelType;
+      byChannel[ch] = (byChannel[ch] ?? 0) + c.unreadCount;
+    }
+    return { total, byChannel };
+  },
+
+  /**
+   * Every communication channel linked to a customer, plus their existing
+   * conversations, for the "Chat" action on a customer profile. Tenant-scoped.
+   */
+  async customerChannels(customerId: string) {
+    const [identities, conversations, accounts] = await Promise.all([
+      prisma.customerIdentity.findMany({
+        where: { customerId },
+        select: { channelType: true, displayName: true, externalId: true, channelAccountId: true },
+      }),
+      prisma.conversation.findMany({
+        where: { customerId },
+        orderBy: { lastMessageAt: 'desc' },
+        select: {
+          id: true, status: true, unreadCount: true, lastMessageText: true, lastMessageAt: true,
+          channelAccount: { select: { channelType: true, name: true } },
+        },
+      }),
+      prisma.channelAccount.findMany({ select: { channelType: true } }),
+    ]);
+    const connected = [...new Set(accounts.map((a) => a.channelType))];
+    return {
+      channels: identities.map((i) => ({
+        channelType: i.channelType,
+        handle: i.displayName ?? i.externalId,
+        connected: connected.includes(i.channelType),
+      })),
+      connectedChannels: connected,
+      conversations: conversations.map((c) => ({
+        id: c.id,
+        channelType: c.channelAccount.channelType,
+        status: c.status,
+        unreadCount: c.unreadCount,
+        lastMessageText: c.lastMessageText,
+        lastMessageAt: c.lastMessageAt,
+      })),
+    };
+  },
+
+  /**
+   * Start a new conversation (or continue the latest) with a customer on a
+   * given channel and send the first message — from their profile. Reuses the
+   * normal outbound path so it lands in the Unified Inbox and CRM timeline.
+   */
+  async startOrContinue(customerId: string, channelType: ChannelType, text: string, authorUserId: string | null) {
+    const identity = await prisma.customerIdentity.findFirst({ where: { customerId, channelType } });
+    if (!identity) throw new ConflictError(`This customer has no ${channelType} contact on file`);
+    const account = identity.channelAccountId
+      ? await prisma.channelAccount.findFirst({ where: { id: identity.channelAccountId } })
+      : await prisma.channelAccount.findFirst({ where: { channelType } });
+    if (!account) throw new ConflictError(`No connected ${channelType} channel to send from`);
+
+    let convo = await prisma.conversation.findFirst({
+      where: { customerId, channelAccountId: account.id },
+      orderBy: { lastMessageAt: 'desc' },
+      select: { id: true },
+    });
+    convo ??= await prisma.conversation.create({
+      data: { channelAccountId: account.id, customerId, status: 'OPEN' },
+      select: { id: true },
+    });
+    await this.sendMessage(convo.id, text, authorUserId, 'AGENT');
+    return { conversationId: convo.id };
   },
 
   async assign(conversationId: string, membershipId: string | null) {

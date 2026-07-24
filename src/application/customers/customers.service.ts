@@ -1,5 +1,7 @@
 import { ConflictError, NotFoundError } from '../../shared/errors';
 import { prisma } from '../../infrastructure/database/prisma';
+import { requestContext } from '../../shared/context';
+import { exchangeRates } from '../../shared/exchange-rates';
 import type {
   AddressDto,
   CreateCustomerDto,
@@ -111,6 +113,81 @@ export const customersService = {
     });
     if (!customer) throw new NotFoundError('Customer');
     return customer;
+  },
+
+  /** Customer 360: related deals, orders, invoices and open tasks + roll-ups. */
+  async overview(id: string) {
+    const exists = await prisma.customer.findFirst({ where: { id, deletedAt: null }, select: { id: true } });
+    if (!exists) throw new NotFoundError('Customer');
+
+    const [deals, orders, invoices, tasks] = await Promise.all([
+      prisma.deal.findMany({
+        where: { customerId: id, deletedAt: null },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+        select: {
+          id: true, title: true, value: true, currency: true, status: true,
+          aiWinProbability: true, stage: { select: { name: true } }, createdAt: true,
+        },
+      }),
+      prisma.order.findMany({
+        where: { customerId: id },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+        select: { id: true, number: true, status: true, paymentStatus: true, total: true, currency: true, createdAt: true },
+      }),
+      prisma.invoice.findMany({
+        where: { customerId: id, deletedAt: null },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+        select: { id: true, number: true, status: true, total: true, amountPaid: true, currency: true, dueAt: true },
+      }),
+      prisma.task.findMany({
+        where: { entityType: 'CUSTOMER', entityId: id, deletedAt: null, status: { in: ['TODO', 'IN_PROGRESS'] } },
+        orderBy: { dueAt: 'asc' },
+        take: 10,
+        select: { id: true, title: true, status: true, priority: true, dueAt: true },
+      }),
+    ]);
+    const organizationId = requestContext.get()?.organizationId;
+    if (!organizationId) throw new Error('No tenant in request context');
+    const org = await prisma.organization.findUniqueOrThrow({
+      where: { id: organizationId },
+      select: { currency: true },
+    });
+    const displayDeals = await Promise.all(deals.map(async (d) => ({
+      ...d,
+      value: (await exchangeRates.convert(Number(d.value), d.currency, org.currency)).amount,
+      currency: org.currency,
+    })));
+    const displayOrders = await Promise.all(orders.map(async (o) => ({
+      ...o,
+      total: (await exchangeRates.convert(Number(o.total), o.currency, org.currency)).amount,
+      currency: org.currency,
+    })));
+    const displayInvoices = await Promise.all(invoices.map(async (i) => {
+      const conversion = await exchangeRates.convert(1, i.currency, org.currency);
+      return {
+        ...i,
+        total: Number(i.total) * conversion.rate,
+        amountPaid: Number(i.amountPaid) * conversion.rate,
+        currency: org.currency,
+      };
+    }));
+
+    const openDeals = displayDeals.filter((d) => d.status === 'OPEN');
+    const outstanding = displayInvoices.reduce((s, i) => s + (Number(i.total) - Number(i.amountPaid)), 0);
+    return {
+      deals: displayDeals,
+      orders: displayOrders,
+      invoices: displayInvoices,
+      tasks,
+      metrics: {
+        openDeals: openDeals.length,
+        openDealsValue: openDeals.reduce((s, d) => s + Number(d.value), 0),
+        outstandingInvoices: Math.round(outstanding * 100) / 100,
+      },
+    };
   },
 
   async create(dto: CreateCustomerDto) {

@@ -5,6 +5,8 @@ import { authenticate, requireTenant } from '../middleware/authenticate';
 import { requirePermission } from '../middleware/require-permission';
 import { billingService, checkoutSchema } from '../../../application/billing/billing.service';
 import { syncPlansFromAdmin } from '../../../application/billing/plan-sync';
+import { smsWalletService } from '../../../application/billing/sms-wallet.service';
+import { addOnsService, addOnCheckoutSchema } from '../../../application/billing/add-ons.service';
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<void>): RequestHandler =>
@@ -20,6 +22,40 @@ billingRoutes.get(
   '/plans',
   wrap(async (_req, res) => {
     res.json({ success: true, data: await billingService.listPlans() });
+  })
+);
+
+billingRoutes.get(
+  '/sms-wallet',
+  requirePermission('billing.view'),
+  wrap(async (_req, res) => {
+    res.json({ success: true, data: await smsWalletService.summary() });
+  })
+);
+
+billingRoutes.get('/add-ons', requirePermission('billing.view'), wrap(async (_req, res) => {
+  res.json({ success: true, data: await addOnsService.list() });
+}));
+
+billingRoutes.post('/add-ons/checkout', requirePermission('billing.manage'), validate({ body: addOnCheckoutSchema }), wrap(async (req, res) => {
+  res.json({ success: true, data: await addOnsService.checkout(req.body.addOnId) });
+}));
+
+billingRoutes.post(
+  '/sms-wallet/checkout',
+  requirePermission('billing.manage'),
+  validate({ body: z.object({ packageId: z.string().min(1) }) }),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await smsWalletService.checkout(req.body.packageId) });
+  })
+);
+
+billingRoutes.get(
+  '/sms-wallet/verify',
+  requirePermission('billing.manage'),
+  validate({ query: z.object({ reference: z.string().min(1) }) }),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await smsWalletService.verifyPurchase(req.query.reference as string) });
   })
 );
 

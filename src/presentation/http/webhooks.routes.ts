@@ -66,7 +66,12 @@ webhookRoutes.post('/:channel/:accountId', (req, res) => {
 
       const adapter = getAdapter(channelType);
       const verified = adapter.verifyWebhook(
-        { headers: req.headers, body: req.body, query: req.query as Record<string, unknown> },
+        {
+          headers: req.headers,
+          body: req.body,
+          query: req.query as Record<string, unknown>,
+          rawBody: (req as unknown as { rawBody?: Buffer }).rawBody,
+        },
         {
           id: account.id,
           organizationId: account.organizationId,

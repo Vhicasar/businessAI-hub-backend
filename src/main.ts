@@ -8,6 +8,8 @@ import {
   stopEmailInboundPoller,
 } from './infrastructure/channels/email.poller';
 import { startPlanSync } from './application/billing/plan-sync';
+import { startAiConfigSync } from './application/ai/ai-sync';
+import { closeQueues, queueEnabled } from './infrastructure/queue/queue';
 import { createApp } from './app';
 
 async function bootstrap(): Promise<void> {
@@ -24,11 +26,18 @@ async function bootstrap(): Promise<void> {
 
   startEmailInboundPoller();
   startPlanSync(); // keep the plan catalog in sync with Vhicasar Admin
+  startAiConfigSync(); // keep the AI provider config in sync with Vhicasar Admin
+  logger.info(
+    queueEnabled()
+      ? '📮 Queue mode: async — workflow & campaign jobs handed to the worker (run `npm run worker`)'
+      : '📮 Queue mode: inline — set REDIS_URL and run a worker to process jobs asynchronously',
+  );
 
   const shutdown = async (signal: string): Promise<void> => {
     logger.info(`${signal} received — shutting down gracefully`);
     stopEmailInboundPoller();
     httpServer.close(async () => {
+      await closeQueues();
       await disconnectDatabase();
       process.exit(0);
     });

@@ -3,7 +3,11 @@ import rateLimit from 'express-rate-limit';
 import { authenticate, requireTenant } from '../middleware/authenticate';
 import { requirePermission } from '../middleware/require-permission';
 import { aiService } from '../../../application/ai/ai.service';
-import { aiEnabled } from '../../../infrastructure/ai';
+import { getAiStatus } from '../../../infrastructure/ai';
+import { syncAiConfigFromAdmin } from '../../../application/ai/ai-sync';
+import { requireFeature } from '../middleware/plan-guard';
+import { z } from 'zod';
+import { validate } from '../middleware/validate';
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<void>): RequestHandler =>
@@ -30,13 +34,46 @@ aiRoutes.get(
   '/status',
   requirePermission('ai.use_assistant'),
   wrap(async (_req, res) => {
-    res.json({ success: true, data: { enabled: aiEnabled() } });
+    // Reports the active provider/model and whether it came from the admin.
+    res.json({ success: true, data: getAiStatus() });
   })
+);
+
+/** Pull the latest AI config from the Vhicasar Admin now (else it refreshes periodically). */
+aiRoutes.post(
+  '/sync',
+  requirePermission('ai.use_assistant'),
+  wrap(async (_req, res) => {
+    const applied = await syncAiConfigFromAdmin();
+    res.json({ success: true, data: { applied, ...getAiStatus() } });
+  })
+);
+
+aiRoutes.post(
+  '/assistant',
+  requirePermission('ai.use_assistant'),
+  validate({
+    body: z.object({
+      prompt: z.string().trim().min(1).max(2_000),
+      currentPath: z.string().max(300).optional(),
+      history: z.array(z.object({
+        role: z.enum(['user', 'assistant']),
+        content: z.string().max(4_000),
+      })).max(20).default([]),
+    }),
+  }),
+  wrap(async (req, res) => {
+    res.json({
+      success: true,
+      data: await aiService.workspaceAssistant(req.body.prompt, req.body.history, req.body.currentPath),
+    });
+  }),
 );
 
 aiRoutes.post(
   '/conversations/:id/summarize',
   requirePermission('ai.use_assistant', 'inbox.read'),
+  requireFeature('ai_insights'),
   wrap(async (req, res) => {
     res.json({
       success: true,
@@ -56,6 +93,7 @@ aiRoutes.post(
 aiRoutes.post(
   '/customers/:id/summarize',
   requirePermission('ai.use_assistant', 'customers.read'),
+  requireFeature('ai_insights'),
   wrap(async (req, res) => {
     res.json({ success: true, data: await aiService.summarizeCustomer(req.params.id as string) });
   })
@@ -64,7 +102,61 @@ aiRoutes.post(
 aiRoutes.post(
   '/leads/:id/score',
   requirePermission('ai.use_assistant', 'crm.update'),
+  requireFeature('ai_insights'),
   wrap(async (req, res) => {
     res.json({ success: true, data: await aiService.scoreLead(req.params.id as string) });
+  })
+);
+
+aiRoutes.post(
+  '/deals/:id/score',
+  requirePermission('ai.use_assistant', 'crm.update'),
+  requireFeature('ai_insights'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await aiService.scoreDeal(req.params.id as string) });
+  })
+);
+
+aiRoutes.post(
+  '/leads/:id/next-action',
+  requirePermission('ai.use_assistant', 'crm.read'),
+  requireFeature('ai_insights'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await aiService.nextBestAction('LEAD', req.params.id as string) });
+  })
+);
+
+aiRoutes.post(
+  '/deals/:id/next-action',
+  requirePermission('ai.use_assistant', 'crm.read'),
+  requireFeature('ai_insights'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await aiService.nextBestAction('DEAL', req.params.id as string) });
+  })
+);
+
+aiRoutes.post(
+  '/tickets/:id/summarize',
+  requirePermission('ai.use_assistant', 'support.read'),
+  requireFeature('ai_insights'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await aiService.summarizeTicket(req.params.id as string) });
+  })
+);
+
+aiRoutes.post(
+  '/tickets/:id/suggest-reply',
+  requirePermission('ai.use_assistant', 'support.update'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await aiService.suggestTicketReply(req.params.id as string) });
+  })
+);
+
+aiRoutes.post(
+  '/applicants/:id/score',
+  requirePermission('ai.use_assistant', 'employees.update'),
+  requireFeature('ai_insights'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await aiService.scoreApplicant(req.params.id as string) });
   })
 );

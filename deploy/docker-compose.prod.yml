@@ -14,6 +14,29 @@
 #   docker compose -f deploy/docker-compose.prod.yml --env-file .env \
 #     run --rm agentv-backend npm run seed
 
+# Shared backend env for the API and the worker (same image, same config).
+x-backend-env: &backend-env
+  NODE_ENV: production
+  PORT: "4000"
+  DATABASE_URL: postgresql://businesshub:${DB_PASSWORD}@agentv-postgres:5432/businesshub?schema=public
+  REDIS_URL: redis://agentv-redis:6379
+  API_BASE_URL: https://${APP_DOMAIN}
+  WEB_APP_URL: https://${APP_DOMAIN}
+  CORS_ORIGINS: https://${APP_DOMAIN}
+  JWT_ALG: HS256
+  JWT_SECRET: ${JWT_SECRET}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+  AI_PROVIDER: ${AI_PROVIDER:-none}
+  AI_API_KEY: ${AI_API_KEY:-}
+  AI_MODEL: ${AI_MODEL:-}
+  BILLING_CURRENCY: ${BILLING_CURRENCY:-NGN}
+  PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY:-}
+  PAYSTACK_PUBLIC_KEY: ${PAYSTACK_PUBLIC_KEY:-}
+  # Reads pricing + quota limits from the Vhicasar Admin.
+  ADMIN_API_URL: ${ADMIN_API_URL:-https://admin.vhicasar.com}
+  ADMIN_TENANT_SLUG: businesshub-ai
+  ADMIN_PLAN_SYNC: "true"
+
 services:
   agentv-postgres:
     image: postgres:16-alpine
@@ -30,31 +53,39 @@ services:
       timeout: 3s
       retries: 12
 
+  agentv-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - agentv_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
   agentv-backend:
     image: ghcr.io/${GHCR_OWNER}/agentv-backend:latest
     restart: unless-stopped
-    environment:
-      NODE_ENV: production
-      PORT: "4000"
-      DATABASE_URL: postgresql://businesshub:${DB_PASSWORD}@agentv-postgres:5432/businesshub?schema=public
-      API_BASE_URL: https://${APP_DOMAIN}
-      WEB_APP_URL: https://${APP_DOMAIN}
-      CORS_ORIGINS: https://${APP_DOMAIN}
-      JWT_ALG: HS256
-      JWT_SECRET: ${JWT_SECRET}
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
-      AI_PROVIDER: ${AI_PROVIDER:-none}
-      AI_API_KEY: ${AI_API_KEY:-}
-      AI_MODEL: ${AI_MODEL:-}
-      BILLING_CURRENCY: ${BILLING_CURRENCY:-NGN}
-      PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY:-}
-      PAYSTACK_PUBLIC_KEY: ${PAYSTACK_PUBLIC_KEY:-}
-      # Reads pricing + quota limits from the Vhicasar Admin.
-      ADMIN_API_URL: ${ADMIN_API_URL:-https://admin.vhicasar.com}
-      ADMIN_TENANT_SLUG: businesshub-ai
-      ADMIN_PLAN_SYNC: "true"
+    environment: *backend-env
     depends_on:
       agentv-postgres:
+        condition: service_healthy
+      agentv-redis:
+        condition: service_healthy
+
+  # Async job processor (workflow automations + campaign sends). Same image as
+  # the API, different command; no migrations (the API runs those).
+  agentv-worker:
+    image: ghcr.io/${GHCR_OWNER}/agentv-backend:latest
+    restart: unless-stopped
+    command: ["node", "dist/worker.js"]
+    environment: *backend-env
+    depends_on:
+      agentv-backend:
+        condition: service_started
+      agentv-redis:
         condition: service_healthy
 
   agentv-web:
@@ -68,3 +99,4 @@ services:
 
 volumes:
   agentv_pgdata:
+  agentv_redisdata:

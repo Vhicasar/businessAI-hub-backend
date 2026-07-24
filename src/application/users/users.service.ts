@@ -7,6 +7,7 @@ import {
 import { generateOpaqueToken, hashPassword, sha256 } from '../../shared/crypto';
 import { prisma } from '../../infrastructure/database/prisma';
 import { mailer } from '../../infrastructure/mail/mailer';
+import { auditService } from '../audit/audit.service';
 import type { AcceptInviteDto, InviteUserDto, UpdateMemberDto, UpdateProfileDto } from './users.dto';
 
 const memberSelect = {
@@ -60,13 +61,15 @@ export const usersService = {
     const org = await prisma.organization.findUniqueOrThrow({ where: { id: organizationId } });
     const raw = generateOpaqueToken();
 
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     await prisma.invitation.upsert({
       where: { organizationId_email: { organizationId, email: dto.email } },
       update: {
         roleId: dto.roleId,
         invitedById,
+        employeeId: dto.employeeId ?? null,
         tokenHash: sha256(raw),
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        expiresAt,
         acceptedAt: null,
       },
       create: {
@@ -74,12 +77,18 @@ export const usersService = {
         email: dto.email,
         roleId: dto.roleId,
         invitedById,
+        employeeId: dto.employeeId ?? null,
         tokenHash: sha256(raw),
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        expiresAt,
       },
     });
 
     await mailer.sendInvitation(dto.email, org.name, raw);
+    await auditService.record({
+      action: 'member.invited',
+      entityType: 'INVITATION',
+      after: { email: dto.email, roleId: dto.roleId },
+    });
     return { message: `Invitation sent to ${dto.email}` };
   },
 
@@ -119,6 +128,17 @@ export const usersService = {
       });
     }
 
+    // An employee invite carries the staff record it came from, so the new
+    // login can inherit its department/job title.
+    // Accepting is a public route, so there is no tenant context here and the
+    // Prisma extension won't scope this — pin the org from the invite by hand.
+    const employee = inv.employeeId
+      ? await prisma.employee.findFirst({
+          where: { id: inv.employeeId, organizationId: inv.organizationId, deletedAt: null },
+          select: { id: true, userId: true, departmentId: true, jobTitle: true },
+        })
+      : null;
+
     const existing = await prisma.membership.findFirst({
       where: { organizationId: inv.organizationId, userId: user.id },
     });
@@ -131,8 +151,28 @@ export const usersService = {
       }
     } else {
       await prisma.membership.create({
-        data: { organizationId: inv.organizationId, userId: user.id, roleId: inv.roleId },
+        data: {
+          organizationId: inv.organizationId,
+          userId: user.id,
+          roleId: inv.roleId,
+          ...(employee ? { departmentId: employee.departmentId, jobTitle: employee.jobTitle } : {}),
+        },
       });
+    }
+
+    // Link the staff record to the account. Employee.userId is unique, so only
+    // claim it when free — if this user is already another employee, leave both
+    // alone rather than stealing the link or failing an otherwise-valid invite.
+    if (employee && !employee.userId) {
+      // Employee.userId is unique platform-wide, so this check is deliberately
+      // not org-scoped: the account may already be staff in another tenant.
+      const claimed = await prisma.employee.findFirst({
+        where: { userId: user.id },
+        select: { id: true },
+      });
+      if (!claimed) {
+        await prisma.employee.update({ where: { id: employee.id }, data: { userId: user.id } });
+      }
     }
 
     await prisma.invitation.update({ where: { id: inv.id }, data: { acceptedAt: new Date() } });
@@ -156,7 +196,7 @@ export const usersService = {
       if (!role) throw new NotFoundError('Role');
     }
 
-    return prisma.membership.update({
+    const updated = await prisma.membership.update({
       where: { id: membershipId },
       data: {
         ...(dto.roleId ? { roleId: dto.roleId } : {}),
@@ -165,6 +205,23 @@ export const usersService = {
       },
       select: memberSelect,
     });
+    if (dto.roleId && dto.roleId !== member.roleId) {
+      await auditService.record({
+        action: 'member.role_changed',
+        entityType: 'MEMBERSHIP',
+        entityId: membershipId,
+        before: { roleId: member.roleId, role: member.role.name },
+        after: { roleId: dto.roleId },
+      });
+    }
+    if (dto.isActive !== undefined && dto.isActive !== member.isActive) {
+      await auditService.record({
+        action: dto.isActive ? 'member.activated' : 'member.deactivated',
+        entityType: 'MEMBERSHIP',
+        entityId: membershipId,
+      });
+    }
+    return updated;
   },
 
   async removeMember(membershipId: string, actorMembershipId: string) {
@@ -178,6 +235,12 @@ export const usersService = {
     await prisma.membership.update({
       where: { id: membershipId },
       data: { deletedAt: new Date(), isActive: false },
+    });
+    await auditService.record({
+      action: 'member.removed',
+      entityType: 'MEMBERSHIP',
+      entityId: membershipId,
+      before: { userId: member.userId },
     });
   },
 

@@ -1,28 +1,10 @@
 import type { RequestHandler } from 'express';
 import { ForbiddenError, UnauthorizedError } from '../../../shared/errors';
-import { prisma } from '../../../infrastructure/database/prisma';
+import { permissionsForRole } from '../../../application/roles/role-permissions';
 
-const CACHE_TTL_MS = 60_000;
-const cache = new Map<string, { keys: Set<string>; expires: number }>();
-
-async function permissionsForRole(roleId: string): Promise<Set<string>> {
-  const hit = cache.get(roleId);
-  if (hit && hit.expires > Date.now()) return hit.keys;
-
-  const rows = await prisma.rolePermission.findMany({
-    where: { roleId },
-    select: { permission: { select: { key: true } } },
-  });
-  const keys = new Set(rows.map((r) => r.permission.key));
-  cache.set(roleId, { keys, expires: Date.now() + CACHE_TTL_MS });
-  return keys;
-}
-
-/** Invalidate after role edits (call from role management use cases). */
-export function invalidateRoleCache(roleId?: string): void {
-  if (roleId) cache.delete(roleId);
-  else cache.clear();
-}
+// Re-exported so existing importers keep working; the cache itself now lives in
+// the application layer, where services can consult it too.
+export { invalidateRoleCache, callerHasPermission } from '../../../application/roles/role-permissions';
 
 /**
  * Gate a route behind one or more permission keys.

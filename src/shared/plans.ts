@@ -11,6 +11,7 @@ export const FEATURE_KEYS = [
   'inbox', // omnichannel inbox
   'ai_support', // AI customer support (24/7 answering)
   'ai_sales', // AI sales agent (recommend, upsell, qualify, follow-up)
+  'ai_insights', // AI summaries, sentiment, scoring and next-best-action insights
   'crm', // smart CRM + pipeline
   'catalog', // product catalog / e-commerce
   'orders', // order management
@@ -42,6 +43,8 @@ export interface PlanSeed {
   priceYearly: number;
   currency: string;
   maxUsers: number | null;
+  /** How many businesses (organizations) a user on this plan may create. */
+  maxBusinesses: number | null;
   maxBranches: number | null;
   maxProducts: number | null;
   maxChannels: number | null;
@@ -65,6 +68,7 @@ export const PLAN_CATALOG: PlanSeed[] = [
     priceYearly: 0,
     currency: 'NGN',
     maxUsers: 1,
+    maxBusinesses: 1,
     maxBranches: 1,
     maxProducts: 50,
     maxChannels: 1,
@@ -82,14 +86,15 @@ export const PLAN_CATALOG: PlanSeed[] = [
     priceYearly: yearly(8500),
     currency: 'NGN',
     maxUsers: 3,
+    maxBusinesses: 2,
     maxBranches: 1,
     maxProducts: 10_000,
     maxChannels: 4,
     maxContacts: 5_000,
     aiCreditsMonthly: 3_000,
     features: [
-      'inbox', 'ai_support', 'ai_sales', 'crm', 'catalog', 'orders', 'invoices',
-      'marketing', 'analytics', 'knowledge_base', 'team', 'loyalty',
+      'inbox', 'ai_support', 'ai_sales', 'ai_insights', 'crm', 'catalog', 'orders', 'invoices',
+      'marketing', 'analytics', 'knowledge_base', 'team', 'loyalty', 'pos',
     ],
     isPublic: true,
     position: 2,
@@ -102,13 +107,14 @@ export const PLAN_CATALOG: PlanSeed[] = [
     priceYearly: yearly(22_500),
     currency: 'NGN',
     maxUsers: 10,
+    maxBusinesses: 5,
     maxBranches: null,
     maxProducts: null,
     maxChannels: null,
     maxContacts: null,
     aiCreditsMonthly: 15_000,
     features: [
-      'inbox', 'ai_support', 'ai_sales', 'crm', 'catalog', 'orders', 'invoices',
+      'inbox', 'ai_support', 'ai_sales', 'ai_insights', 'crm', 'catalog', 'orders', 'invoices',
       'inventory', 'marketing', 'automations', 'analytics', 'knowledge_base',
       'team', 'loyalty', 'pos', 'api', 'webhooks',
     ],
@@ -123,6 +129,7 @@ export const PLAN_CATALOG: PlanSeed[] = [
     priceYearly: 0,
     currency: 'NGN',
     maxUsers: null,
+    maxBusinesses: null,
     maxBranches: null,
     maxProducts: null,
     maxChannels: null,

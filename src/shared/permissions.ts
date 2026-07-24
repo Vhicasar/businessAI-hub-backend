@@ -32,7 +32,18 @@ export const PERMISSION_MODULES = {
   bookings: ['read', 'create', 'update', 'cancel'],
   maintenance: ['read', 'create', 'update', 'assign'],
   commissions: ['read', 'approve', 'pay'],
-  employees: ['read', 'create', 'update', 'delete'],
+  // People. The HR areas below are deliberately separate modules rather than
+  // `employees` actions: reading the staff directory must not imply reading
+  // salaries, payslips, medical leave or interview feedback.
+  employees: ['read', 'create', 'update', 'delete', 'invite', 'manage_departments', 'view_salary'],
+  leave: ['read', 'request', 'approve', 'manage_types'],
+  attendance: ['read', 'clock', 'manage_shifts', 'manage_roster'],
+  payroll: ['read', 'configure', 'process', 'approve', 'pay'],
+  assets: ['read', 'create', 'update', 'delete', 'assign'],
+  expenses: ['read', 'create', 'approve', 'reimburse'],
+  recruitment: ['read', 'create', 'update', 'delete', 'hire'],
+  performance: ['read', 'manage_cycles', 'review', 'manage_goals', 'give_feedback'],
+  learning: ['read', 'manage_courses', 'enroll'],
   analytics: ['view', 'export'],
   ai: ['use_assistant', 'configure'],
   files: ['read', 'upload', 'delete'],
@@ -128,6 +139,27 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, { description: string; permis
       ...keysFor('marketing', 'segments', 'automations', 'loyalty'),
       'customers.read', 'customers.export', 'catalog.read',
       'analytics.view', 'ai.use_assistant', 'files.read', 'files.upload',
+    ],
+  },
+  'HR Manager': {
+    description: 'People operations: directory, leave, attendance, recruitment, performance and assets — excludes payroll',
+    permissions: [
+      'dashboard.view',
+      ...keysFor('employees').filter((k) => k !== 'employees.view_salary'),
+      ...keysFor('leave', 'attendance', 'assets', 'expenses', 'recruitment', 'performance', 'learning'),
+      'analytics.view', 'ai.use_assistant', 'files.read', 'files.upload',
+    ],
+  },
+  'Payroll Officer': {
+    description: 'Payroll runs, pay components and payslips, with read-only access to the staff directory',
+    permissions: [
+      'dashboard.view',
+      ...keysFor('payroll'),
+      // Salary lives on the employee record, so payroll work needs it explicitly.
+      'employees.read', 'employees.view_salary',
+      'leave.read', 'attendance.read',
+      'expenses.read', 'expenses.reimburse',
+      'analytics.view', 'files.read', 'files.upload',
     ],
   },
   Agent: {

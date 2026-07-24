@@ -68,10 +68,53 @@ async function syncSystemRoles(): Promise<void> {
   console.log(`✓ system roles synced for ${orgs.length} organization(s)`);
 }
 
+/**
+ * The HR permissions used to live inside `employees.*`, so a custom role with
+ * employees.read implicitly granted payroll, leave, recruitment and the rest.
+ * Splitting them fails closed: those roles keep the directory and lose the
+ * sensitive areas until an admin re-grants them on purpose. That's the point —
+ * but it must not be a silent surprise, so name the affected roles.
+ */
+async function reportSplitImpact(): Promise<void> {
+  const roles = await prisma.role.findMany({
+    where: { isSystem: false },
+    select: {
+      name: true,
+      organization: { select: { name: true } },
+      permissions: { select: { permission: { select: { key: true } } } },
+    },
+  });
+
+  const affected = roles
+    .map((r) => ({
+      role: r.name,
+      org: r.organization.name,
+      keys: new Set(r.permissions.map((p) => p.permission.key)),
+    }))
+    .filter((r) => r.keys.has('employees.read') || r.keys.has('employees.update'))
+    // Only flag roles that haven't already been given the new permissions.
+    .filter((r) => !['payroll.read', 'leave.read', 'recruitment.read'].every((k) => r.keys.has(k)));
+
+  if (affected.length === 0) {
+    console.log('✓ no custom roles affected by the HR permission split');
+    return;
+  }
+
+  console.log(`\n⚠ ${affected.length} custom role(s) lost implicit HR access in the permission split.`);
+  console.log('  They keep the employee directory. Re-grant the new permissions if they need them:');
+  console.log('  (Settings → Roles — new modules: leave, attendance, payroll, assets, expenses,');
+  console.log('   recruitment, performance, learning; salary is now employees.view_salary)\n');
+  for (const a of affected) {
+    console.log(`    • ${a.org} → "${a.role}"`);
+  }
+  console.log('');
+}
+
 async function main(): Promise<void> {
   await seedPermissions();
   await seedPlans();
   await syncSystemRoles();
+  await reportSplitImpact();
 }
 
 main()

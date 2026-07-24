@@ -8,6 +8,7 @@ import {
   invoicePaymentSchema,
   invoicesService,
   listInvoicesSchema,
+  updateInvoiceSchema,
 } from '../../../application/invoices/invoices.service';
 
 const wrap =
@@ -55,6 +56,23 @@ invoicesRoutes.get(
   requirePermission('invoices.read'),
   wrap(async (req, res) => {
     res.json({ success: true, data: await invoicesService.get(req.params.id as string) });
+  })
+);
+
+invoicesRoutes.patch(
+  '/:id',
+  requirePermission('invoices.update'),
+  validate({ body: updateInvoiceSchema }),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await invoicesService.update(req.params.id as string, req.body) });
+  })
+);
+
+invoicesRoutes.post(
+  '/:id/send',
+  requirePermission('invoices.send', 'invoices.update'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await invoicesService.send(req.params.id as string) });
   })
 );
 

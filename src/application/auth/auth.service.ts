@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 import { authenticator } from 'otplib';
 import {
   ConflictError,
+  ForbiddenError,
   NotFoundError,
   UnauthorizedError,
   ValidationError,
@@ -15,14 +16,21 @@ import {
   verifyPassword,
 } from '../../shared/crypto';
 import { logger } from '../../shared/logger';
-import { prisma } from '../../infrastructure/database/prisma';
+import { prisma, prismaUnscoped } from '../../infrastructure/database/prisma';
 import { mailer } from '../../infrastructure/mail/mailer';
 import { SYSTEM_ROLE_TEMPLATES, OWNER_ROLE_NAME } from '../../shared/permissions';
+import { PLAN_CATALOG } from '../../shared/plans';
+import { resolveEntitlements } from '../billing/entitlements';
+import { resolveLocale } from '../../shared/currency';
 import { tokenService } from './token.service';
-import type { LoginDto, MfaVerifyDto, RegisterDto } from './auth.dto';
+import { filesService } from '../files/files.service';
+import type { CreateOrganizationDto, LoginDto, MfaVerifyDto, RegisterDto } from './auth.dto';
 
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCK_MINUTES = 15;
+
+/** The transaction client our extended Prisma client actually yields. */
+type TenantTransactionClient = Parameters<Parameters<typeof prisma.$transaction>[0]>[0];
 
 export interface RequestMeta {
   userAgent?: string;
@@ -40,7 +48,7 @@ export interface SessionResult {
     emailVerified: boolean;
     twoFactorEnabled: boolean;
   };
-  organization: { id: string; name: string; slug: string } | null;
+  organization: { id: string; name: string; slug: string; logoUrl: string | null } | null;
 }
 
 function slugify(name: string): string {
@@ -89,7 +97,15 @@ async function buildSession(
 ): Promise<SessionResult> {
   const user = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
 
-  const membership = await prisma.membership.findFirst({
+  // Unscoped deliberately. Building a session is inherently cross-tenant: the
+  // caller may be switching *out* of the org in the current request context,
+  // and the tenant extension would AND that context onto this lookup — so the
+  // target membership could never be found and the session would come back
+  // with no organisation at all.
+  //
+  // `userId` is the security boundary here: we only ever return memberships
+  // belonging to the user we already authenticated.
+  const membership = await prismaUnscoped.membership.findFirst({
     where: {
       userId,
       isActive: true,
@@ -97,7 +113,7 @@ async function buildSession(
       ...(organizationId ? { organizationId } : {}),
     },
     orderBy: { createdAt: 'asc' },
-    include: { organization: { select: { id: true, name: true, slug: true } } },
+    include: { organization: { select: { id: true, name: true, slug: true, logoFileId: true } } },
   });
 
   const accessToken = tokenService.signAccessToken({
@@ -121,8 +137,106 @@ async function buildSession(
       emailVerified: Boolean(user.emailVerifiedAt),
       twoFactorEnabled: user.twoFactorEnabled,
     },
-    organization: membership?.organization ?? null,
+    organization: membership
+      ? {
+          id: membership.organization.id,
+          name: membership.organization.name,
+          slug: membership.organization.slug,
+          logoUrl: await filesService.urlFor(membership.organization.logoFileId),
+        }
+      : null,
   };
+}
+
+/**
+ * Provision a workspace: the organisation, its system roles, the owner's
+ * membership and a trial subscription.
+ *
+ * Extracted from `register` so that creating a *second* business gets exactly
+ * the same setup as the first. A user's Nth business must not be a lesser
+ * citizen than their first — same roles, same trial, same everything.
+ *
+ * Runs inside the caller's transaction.
+ */
+async function provisionOrganization(
+  // Derived from the extended client rather than Prisma.TransactionClient:
+  // the tenant extension changes the client's shape, so the stock type doesn't
+  // match what $transaction actually hands us.
+  tx: TenantTransactionClient,
+  input: {
+    userId: string;
+    name: string;
+    businessType: RegisterDto['businessType'];
+    email: string;
+    timezone?: string;
+    locale?: string;
+    currency?: string;
+  },
+  permByKey: Map<string, string>,
+): Promise<{ orgId: string }> {
+  const baseSlug = slugify(input.name) || 'workspace';
+  let slug = baseSlug;
+  if (await tx.organization.findUnique({ where: { slug } })) {
+    slug = `${baseSlug}-${randomUUID().slice(0, 6)}`;
+  }
+
+  // Where the owner is decides what the org trades in (see shared/currency).
+  const locale = resolveLocale({
+    timezone: input.timezone,
+    locale: input.locale,
+    currency: input.currency,
+  });
+
+  const org = await tx.organization.create({
+    data: {
+      name: input.name,
+      slug,
+      businessType: input.businessType,
+      email: input.email,
+      currency: locale.currency,
+      country: locale.country,
+      timezone: locale.timezone,
+      ...(input.locale ? { locale: input.locale } : {}),
+    },
+  });
+
+  let ownerRoleId: string | null = null;
+  for (const [name, tpl] of Object.entries(SYSTEM_ROLE_TEMPLATES)) {
+    const role = await tx.role.create({
+      data: { organizationId: org.id, name, description: tpl.description, isSystem: true },
+    });
+    const wanted = tpl.permissions.map((k) => permByKey.get(k)).filter((id): id is string => Boolean(id));
+    if (wanted.length > 0) {
+      await tx.rolePermission.createMany({
+        data: wanted.map((permissionId) => ({ roleId: role.id, permissionId })),
+      });
+    }
+    if (name === OWNER_ROLE_NAME) ownerRoleId = role.id;
+  }
+  if (!ownerRoleId) throw new Error('Owner role template missing');
+
+  await tx.membership.create({
+    data: { organizationId: org.id, userId: input.userId, roleId: ownerRoleId, isOwner: true },
+  });
+
+  // 14-day trial on the starter plan when seeded.
+  const starter = await tx.plan.findUnique({ where: { slug: 'starter' } });
+  if (starter) {
+    const now = new Date();
+    const trialEnd = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
+    await tx.subscription.create({
+      data: {
+        organizationId: org.id,
+        planId: starter.id,
+        status: 'TRIALING',
+        trialEndsAt: trialEnd,
+        currentPeriodStart: now,
+        currentPeriodEnd: trialEnd,
+      },
+    });
+  }
+
+  return { orgId: org.id };
 }
 
 export const authService = {
@@ -132,7 +246,6 @@ export const authService = {
     if (existing) throw new ConflictError('An account with this email already exists');
 
     const passwordHash = await hashPassword(dto.password);
-    const baseSlug = slugify(dto.organizationName) || 'workspace';
 
     const permissions = await prisma.permission.findMany({ select: { id: true, key: true } });
     if (permissions.length === 0) {
@@ -151,71 +264,21 @@ export const authService = {
         },
       });
 
-      // Unique slug: append short suffix on collision.
-      let slug = baseSlug;
-      if (await tx.organization.findUnique({ where: { slug } })) {
-        slug = `${baseSlug}-${randomUUID().slice(0, 6)}`;
-      }
-
-      const org = await tx.organization.create({
-        data: {
+      const { orgId } = await provisionOrganization(
+        tx,
+        {
+          userId: user.id,
           name: dto.organizationName,
-          slug,
           businessType: dto.businessType,
           email: dto.email,
+          timezone: dto.timezone,
+          locale: dto.locale,
+          currency: dto.currency,
         },
-      });
+        permByKey,
+      );
 
-      // Instantiate system roles from templates.
-      let ownerRoleId: string | null = null;
-      for (const [name, tpl] of Object.entries(SYSTEM_ROLE_TEMPLATES)) {
-        const role = await tx.role.create({
-          data: {
-            organizationId: org.id,
-            name,
-            description: tpl.description,
-            isSystem: true,
-          },
-        });
-        const wanted = tpl.permissions
-          .map((k) => permByKey.get(k))
-          .filter((id): id is string => Boolean(id));
-        if (wanted.length > 0) {
-          await tx.rolePermission.createMany({
-            data: wanted.map((permissionId) => ({ roleId: role.id, permissionId })),
-          });
-        }
-        if (name === OWNER_ROLE_NAME) ownerRoleId = role.id;
-      }
-      if (!ownerRoleId) throw new Error('Owner role template missing');
-
-      await tx.membership.create({
-        data: {
-          organizationId: org.id,
-          userId: user.id,
-          roleId: ownerRoleId,
-          isOwner: true,
-        },
-      });
-
-      // 14-day trial on the starter plan when seeded.
-      const starter = await tx.plan.findUnique({ where: { slug: 'starter' } });
-      if (starter) {
-        const now = new Date();
-        const trialEnd = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
-        await tx.subscription.create({
-          data: {
-            organizationId: org.id,
-            planId: starter.id,
-            status: 'TRIALING',
-            trialEndsAt: trialEnd,
-            currentPeriodStart: now,
-            currentPeriodEnd: trialEnd,
-          },
-        });
-      }
-
-      return { userId: user.id, orgId: org.id };
+      return { userId: user.id, orgId };
     });
 
     // Email verification token (24 h)
@@ -231,6 +294,110 @@ export const authService = {
     await mailer.sendEmailVerification(dto.email, rawToken);
     await audit('auth.register', userId, orgId, meta);
 
+    return buildSession(userId, meta, orgId);
+  },
+
+  // --------------------------------------------------- multiple businesses
+  /**
+   * Every business this user belongs to. Drives the switcher, so it returns
+   * enough to render one without a second round-trip.
+   */
+  async organizations(userId: string) {
+    // Unscoped: the whole point is to see every business, not just the active
+    // one. Scoped by userId instead.
+    const memberships = await prismaUnscoped.membership.findMany({
+      where: { userId, isActive: true, deletedAt: null },
+      orderBy: { createdAt: 'asc' },
+      select: {
+        id: true,
+        isOwner: true,
+        createdAt: true,
+        role: { select: { id: true, name: true } },
+        organization: {
+          select: { id: true, name: true, slug: true, businessType: true, currency: true, logoFileId: true },
+        },
+      },
+    });
+    return memberships.map((m) => ({
+      membershipId: m.id,
+      isOwner: m.isOwner,
+      role: m.role,
+      joinedAt: m.createdAt,
+      ...m.organization,
+    }));
+  },
+
+  /**
+   * Create an additional business for an existing user, and switch into it.
+   * Same provisioning as signup: system roles, owner membership, trial.
+   */
+  /** Throws when the user has hit their plan's business-creation limit. */
+  async assertCanCreateBusiness(userId: string): Promise<void> {
+    const memberships = await prismaUnscoped.membership.findMany({
+      where: { userId, deletedAt: null },
+      select: { organizationId: true },
+    });
+    if (memberships.length === 0) return; // first business is always allowed
+
+    const subs = await prismaUnscoped.subscription.findMany({
+      where: {
+        organizationId: { in: memberships.map((m) => m.organizationId) },
+        status: { in: ['TRIALING', 'ACTIVE', 'PAST_DUE'] },
+      },
+      include: { plan: { select: { slug: true } } },
+    });
+    const starterMax = PLAN_CATALOG.find((p) => p.slug === 'starter')?.maxBusinesses ?? 1;
+    // No paid subscription anywhere → treat as the free (starter) allowance.
+    const slugs = subs.length ? subs.map((s) => s.plan.slug) : ['starter'];
+    let allowance = 0;
+    for (const slug of slugs) {
+      const max = PLAN_CATALOG.find((p) => p.slug === slug)?.maxBusinesses ?? starterMax;
+      if (max === null) return; // an unlimited plan → allow
+      allowance = Math.max(allowance, max);
+    }
+    if (memberships.length >= allowance) {
+      throw new ValidationError(
+        `Your plan allows up to ${allowance} business${allowance === 1 ? '' : 'es'}. Upgrade your plan to add more.`,
+      );
+    }
+  },
+
+  async createOrganization(
+    userId: string,
+    dto: CreateOrganizationDto,
+    meta: RequestMeta,
+  ): Promise<SessionResult> {
+    const user = await prisma.user.findUniqueOrThrow({
+      where: { id: userId },
+      select: { email: true },
+    });
+
+    // Enforce the plan's business-creation limit (Free 1, Growth 2, …), server-
+    // side regardless of the client. Based on the most generous plan the user
+    // is already on.
+    await this.assertCanCreateBusiness(userId);
+
+    const permissions = await prisma.permission.findMany({ select: { id: true, key: true } });
+    const permByKey = new Map(permissions.map((p) => [p.key, p.id]));
+
+    const { orgId } = await prisma.$transaction((tx) =>
+      provisionOrganization(
+        tx,
+        {
+          userId,
+          name: dto.name,
+          businessType: dto.businessType,
+          email: user.email,
+          timezone: dto.timezone,
+          locale: dto.locale,
+          currency: dto.currency,
+        },
+        permByKey,
+      ),
+    );
+
+    await audit('auth.organization_created', userId, orgId, meta);
+    // Drop them straight into the new business — that's why they made it.
     return buildSession(userId, meta, orgId);
   },
 
@@ -498,7 +665,7 @@ export const authService = {
             id: true,
             isOwner: true,
             jobTitle: true,
-            organization: { select: { id: true, name: true, slug: true, businessType: true } },
+            organization: { select: { id: true, name: true, slug: true, businessType: true, logoFileId: true } },
             role: {
               select: {
                 id: true,
@@ -511,10 +678,25 @@ export const authService = {
       },
     });
     if (!user) throw new NotFoundError('User');
+    // Resolve every org's logo in one batch rather than per-membership.
+    const logoUrls = await filesService.urlMap(user.memberships.map((m) => m.organization.logoFileId));
+    // Each org's plan features, so the UI can gate modules by plan (not just RBAC).
+    const featureEntries = await Promise.all(
+      user.memberships.map(async (m) => [m.organization.id, [...(await resolveEntitlements(m.organization.id)).features]] as const),
+    );
+    const featuresByOrg = new Map(featureEntries);
     return {
       ...user,
       memberships: user.memberships.map((m) => ({
         ...m,
+        features: featuresByOrg.get(m.organization.id) ?? [],
+        organization: {
+          id: m.organization.id,
+          name: m.organization.name,
+          slug: m.organization.slug,
+          businessType: m.organization.businessType,
+          logoUrl: m.organization.logoFileId ? logoUrls.get(m.organization.logoFileId) ?? null : null,
+        },
         role: { id: m.role.id, name: m.role.name, permissions: m.role.permissions.map((p) => p.permission.key) },
       })),
     };
@@ -544,11 +726,29 @@ export const authService = {
     });
   },
 
+  /**
+   * Switch the active business, minting a session scoped to it.
+   *
+   * The active org is a claim inside the access token, so switching cannot be a
+   * client-side toggle — it has to come back through here. Membership is
+   * re-checked rather than trusted from the request: this function is the
+   * boundary between two tenants' data.
+   *
+   * Also used by the invite-accept flow to open a session in the org a user has
+   * just joined.
+   */
   async switchOrganization(userId: string, organizationId: string, meta: RequestMeta): Promise<SessionResult> {
-    const membership = await prisma.membership.findFirst({
+    // Unscoped: we're checking membership of the org being switched *to*, which
+    // by definition isn't the one in the current context. userId is the guard.
+    const membership = await prismaUnscoped.membership.findFirst({
       where: { userId, organizationId, isActive: true, deletedAt: null },
+      select: { id: true },
     });
-    if (!membership) throw new NotFoundError('Membership in that organization');
+    // Forbidden, not NotFound: the org may well exist — this user just has no
+    // membership in it, and saying which is a needless information leak.
+    if (!membership) throw new ForbiddenError('You do not have access to that business');
+
+    await audit('auth.organization_switched', userId, organizationId, meta);
     return buildSession(userId, meta, organizationId);
   },
 };

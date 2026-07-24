@@ -6,6 +6,8 @@ import { WhatsAppAdapter } from './whatsapp.adapter';
 import { MetaMessagingAdapter } from './meta.adapter';
 import { WebChatAdapter } from './webchat.adapter';
 import { EmailAdapter } from './email.adapter';
+import { SmsAdapter } from './sms.adapter';
+import { TikTokAdapter } from './tiktok.adapter';
 
 const adapters = new Map<ChannelType, ChannelAdapter>();
 
@@ -19,7 +21,8 @@ register(new MetaMessagingAdapter('FACEBOOK_MESSENGER', 'page'));
 register(new MetaMessagingAdapter('INSTAGRAM', 'instagram'));
 register(new WebChatAdapter());
 register(new EmailAdapter());
-// Future: SmsAdapter (provider-agnostic), TikTok, LinkedIn, Discord, Slack, X.
+register(new SmsAdapter());
+register(new TikTokAdapter());
 
 export function getAdapter(channelType: ChannelType): ChannelAdapter {
   const adapter = adapters.get(channelType);

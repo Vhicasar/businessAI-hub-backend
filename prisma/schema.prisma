@@ -32,6 +32,13 @@ enum OrgStatus {
   CANCELLED
 }
 
+enum SmsWalletTransactionType {
+  PURCHASE
+  SEND
+  ROLLBACK
+  ADJUSTMENT
+}
+
 enum BusinessType {
   ECOMMERCE
   RETAIL
@@ -523,7 +530,10 @@ model Organization {
   country      String?      @db.Char(2)
   postalCode   String?
   timezone     String       @default("UTC")
-  currency     String       @default("USD") @db.Char(3)
+  /// Set from the owner's location at signup (see shared/currency.ts). This
+  /// default only applies when that can't be determined — naira rather than
+  /// USD, because the subscription plans are priced in NGN.
+  currency     String       @default("NGN") @db.Char(3)
   locale       String       @default("en")
   settings     Json?
   createdAt    DateTime     @default(now())
@@ -539,6 +549,8 @@ model Organization {
   subscriptions Subscription[]
   apiKeys       ApiKey[]
   usageCounters UsageCounter[]
+  smsWallet     SmsWallet?
+  addOnPurchases AddOnPurchase[]
 
   @@index([status])
 }
@@ -756,14 +768,20 @@ model Invitation {
   email          String
   roleId         String
   invitedById    String
+  /// Set when the invite was raised from an employee record; on acceptance the
+  /// new user is linked back to it (Employee.userId), which is what makes the
+  /// person assignable as an owner/approver.
+  employeeId     String?
   tokenHash      String    @unique
   expiresAt      DateTime
   acceptedAt     DateTime?
   createdAt      DateTime  @default(now())
 
   organization Organization @relation(fields: [organizationId], references: [id])
+  employee     Employee?    @relation(fields: [employeeId], references: [id])
 
   @@unique([organizationId, email])
+  @@index([employeeId])
 }
 
 model DeviceToken {
@@ -1372,6 +1390,7 @@ model Product {
   taxRate        Decimal       @default(0) @db.Decimal(5, 2)
   attributes     Json? // definition of variant option axes e.g. [{name:"Size",values:["S","M"]}]
   aiTags         Json? // AI-generated search/recommendation tags
+  customFields   Json? // arbitrary extras, incl. externalId from an imported system
   isFeatured     Boolean       @default(false)
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
@@ -1558,11 +1577,17 @@ model Warehouse {
   id             String    @id @default(cuid())
   organizationId String
   branchId       String?
+  /// Membership id of the staff member responsible for this warehouse.
+  managerId      String?
   name           String
   code           String
   addressLine1   String?
+  addressLine2   String?
   city           String?
+  state          String?
+  postalCode     String?
   country        String?   @db.Char(2)
+  phone          String?
   isDefault      Boolean   @default(false)
   isActive       Boolean   @default(true)
   createdAt      DateTime  @default(now())
@@ -2180,6 +2205,8 @@ model Ticket {
   closedAt          DateTime?
   escalatedAt       DateTime?
   satisfactionScore Int? // 1-5 CSAT
+  npsScore          Int? // 0-10 "would you recommend"
+  cesScore          Int? // 1-7 customer effort score
   aiSentiment       String?
   createdAt         DateTime       @default(now())
   updatedAt         DateTime       @updatedAt
@@ -2193,6 +2220,19 @@ model Ticket {
   @@index([organizationId, status, priority])
   @@index([customerId])
   @@index([assigneeId])
+}
+
+model TicketComment {
+  id             String   @id @default(cuid())
+  organizationId String
+  ticketId       String
+  authorType     String   @default("AGENT") // AGENT | CUSTOMER | SYSTEM | AI
+  authorUserId   String?
+  body           String   @db.Text
+  isInternal     Boolean  @default(false) // internal note vs. customer-visible reply
+  createdAt      DateTime @default(now())
+
+  @@index([organizationId, ticketId, createdAt])
 }
 
 model KbCategory {
@@ -2434,12 +2474,595 @@ model Employee {
   salary         Decimal?       @db.Decimal(14, 2)
   currency       String         @default("USD") @db.Char(3)
   customFields   Json?
+  avatarFileId   String?
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
   deletedAt      DateTime?
 
+  leaveBalances    LeaveBalance[]
+  leaveRequests    LeaveRequest[]
+  shiftAssignments ShiftAssignment[]
+  attendance       AttendanceRecord[]
+  payComponents    EmployeePayComponent[]
+  payslips         Payslip[]
+  assetAssignments AssetAssignment[]
+  expenseClaims    ExpenseClaim[]
+  reviews          PerformanceReview[]
+  goals            Goal[]
+  feedback         Feedback[]
+  enrollments      Enrollment[]
+  invitations      Invitation[]
+
   @@unique([organizationId, employeeNumber])
   @@index([organizationId, status])
+}
+
+enum CycleStatus {
+  DRAFT
+  ACTIVE
+  CLOSED
+}
+
+enum ReviewStatus {
+  PENDING
+  SUBMITTED
+  ACKNOWLEDGED
+}
+
+enum GoalType {
+  KPI
+  OKR
+}
+
+enum GoalStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  ACHIEVED
+  MISSED
+}
+
+enum FeedbackType {
+  PRAISE
+  CONSTRUCTIVE
+  GENERAL
+}
+
+enum EnrollmentStatus {
+  ENROLLED
+  IN_PROGRESS
+  COMPLETED
+  EXPIRED
+}
+
+model PerformanceCycle {
+  id             String      @id @default(cuid())
+  organizationId String
+  name           String
+  periodStart    DateTime    @db.Date
+  periodEnd      DateTime    @db.Date
+  status         CycleStatus @default(DRAFT)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  reviews PerformanceReview[]
+  goals   Goal[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId, status])
+}
+
+model PerformanceReview {
+  id             String       @id @default(cuid())
+  organizationId String
+  cycleId        String
+  employeeId     String
+  reviewerId     String? // Membership id
+  status         ReviewStatus @default(PENDING)
+  overallRating  Int? // 1-5
+  strengths      String?      @db.Text
+  improvements   String?      @db.Text
+  comments       String?      @db.Text
+  submittedAt    DateTime?
+  acknowledgedAt DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  cycle    PerformanceCycle @relation(fields: [cycleId], references: [id])
+  employee Employee         @relation(fields: [employeeId], references: [id])
+
+  @@unique([cycleId, employeeId])
+  @@index([organizationId, status])
+}
+
+model Goal {
+  id             String     @id @default(cuid())
+  organizationId String
+  employeeId     String
+  cycleId        String?
+  title          String
+  description    String?    @db.Text
+  type           GoalType   @default(KPI)
+  targetValue    Float?
+  currentValue   Float?     @default(0)
+  unit           String?
+  weight         Int        @default(1)
+  progress       Int        @default(0) // 0-100
+  status         GoalStatus @default(NOT_STARTED)
+  dueAt          DateTime?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  employee Employee          @relation(fields: [employeeId], references: [id])
+  cycle    PerformanceCycle? @relation(fields: [cycleId], references: [id])
+
+  @@index([organizationId, status])
+  @@index([employeeId])
+}
+
+model Feedback {
+  id             String       @id @default(cuid())
+  organizationId String
+  employeeId     String
+  authorUserId   String?
+  type           FeedbackType @default(GENERAL)
+  body           String       @db.Text
+  isPrivate      Boolean      @default(false) // manager-only
+  createdAt      DateTime     @default(now())
+
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@index([organizationId, employeeId, createdAt])
+}
+
+model Course {
+  id             String   @id @default(cuid())
+  organizationId String
+  title          String
+  description    String?  @db.Text
+  category       String   @default("GENERAL") // ONBOARDING | COMPLIANCE | SKILLS…
+  durationMins   Int      @default(0)
+  contentUrl     String?
+  isMandatory    Boolean  @default(false)
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  enrollments Enrollment[]
+
+  @@unique([organizationId, title])
+  @@index([organizationId, isActive])
+}
+
+model Enrollment {
+  id             String           @id @default(cuid())
+  organizationId String
+  courseId       String
+  employeeId     String
+  status         EnrollmentStatus @default(ENROLLED)
+  progress       Int              @default(0) // 0-100
+  score          Int? // assessment result
+  certificateUrl String?
+  enrolledAt     DateTime         @default(now())
+  completedAt    DateTime?
+  expiresAt      DateTime? // recertification due
+  updatedAt      DateTime         @updatedAt
+
+  course   Course   @relation(fields: [courseId], references: [id])
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@unique([courseId, employeeId])
+  @@index([organizationId, status])
+  @@index([employeeId])
+}
+
+enum JobStatus {
+  DRAFT
+  OPEN
+  CLOSED
+  FILLED
+}
+
+enum ApplicantStage {
+  APPLIED
+  SCREENING
+  INTERVIEW
+  OFFER
+  HIRED
+  REJECTED
+}
+
+enum InterviewStatus {
+  SCHEDULED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+model JobPosting {
+  id             String         @id @default(cuid())
+  organizationId String
+  reference      String
+  title          String
+  departmentId   String?
+  description    String?        @db.Text
+  employmentType EmploymentType @default(FULL_TIME)
+  location       String?
+  status         JobStatus      @default(DRAFT)
+  openings       Int            @default(1)
+  salaryMin      Decimal?       @db.Decimal(14, 2)
+  salaryMax      Decimal?       @db.Decimal(14, 2)
+  currency       String         @default("USD") @db.Char(3)
+  publishedAt    DateTime?
+  closedAt       DateTime?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  deletedAt      DateTime?
+
+  applicants Applicant[]
+
+  @@unique([organizationId, reference])
+  @@index([organizationId, status])
+}
+
+model Applicant {
+  id              String         @id @default(cuid())
+  organizationId  String
+  jobPostingId    String
+  firstName       String
+  lastName        String
+  email           String?
+  phone           String?
+  resumeUrl       String?
+  resumeText      String?        @db.Text // pasted/parsed CV — feeds AI scoring
+  source          String? // CAREER_PORTAL | REFERRAL | LINKEDIN | AGENCY…
+  stage           ApplicantStage @default(APPLIED)
+  aiScore         Int? // 0-100 fit
+  aiScoreReason   String?        @db.Text
+  notes           String?        @db.Text
+  hiredEmployeeId String? // set when converted to an Employee
+  appliedAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  jobPosting JobPosting  @relation(fields: [jobPostingId], references: [id])
+  interviews Interview[]
+
+  @@index([organizationId, stage])
+  @@index([jobPostingId])
+}
+
+model Interview {
+  id             String          @id @default(cuid())
+  organizationId String
+  applicantId    String
+  scheduledAt    DateTime
+  durationMin    Int             @default(45)
+  interviewerId  String? // Membership id
+  mode           String          @default("VIDEO") // VIDEO | PHONE | ONSITE
+  meetingUrl     String?
+  status         InterviewStatus @default(SCHEDULED)
+  feedback       String?         @db.Text
+  rating         Int? // 1-5
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  applicant Applicant @relation(fields: [applicantId], references: [id])
+
+  @@index([organizationId, scheduledAt])
+  @@index([applicantId])
+}
+
+enum AssetStatus {
+  AVAILABLE
+  ASSIGNED
+  MAINTENANCE
+  RETIRED
+  LOST
+}
+
+enum ExpenseStatus {
+  SUBMITTED
+  APPROVED
+  REJECTED
+  REIMBURSED
+}
+
+model Asset {
+  id             String      @id @default(cuid())
+  organizationId String
+  assetTag       String
+  name           String
+  category       String      @default("OTHER") // LAPTOP | PHONE | VEHICLE | LICENSE | ACCESS_CARD…
+  serialNumber   String?
+  status         AssetStatus @default(AVAILABLE)
+  purchaseDate   DateTime?
+  purchaseCost   Decimal?    @db.Decimal(14, 2)
+  currency       String      @default("USD") @db.Char(3)
+  notes          String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  deletedAt      DateTime?
+
+  assignments AssetAssignment[]
+
+  @@unique([organizationId, assetTag])
+  @@index([organizationId, status])
+}
+
+model AssetAssignment {
+  id             String    @id @default(cuid())
+  organizationId String
+  assetId        String
+  employeeId     String
+  assignedAt     DateTime  @default(now())
+  returnedAt     DateTime?
+  notes          String?
+
+  asset    Asset    @relation(fields: [assetId], references: [id])
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@index([organizationId, assetId])
+  @@index([employeeId])
+}
+
+model ExpenseClaim {
+  id             String        @id @default(cuid())
+  organizationId String
+  reference      String
+  employeeId     String
+  title          String
+  category       String        @default("OTHER") // TRAVEL | MEALS | ACCOMMODATION | SUPPLIES…
+  amount         Decimal       @db.Decimal(14, 2)
+  currency       String        @default("USD") @db.Char(3)
+  incurredAt     DateTime      @db.Date
+  description    String?       @db.Text
+  receiptFileId  String?
+  status         ExpenseStatus @default(SUBMITTED)
+  approverId     String? // Membership id
+  decidedAt      DateTime?
+  decisionNote   String?
+  reimbursedAt   DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@unique([organizationId, reference])
+  @@index([organizationId, status])
+  @@index([employeeId])
+}
+
+enum PayComponentType {
+  EARNING
+  DEDUCTION
+}
+
+enum PayCalcMethod {
+  FIXED
+  PERCENT_OF_BASIC
+}
+
+enum PayrollRunStatus {
+  DRAFT
+  APPROVED
+  PAID
+  CANCELLED
+}
+
+/// An earning or deduction line definition (allowance, pension, tax…).
+/// Jurisdiction-specific tax rules are intentionally NOT modelled — configure
+/// them as PERCENT_OF_BASIC / FIXED components to suit local regulation.
+model PayComponent {
+  id             String           @id @default(cuid())
+  organizationId String
+  name           String
+  code           String
+  type           PayComponentType
+  calc           PayCalcMethod    @default(FIXED)
+  amount         Float            @default(0) // fixed amount, or percent when PERCENT_OF_BASIC
+  appliesToAll   Boolean          @default(false)
+  isActive       Boolean          @default(true)
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  assignments EmployeePayComponent[]
+
+  @@unique([organizationId, code])
+}
+
+model EmployeePayComponent {
+  id             String   @id @default(cuid())
+  organizationId String
+  employeeId     String
+  componentId    String
+  amountOverride Float?
+  createdAt      DateTime @default(now())
+
+  employee  Employee     @relation(fields: [employeeId], references: [id])
+  component PayComponent @relation(fields: [componentId], references: [id])
+
+  @@unique([employeeId, componentId])
+  @@index([organizationId])
+}
+
+model PayrollRun {
+  id              String           @id @default(cuid())
+  organizationId  String
+  reference       String
+  periodStart     DateTime         @db.Date
+  periodEnd       DateTime         @db.Date
+  status          PayrollRunStatus @default(DRAFT)
+  currency        String           @default("USD") @db.Char(3)
+  totalGross      Decimal          @default(0) @db.Decimal(14, 2)
+  totalDeductions Decimal          @default(0) @db.Decimal(14, 2)
+  totalNet        Decimal          @default(0) @db.Decimal(14, 2)
+  employeeCount   Int              @default(0)
+  notes           String?
+  approvedById    String? // Membership id
+  approvedAt      DateTime?
+  paidAt          DateTime?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  payslips Payslip[]
+
+  @@unique([organizationId, reference])
+  @@index([organizationId, status])
+}
+
+model Payslip {
+  id              String   @id @default(cuid())
+  organizationId  String
+  payrollRunId    String
+  employeeId      String
+  basicSalary     Decimal  @db.Decimal(14, 2)
+  overtimePay     Decimal  @default(0) @db.Decimal(14, 2)
+  grossPay        Decimal  @db.Decimal(14, 2)
+  totalDeductions Decimal  @default(0) @db.Decimal(14, 2)
+  netPay          Decimal  @db.Decimal(14, 2)
+  currency        String   @default("USD") @db.Char(3)
+  overtimeMinutes Int      @default(0)
+  lines           Json // [{ name, code, type, amount }]
+  createdAt       DateTime @default(now())
+
+  payrollRun PayrollRun @relation(fields: [payrollRunId], references: [id])
+  employee   Employee   @relation(fields: [employeeId], references: [id])
+
+  @@unique([payrollRunId, employeeId])
+  @@index([organizationId])
+}
+
+enum AttendanceStatus {
+  PRESENT
+  LATE
+  ABSENT
+  ON_LEAVE
+  HALF_DAY
+}
+
+model Shift {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  startTime      String // "09:00" local
+  endTime        String // "17:00" local (may wrap past midnight)
+  breakMinutes   Int      @default(0)
+  daysOfWeek     Int[] // 0=Sun … 6=Sat
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  assignments ShiftAssignment[]
+  attendance  AttendanceRecord[]
+
+  @@unique([organizationId, name])
+}
+
+model ShiftAssignment {
+  id             String   @id @default(cuid())
+  organizationId String
+  employeeId     String
+  shiftId        String
+  date           DateTime @db.Date
+  createdAt      DateTime @default(now())
+
+  employee Employee @relation(fields: [employeeId], references: [id])
+  shift    Shift    @relation(fields: [shiftId], references: [id])
+
+  @@unique([employeeId, date])
+  @@index([organizationId, date])
+}
+
+model AttendanceRecord {
+  id              String           @id @default(cuid())
+  organizationId  String
+  employeeId      String
+  shiftId         String?
+  date            DateTime         @db.Date
+  clockInAt       DateTime?
+  clockOutAt      DateTime?
+  breakMinutes    Int              @default(0)
+  workedMinutes   Int              @default(0)
+  overtimeMinutes Int              @default(0)
+  lateMinutes     Int              @default(0)
+  status          AttendanceStatus @default(PRESENT)
+  source          String           @default("WEB") // WEB | GPS | QR | BIOMETRIC
+  latitude        Decimal?         @db.Decimal(10, 7)
+  longitude       Decimal?         @db.Decimal(10, 7)
+  notes           String?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  employee Employee @relation(fields: [employeeId], references: [id])
+  shift    Shift?   @relation(fields: [shiftId], references: [id])
+
+  @@unique([employeeId, date])
+  @@index([organizationId, date])
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+model LeaveType {
+  id               String   @id @default(cuid())
+  organizationId   String
+  name             String
+  code             String
+  daysPerYear      Float    @default(0) // default annual entitlement
+  isPaid           Boolean  @default(true)
+  requiresApproval Boolean  @default(true)
+  isActive         Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  balances LeaveBalance[]
+  requests LeaveRequest[]
+
+  @@unique([organizationId, code])
+}
+
+model LeaveBalance {
+  id              String   @id @default(cuid())
+  organizationId  String
+  employeeId      String
+  leaveTypeId     String
+  year            Int
+  entitledDays    Float    @default(0)
+  usedDays        Float    @default(0)
+  carriedOverDays Float    @default(0)
+  updatedAt       DateTime @updatedAt
+
+  employee  Employee  @relation(fields: [employeeId], references: [id])
+  leaveType LeaveType @relation(fields: [leaveTypeId], references: [id])
+
+  @@unique([employeeId, leaveTypeId, year])
+  @@index([organizationId])
+}
+
+model LeaveRequest {
+  id             String      @id @default(cuid())
+  organizationId String
+  employeeId     String
+  leaveTypeId    String
+  startDate      DateTime
+  endDate        DateTime
+  days           Float // working days requested
+  reason         String?     @db.Text
+  status         LeaveStatus @default(PENDING)
+  approverId     String? // Membership id
+  decidedAt      DateTime?
+  decisionNote   String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  employee  Employee  @relation(fields: [employeeId], references: [id])
+  leaveType LeaveType @relation(fields: [leaveTypeId], references: [id])
+
+  @@index([organizationId, status])
+  @@index([employeeId])
 }
 
 // ============================================================
@@ -2451,14 +3074,23 @@ model Plan {
   name          String       @unique
   slug          String       @unique
   description   String?
+  /// The plan's base price, in `currency`. Used when `prices` has nothing for
+  /// the customer's currency — i.e. today's behaviour, unchanged.
   priceMonthly  Decimal      @db.Decimal(14, 2)
   priceYearly   Decimal      @db.Decimal(14, 2)
   currency      String       @default("USD") @db.Char(3)
+  /// Per-currency price book, synced from the admin:
+  /// { "NGN": { "monthly": 8500, "yearly": 81600 }, "USD": { ... } }
+  /// A currency absent here is never charged — we don't convert (see
+  /// shared/billing-currency.ts).
+  prices        Json?
   maxUsers      Int?
   maxBranches   Int?
   maxProducts   Int?
   maxChannels   Int?
   maxContacts   Int?
+  /// Maximum opted-in recipients a single marketing campaign may target.
+  maxMarketingReach Int?
   aiCreditsMonthly Int?
   features      Json // feature keys enabled on this plan
   isPublic      Boolean      @default(true) // shown on pricing UI (false = custom/contact-sales)
@@ -2514,11 +3146,79 @@ model UsageCounter {
   @@index([organizationId, metric])
 }
 
+/// Purchased entitlement extensions sourced from the admin-managed add-on
+/// catalog. The entitlement snapshot keeps an existing purchase stable even
+/// if the catalog is edited later.
+model AddOnPurchase {
+  id             String   @id @default(cuid())
+  organizationId String
+  addOnId        String
+  title          String
+  billingType    String
+  amount         Decimal  @db.Decimal(14, 2)
+  currency       String   @db.Char(3)
+  entitlements   Json
+  provider       String?
+  providerRef    String?  @unique
+  purchasedAt    DateTime @default(now())
+  expiresAt      DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId, expiresAt])
+  @@index([organizationId, addOnId])
+}
+
+/// Prepaid SMS balance. Amounts are monetary and always use `currency`.
+model SmsWallet {
+  id                  String   @id @default(cuid())
+  organizationId      String   @unique
+  balance             Decimal  @default(0) @db.Decimal(14, 4)
+  currency            String   @default("NGN") @db.Char(3)
+  lowBalanceThreshold Decimal  @default(500) @db.Decimal(14, 4)
+  lastLowBalanceAt    DateTime?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  transactions SmsWalletTransaction[]
+}
+
+model SmsWalletTransaction {
+  id             String                   @id @default(cuid())
+  organizationId String
+  walletId       String
+  type           SmsWalletTransactionType
+  channelType    ChannelType @default(SMS)
+  amount         Decimal                  @db.Decimal(14, 4)
+  balanceAfter   Decimal                  @db.Decimal(14, 4)
+  currency       String                   @db.Char(3)
+  description    String
+  reference      String?
+  campaignId     String?
+  customerId     String?
+  metadata       Json?
+  createdAt      DateTime                 @default(now())
+
+  wallet SmsWallet @relation(fields: [walletId], references: [id])
+
+  @@unique([organizationId, reference])
+  @@index([organizationId, createdAt])
+  @@index([walletId])
+  @@index([organizationId, channelType, createdAt])
+}
+
 model BillingRecord {
   id             String        @id @default(cuid())
   subscriptionId String
   amount         Decimal       @db.Decimal(14, 2)
   currency       String        @default("USD") @db.Char(3)
+  sourceAmount   Decimal?      @db.Decimal(14, 2)
+  sourceCurrency String?       @db.Char(3)
+  exchangeRate   Decimal?      @db.Decimal(24, 12)
+  exchangeRateSnapshotId String?
   status         PaymentStatus @default(PENDING)
   periodStart    DateTime
   periodEnd      DateTime
@@ -2529,8 +3229,27 @@ model BillingRecord {
   createdAt      DateTime      @default(now())
 
   subscription Subscription @relation(fields: [subscriptionId], references: [id])
+  exchangeRateSnapshot ExchangeRateSnapshot? @relation(fields: [exchangeRateSnapshotId], references: [id])
 
   @@index([subscriptionId])
+}
+
+/// Immutable provider observations used to reproduce converted display and
+/// charged amounts. Rates express one unit of `baseCurrency` in `quoteCurrency`.
+model ExchangeRateSnapshot {
+  id                String   @id @default(cuid())
+  baseCurrency      String   @db.Char(3)
+  quoteCurrency     String   @db.Char(3)
+  rate              Decimal  @db.Decimal(24, 12)
+  provider          String
+  providerUpdatedAt DateTime?
+  fetchedAt         DateTime @default(now())
+  expiresAt         DateTime
+  createdAt         DateTime @default(now())
+
+  billingRecords BillingRecord[]
+
+  @@index([baseCurrency, quoteCurrency, fetchedAt])
 }
 
 model ApiKey {
@@ -2675,4 +3394,134 @@ model AuditLog {
   @@index([organizationId, createdAt])
   @@index([actorUserId])
   @@index([entityType, entityId])
+}
+
+// ── AI knowledge base ──────────────────────────────────────────────────────
+// A business's ingested website pages and documents, chunked for retrieval so
+// the AI answers grounded in the business's own content (RAG).
+
+enum KnowledgeSourceType {
+  URL
+  DOCUMENT
+  TEXT
+}
+
+enum KnowledgeStatus {
+  PENDING
+  READY
+  FAILED
+}
+
+model KnowledgeSource {
+  id             String              @id @default(cuid())
+  organizationId String
+  type           KnowledgeSourceType
+  title          String
+  /// Origin URL for URL sources; original filename for documents.
+  url            String?
+  status         KnowledgeStatus     @default(PENDING)
+  chunkCount     Int                 @default(0)
+  /// Last ingestion error, if any (surfaced in the UI).
+  error          String?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  chunks KnowledgeChunk[]
+
+  @@index([organizationId, status])
+}
+
+model KnowledgeChunk {
+  id             String   @id @default(cuid())
+  organizationId String
+  sourceId       String
+  content        String   @db.Text
+  /// Order within the source, for stable citations.
+  position       Int      @default(0)
+  createdAt      DateTime @default(now())
+
+  source KnowledgeSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  // Full-text GIN index on `content` added via raw SQL in the migration
+  // (Prisma @@fulltext is unsupported on PostgreSQL). A nullable embedding
+  // column for the optional semantic path is added later, only when enabled.
+  @@index([organizationId])
+  @@index([sourceId])
+}
+
+// ── Website builder ────────────────────────────────────────────────────────
+// A no-code site per organization: block-based pages, a theme, and subdomain
+// hosting. Blocks are an ordered JSON array of { id, type, props }.
+
+enum SiteStatus {
+  DRAFT
+  PUBLISHED
+}
+
+model Site {
+  id             String     @id @default(cuid())
+  organizationId String     @unique
+  name           String
+  /// Platform subdomain: <subdomain>.sites.host. Unique across the platform.
+  subdomain      String?    @unique
+  status         SiteStatus @default(DRAFT)
+  /// { primaryColor, accentColor, font }
+  theme          Json?
+  /// { title, description }
+  seo            Json?
+  publishedAt    DateTime?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  pages SitePage[]
+}
+
+model SitePage {
+  id             String   @id @default(cuid())
+  organizationId String
+  siteId         String
+  title          String
+  /// "" for the home page, else "about", "contact", …
+  slug           String
+  /// Ordered array of content blocks.
+  blocks         Json     @default("[]")
+  seo            Json?
+  position       Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  site Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
+
+  @@unique([siteId, slug])
+  @@index([organizationId])
+}
+
+model SiteVersion {
+  id             String   @id @default(cuid())
+  organizationId String
+  siteId         String
+  label          String
+  /// Full snapshot: { site: { name, theme, seo }, pages: [{ title, slug, blocks, seo, position }] }.
+  snapshot       Json
+  createdAt      DateTime @default(now())
+
+  @@index([siteId])
+  @@index([organizationId])
+}
+
+// ── Marketing visual editor (Canva-style designs) ──────────────────────────
+model Design {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  width          Int      @default(1080)
+  height         Int      @default(1350)
+  background     String   @default("#ffffff")
+  /// Ordered array of canvas elements:
+  /// [{ id, type, x, y, w, h, rotation, z, props }].
+  elements       Json     @default("[]")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([organizationId])
 }

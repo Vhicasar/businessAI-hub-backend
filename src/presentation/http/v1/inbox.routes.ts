@@ -23,6 +23,15 @@ const wrap =
 export const inboxRoutes = Router();
 inboxRoutes.use(authenticate, requireTenant);
 
+// unread badge counts (total + per channel)
+inboxRoutes.get(
+  '/unread',
+  requirePermission('inbox.read'),
+  wrap(async (_req, res) => {
+    res.json({ success: true, data: await inboxService.unreadCounts() });
+  })
+);
+
 // conversations
 inboxRoutes.get(
   '/conversations',

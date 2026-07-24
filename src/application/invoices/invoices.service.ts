@@ -3,6 +3,25 @@ import type { Prisma } from '@prisma/client';
 import { ConflictError, NotFoundError, ValidationError } from '../../shared/errors';
 import { prisma } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
+import { activityService } from '../crm/activity.service';
+import { workflowService } from '../crm/workflow.service';
+import { exchangeRates } from '../../shared/exchange-rates';
+
+/** Mirror an invoice event onto the CRM timeline (invoice + its customer). */
+async function recordInvoiceActivity(
+  inv: { id: string; number: string; customer?: { id: string } | null },
+  title: string,
+  body?: string,
+): Promise<void> {
+  await activityService.record({
+    type: 'SYSTEM',
+    entityType: 'INVOICE',
+    entityId: inv.id,
+    title,
+    body,
+    also: inv.customer ? [{ entityType: 'CUSTOMER', entityId: inv.customer.id }] : undefined,
+  });
+}
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
@@ -20,20 +39,27 @@ export const listInvoicesSchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(25),
 });
 
+const invoiceItemSchema = z.object({
+  description: z.string().trim().min(1).max(300),
+  quantity: z.coerce.number().positive(),
+  unitPrice: z.coerce.number().nonnegative(),
+  taxRate: z.coerce.number().min(0).max(100).default(0),
+});
+
 export const createInvoiceSchema = z.object({
   customerId: z.string().min(1),
   dueInDays: z.coerce.number().int().min(0).max(365).default(14),
   notes: z.string().trim().max(2000).nullable().optional(),
-  items: z
-    .array(
-      z.object({
-        description: z.string().trim().min(1).max(300),
-        quantity: z.coerce.number().positive(),
-        unitPrice: z.coerce.number().nonnegative(),
-        taxRate: z.coerce.number().min(0).max(100).default(0),
-      })
-    )
-    .min(1),
+  // DRAFT invoices can still be edited; SENT ones are issued to the customer.
+  status: z.enum(['DRAFT', 'SENT']).default('SENT'),
+  items: z.array(invoiceItemSchema).min(1),
+});
+
+export const updateInvoiceSchema = z.object({
+  customerId: z.string().min(1).optional(),
+  dueInDays: z.coerce.number().int().min(0).max(365).optional(),
+  notes: z.string().trim().max(2000).nullable().optional(),
+  items: z.array(invoiceItemSchema).min(1).optional(),
 });
 
 export const invoicePaymentSchema = z.object({
@@ -44,7 +70,22 @@ export const invoicePaymentSchema = z.object({
 
 export type ListInvoicesDto = z.infer<typeof listInvoicesSchema>;
 export type CreateInvoiceDto = z.infer<typeof createInvoiceSchema>;
+export type UpdateInvoiceDto = z.infer<typeof updateInvoiceSchema>;
 export type InvoicePaymentDto = z.infer<typeof invoicePaymentSchema>;
+
+/** Sum line items into subtotal / tax / per-line totals. */
+function computeItemTotals(items: CreateInvoiceDto['items']) {
+  let subtotal = 0;
+  let taxTotal = 0;
+  const priced = items.map((i) => {
+    const net = round2(i.unitPrice * i.quantity);
+    const tax = round2((net * i.taxRate) / 100);
+    subtotal = round2(subtotal + net);
+    taxTotal = round2(taxTotal + tax);
+    return { ...i, total: round2(net + tax) };
+  });
+  return { priced, subtotal, taxTotal, total: round2(subtotal + taxTotal) };
+}
 
 const invoiceSelect = {
   id: true,
@@ -90,6 +131,37 @@ async function nextInvoiceNumber(tx: Prisma.TransactionClient, organizationId: s
   return `INV-${year}-${String(count + 1).padStart(5, '0')}`;
 }
 
+async function invoiceForDisplay<T extends {
+  currency: string;
+  subtotal: unknown;
+  taxTotal: unknown;
+  total: unknown;
+  amountPaid: unknown;
+  items: Array<{ unitPrice: unknown; total: unknown }>;
+  payments: Array<{ amount: unknown }>;
+}>(invoice: T): Promise<T> {
+  const org = await prisma.organization.findUniqueOrThrow({
+    where: { id: orgId() },
+    select: { currency: true },
+  });
+  if (invoice.currency === org.currency) return invoice;
+  const conversion = await exchangeRates.convert(1, invoice.currency, org.currency);
+  const money = (value: unknown) => round2(Number(value) * conversion.rate);
+  return {
+    ...invoice,
+    currency: org.currency,
+    subtotal: money(invoice.subtotal),
+    taxTotal: money(invoice.taxTotal),
+    total: money(invoice.total),
+    amountPaid: money(invoice.amountPaid),
+    items: invoice.items.map((i) => ({ ...i, unitPrice: money(i.unitPrice), total: money(i.total) })),
+    payments: invoice.payments.map((p) => ({ ...p, amount: money(p.amount) })),
+    sourceCurrency: invoice.currency,
+    exchangeRate: conversion.rate,
+    exchangeRateAsOf: conversion.asOf,
+  } as T;
+}
+
 export const invoicesService = {
   async list(dto: ListInvoicesDto) {
     const overdueFilter =
@@ -111,7 +183,11 @@ export const invoicesService = {
       ...(dto.cursor ? { cursor: { id: dto.cursor }, skip: 1 } : {}),
     });
     const hasMore = rows.length > dto.limit;
-    const items = (hasMore ? rows.slice(0, dto.limit) : rows).map(withDerivedStatus);
+    const items = await Promise.all(
+      (hasMore ? rows.slice(0, dto.limit) : rows)
+        .map(withDerivedStatus)
+        .map(invoiceForDisplay),
+    );
     return { items, nextCursor: hasMore ? items[items.length - 1]?.id ?? null : null };
   },
 
@@ -121,7 +197,7 @@ export const invoicesService = {
       select: invoiceSelect,
     });
     if (!invoice) throw new NotFoundError('Invoice');
-    return withDerivedStatus(invoice);
+    return invoiceForDisplay(withDerivedStatus(invoice));
   },
 
   async createStandalone(dto: CreateInvoiceDto) {
@@ -131,17 +207,10 @@ export const invoicesService = {
     });
     if (!customer) throw new NotFoundError('Customer');
 
-    let subtotal = 0;
-    let taxTotal = 0;
-    const items = dto.items.map((i) => {
-      const net = round2(i.unitPrice * i.quantity);
-      const tax = round2((net * i.taxRate) / 100);
-      subtotal = round2(subtotal + net);
-      taxTotal = round2(taxTotal + tax);
-      return { ...i, total: round2(net + tax) };
-    });
+    const { priced, subtotal, taxTotal, total } = computeItemTotals(dto.items);
+    const isSent = dto.status === 'SENT';
 
-    return prisma.$transaction(async (tx) => {
+    const inv = await prisma.$transaction(async (tx) => {
       const org = await tx.organization.findUniqueOrThrow({
         where: { id: organizationId },
         select: { currency: true },
@@ -151,20 +220,84 @@ export const invoicesService = {
           organizationId,
           number: await nextInvoiceNumber(tx, organizationId),
           customerId: dto.customerId,
-          status: 'SENT',
+          status: dto.status,
           currency: org.currency,
           subtotal,
           taxTotal,
-          total: round2(subtotal + taxTotal),
-          issuedAt: new Date(),
+          total,
+          issuedAt: isSent ? new Date() : null,
           dueAt: new Date(Date.now() + dto.dueInDays * 24 * 60 * 60 * 1000),
           notes: dto.notes ?? null,
-          items: { create: items },
+          items: { create: priced },
         },
         select: invoiceSelect,
       });
       return withDerivedStatus(invoice);
     });
+    await recordInvoiceActivity(
+      inv,
+      isSent ? `Invoice ${inv.number} issued` : `Draft invoice ${inv.number} created`,
+      `${inv.currency} ${Number(inv.total).toFixed(2)}`,
+    );
+    return inv;
+  },
+
+  /** Edit a DRAFT invoice — items/notes/customer/due date. Issued invoices are immutable. */
+  async update(id: string, dto: UpdateInvoiceDto) {
+    const invoice = await prisma.invoice.findFirst({ where: { id, deletedAt: null } });
+    if (!invoice) throw new NotFoundError('Invoice');
+    if (invoice.status !== 'DRAFT') {
+      throw new ConflictError('Only draft invoices can be edited');
+    }
+    if (dto.customerId) {
+      const customer = await prisma.customer.findFirst({
+        where: { id: dto.customerId, deletedAt: null },
+      });
+      if (!customer) throw new NotFoundError('Customer');
+    }
+
+    const totals = dto.items ? computeItemTotals(dto.items) : null;
+
+    return prisma.$transaction(async (tx) => {
+      if (dto.items) {
+        await tx.invoiceItem.deleteMany({ where: { invoiceId: id } });
+      }
+      const updated = await tx.invoice.update({
+        where: { id },
+        data: {
+          ...(dto.customerId ? { customerId: dto.customerId } : {}),
+          ...(dto.notes !== undefined ? { notes: dto.notes } : {}),
+          ...(dto.dueInDays !== undefined
+            ? { dueAt: new Date(Date.now() + dto.dueInDays * 24 * 60 * 60 * 1000) }
+            : {}),
+          ...(totals
+            ? {
+                subtotal: totals.subtotal,
+                taxTotal: totals.taxTotal,
+                total: totals.total,
+                items: { create: totals.priced },
+              }
+            : {}),
+        },
+        select: invoiceSelect,
+      });
+      return withDerivedStatus(updated);
+    });
+  },
+
+  /** Issue a DRAFT invoice to the customer. */
+  async send(id: string) {
+    const invoice = await prisma.invoice.findFirst({ where: { id, deletedAt: null } });
+    if (!invoice) throw new NotFoundError('Invoice');
+    if (invoice.status !== 'DRAFT') throw new ConflictError('Invoice is not a draft');
+    const updated = await prisma.invoice.update({
+      where: { id },
+      data: { status: 'SENT', issuedAt: invoice.issuedAt ?? new Date() },
+      select: invoiceSelect,
+    });
+    const result = withDerivedStatus(updated);
+    await recordInvoiceActivity(result, `Invoice ${result.number} sent to customer`);
+    return result;
   },
 
   async createFromOrder(orderId: string, dueInDays = 14) {
@@ -182,7 +315,7 @@ export const invoicesService = {
 
     const alreadyPaid = order.paymentStatus === 'PAID';
 
-    return prisma.$transaction(async (tx) => {
+    const inv = await prisma.$transaction(async (tx) => {
       const invoice = await tx.invoice.create({
         data: {
           organizationId: order.organizationId,
@@ -213,6 +346,8 @@ export const invoicesService = {
       });
       return withDerivedStatus(invoice);
     });
+    await recordInvoiceActivity(inv, `Invoice ${inv.number} generated from order ${order.number}`);
+    return inv;
   },
 
   async recordPayment(id: string, dto: InvoicePaymentDto, actorMembershipId: string | null) {
@@ -228,7 +363,7 @@ export const invoicesService = {
     const newPaid = round2(Number(invoice.amountPaid) + dto.amount);
     const fullyPaid = newPaid >= Number(invoice.total) - 0.005;
 
-    return prisma.$transaction(async (tx) => {
+    const paid = await prisma.$transaction(async (tx) => {
       await tx.payment.create({
         data: {
           organizationId: invoice.organizationId,
@@ -256,6 +391,19 @@ export const invoicesService = {
       });
       return withDerivedStatus(updated);
     });
+    await recordInvoiceActivity(
+      paid,
+      `Payment recorded — ${paid.currency} ${dto.amount.toFixed(2)}`,
+      `${dto.method.replace(/_/g, ' ').toLowerCase()}${fullyPaid ? ' · fully paid' : ''}`,
+    );
+    if (fullyPaid) {
+      await workflowService.dispatch(
+        'invoice.paid',
+        { number: paid.number, total: Number(paid.total), method: dto.method, currency: paid.currency },
+        { entityType: 'INVOICE', entityId: id, customerId: paid.customer?.id ?? null },
+      );
+    }
+    return paid;
   },
 
   async voidInvoice(id: string) {
@@ -269,6 +417,8 @@ export const invoicesService = {
       data: { status: 'VOID' },
       select: invoiceSelect,
     });
-    return withDerivedStatus(updated);
+    const result = withDerivedStatus(updated);
+    await recordInvoiceActivity(result, `Invoice ${result.number} voided`);
+    return result;
   },
 };

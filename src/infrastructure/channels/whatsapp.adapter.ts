@@ -121,12 +121,28 @@ export class WhatsAppAdapter implements ChannelAdapter {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${accessToken}`,
       },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        to: payload.recipientExternalId,
-        type: 'text',
-        text: { body: payload.text },
-      }),
+      body: JSON.stringify(
+        payload.isMarketing && payload.templateName
+          ? {
+              messaging_product: 'whatsapp',
+              to: payload.recipientExternalId,
+              type: 'template',
+              template: {
+                name: payload.templateName,
+                language: { code: payload.templateLanguage || 'en_US' },
+                components: [{
+                  type: 'body',
+                  parameters: [{ type: 'text', text: payload.text }],
+                }],
+              },
+            }
+          : {
+              messaging_product: 'whatsapp',
+              to: payload.recipientExternalId,
+              type: 'text',
+              text: { body: payload.text },
+            },
+      ),
     });
     const json = (await res.json()) as {
       messages?: { id: string }[];

@@ -1,6 +1,6 @@
 import nodemailer, { Transporter } from 'nodemailer';
 import { env } from '../../shared/config/env';
-import { logger } from '../../shared/logger';
+import { logger } from '../../shared/logger'; 
 
 function buildTransport(): Transporter {
   if (env.SMTP_HOST) {
@@ -17,13 +17,31 @@ function buildTransport(): Transporter {
 }
 
 const transport = buildTransport();
+const devFallbackTransport = nodemailer.createTransport({ jsonTransport: true });
 
 async function send(to: string, subject: string, html: string, text: string): Promise<void> {
-  const info = await transport.sendMail({ from: env.MAIL_FROM, to, subject, html, text });
-  if (!env.SMTP_HOST) {
-    logger.info({ to, subject, preview: text.slice(0, 200) }, 'Email (dev log transport)');
-  } else {
-    logger.debug({ to, subject, messageId: info.messageId }, 'Email sent');
+  const message = { from: env.MAIL_FROM, to, subject, html, text };
+  try {
+    const info = await transport.sendMail(message);
+    if (!env.SMTP_HOST) {
+      logger.info({ to, subject, preview: text.slice(0, 200) }, 'Email (dev log transport)');
+    } else {
+      logger.debug({ to, subject, messageId: info.messageId }, 'Email sent');
+    }
+  } catch (err) {
+    logger.error(
+      { err, to, subject, smtpHost: env.SMTP_HOST, smtpPort: env.SMTP_PORT },
+      'Email delivery failed',
+    );
+    // A stale local SMTP setting should not make authentication flows unusable.
+    // Keep production strict: silently pretending a reset email was delivered
+    // there would strand the user without a usable link.
+    if (env.isProd) throw err;
+    await devFallbackTransport.sendMail(message);
+    logger.warn(
+      { to, subject, preview: text.slice(0, 500) },
+      'Email written to development log after SMTP failure',
+    );
   }
 }
 

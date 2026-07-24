@@ -10,6 +10,8 @@ import {
   createProductSchema,
   listProductsSchema,
   namedEntitySchema,
+  productImageSchema,
+  reorderImagesSchema,
   updateProductSchema,
   variantSchema,
 } from '../../../application/catalog/catalog.dto';
@@ -113,6 +115,51 @@ catalogRoutes.delete(
   wrap(async (req, res) => {
     await catalogService.deleteVariant(req.params.id as string, req.params.variantId as string);
     res.json({ success: true, data: { message: 'Variant removed' } });
+  })
+);
+
+// variant photo
+catalogRoutes.put(
+  '/products/:id/variants/:variantId/image',
+  requirePermission('catalog.update'),
+  validate({ body: z.object({ fileId: z.string().min(1).nullable() }) }),
+  wrap(async (req, res) => {
+    res.json({
+      success: true,
+      data: await catalogService.setVariantImage(
+        req.params.id as string,
+        req.params.variantId as string,
+        req.body.fileId
+      ),
+    });
+  })
+);
+
+// product gallery
+catalogRoutes.post(
+  '/products/:id/images',
+  requirePermission('catalog.update'),
+  validate({ body: productImageSchema }),
+  wrap(async (req, res) => {
+    res.status(201).json({ success: true, data: await catalogService.addProductImage(req.params.id as string, req.body) });
+  })
+);
+
+catalogRoutes.put(
+  '/products/:id/images/order',
+  requirePermission('catalog.update'),
+  validate({ body: reorderImagesSchema }),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await catalogService.reorderProductImages(req.params.id as string, req.body.order) });
+  })
+);
+
+catalogRoutes.delete(
+  '/products/:id/images/:imageId',
+  requirePermission('catalog.update'),
+  wrap(async (req, res) => {
+    await catalogService.removeProductImage(req.params.id as string, req.params.imageId as string);
+    res.json({ success: true, data: { message: 'Image removed' } });
   })
 );
 

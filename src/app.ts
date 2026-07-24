@@ -19,13 +19,31 @@ import { catalogRoutes } from './presentation/http/v1/catalog.routes';
 import { inventoryRoutes } from './presentation/http/v1/inventory.routes';
 import { ordersRoutes } from './presentation/http/v1/orders.routes';
 import { invoicesRoutes } from './presentation/http/v1/invoices.routes';
+import { settingsRoutes } from './presentation/http/v1/settings.routes';
+import { realestateRoutes } from './presentation/http/v1/realestate.routes';
+import { marketingRoutes } from './presentation/http/v1/marketing.routes';
+import { auditRoutes } from './presentation/http/v1/audit.routes';
+import { dataTransferRoutes } from './presentation/http/v1/data-transfer.routes';
+import { supportRoutes } from './presentation/http/v1/support.routes';
+import { employeesRoutes } from './presentation/http/v1/employees.routes';
 import { crmRoutes } from './presentation/http/v1/crm.routes';
 import { inboxRoutes } from './presentation/http/v1/inbox.routes';
 import { webhookRoutes } from './presentation/http/webhooks.routes';
 import { webchatRoutes } from './presentation/http/webchat.routes';
 import { aiRoutes } from './presentation/http/v1/ai.routes';
+import { knowledgeRoutes } from './presentation/http/v1/knowledge.routes';
+import { notificationsRoutes } from './presentation/http/v1/notifications.routes';
+import { developerRoutes } from './presentation/http/v1/developer.routes';
+import { publicApiRoutes } from './presentation/http/public/public-api.routes';
+import { sitesRoutes } from './presentation/http/v1/sites.routes';
+import { designsRoutes } from './presentation/http/v1/designs.routes';
+import { siteHostRoutes } from './presentation/http/site-host.routes';
 import { analyticsRoutes } from './presentation/http/v1/analytics.routes';
 import { billingRoutes } from './presentation/http/v1/billing.routes';
+import { serviceRoutes } from './presentation/http/v1/service.routes';
+import { filesRoutes } from './presentation/http/v1/files.routes';
+import { integrationsRoutes } from './presentation/http/v1/integrations.routes';
+import { storage } from './infrastructure/storage/storage';
 import { paystackWebhookRoutes } from './presentation/http/paystack-webhook.routes';
 import { openApiDocument } from './presentation/http/swagger';
 
@@ -77,12 +95,61 @@ export function createApp(): Express {
   v1.use('/inventory', inventoryRoutes);
   v1.use('/orders', ordersRoutes);
   v1.use('/invoices', invoicesRoutes);
+  v1.use('/settings', settingsRoutes);
+  v1.use('/realestate', realestateRoutes);
+  v1.use('/marketing', marketingRoutes);
+  v1.use('/audit', auditRoutes);
+  v1.use('/data', dataTransferRoutes);
+  v1.use('/support', supportRoutes);
+  v1.use('/employees', employeesRoutes);
   v1.use('/crm', crmRoutes);
   v1.use('/inbox', inboxRoutes);
   v1.use('/ai', aiRoutes);
+  v1.use('/knowledge', knowledgeRoutes);
+  v1.use('/notifications', notificationsRoutes);
+  v1.use('/sites', sitesRoutes);
+  v1.use('/designs', designsRoutes);
   v1.use('/analytics', analyticsRoutes);
   v1.use('/billing', billingRoutes);
+  v1.use('/files', filesRoutes);
+  v1.use('/developer', developerRoutes);
+  v1.use('/integrations', integrationsRoutes);
+
+  // Service API for the Vhicasar Admin. Mounted only when a key is configured:
+  // an endpoint that lists every customer organisation should not exist at all
+  // on a deployment that hasn't deliberately turned it on.
+  if (env.service.enabled) {
+    v1.use('/service', serviceRoutes);
+    logger.info('🔑 Service API enabled at /api/v1/service (admin roster access)');
+  }
+
   app.use('/api/v1', appCors, apiLimiter, v1);
+
+  // Public REST API for a business's own integrations — API-key authenticated,
+  // permissive CORS, scope-gated and per-key rate-limited (see the router).
+  app.use('/api/public/v1', cors({ origin: true, credentials: false }), publicApiRoutes);
+
+  // Serve locally-stored uploads. Only meaningful with the local driver (R2
+  // serves its own objects); harmless otherwise since keys won't resolve.
+  if (storage.driver === 'local') {
+    const MIME: Record<string, string> = {
+      png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+      webp: 'image/webp', svg: 'image/svg+xml', pdf: 'application/pdf',
+    };
+    app.get('/uploads/*', (req, res) => {
+      const key = decodeURIComponent(req.path.replace(/^\/uploads\//, ''));
+      const stream = storage.localStream(key);
+      if (!stream) {
+        res.status(404).end();
+        return;
+      }
+      const ext = key.split('.').pop()?.toLowerCase() ?? '';
+      if (MIME[ext]) res.setHeader('Content-Type', MIME[ext]);
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      stream.on('error', () => res.status(404).end());
+      stream.pipe(res);
+    });
+  }
 
   // Public payment webhook (Paystack, HMAC-verified) — mounted before the
   // channel webhook receiver so its specific path wins.
@@ -95,6 +162,9 @@ export function createApp(): Express {
   // These are embedded on arbitrary customer websites, so unlike the rest of
   // the API they must allow any origin (auth = unguessable visitor ids).
   app.use('/api/webchat', cors({ origin: true, credentials: false }), webchatRoutes);
+
+  // Public website hosting: renders a published site's pages by subdomain.
+  app.use('/site', cors({ origin: true, credentials: false }), siteHostRoutes);
   app.get('/widget.js', (_req, res) => {
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     res.setHeader('Access-Control-Allow-Origin', '*');

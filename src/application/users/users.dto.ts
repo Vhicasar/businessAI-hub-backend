@@ -3,6 +3,8 @@ import { z } from 'zod';
 export const inviteUserSchema = z.object({
   email: z.string().trim().toLowerCase().email().max(320),
   roleId: z.string().min(1),
+  /** Set by the employee-invite flow; links the new user to the staff record. */
+  employeeId: z.string().min(1).optional(),
 });
 
 export const acceptInviteSchema = z.object({

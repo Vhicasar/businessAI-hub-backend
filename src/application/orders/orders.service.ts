@@ -3,6 +3,10 @@ import { ConflictError, NotFoundError, ValidationError } from '../../shared/erro
 import { prisma } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { inventoryService } from '../inventory/inventory.service';
+import { activityService } from '../crm/activity.service';
+import { webhooksService } from '../api-keys/webhooks.service';
+import { workflowService } from '../crm/workflow.service';
+import { exchangeRates } from '../../shared/exchange-rates';
 import type { CreateOrderDto, ListOrdersDto, RecordPaymentDto, TransitionDto } from './orders.dto';
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
@@ -86,6 +90,39 @@ async function nextOrderNumber(tx: Prisma.TransactionClient, organizationId: str
   return `ORD-${year}-${String(count + 1).padStart(5, '0')}`;
 }
 
+async function orderForDisplay<T extends {
+  currency: string;
+  total: unknown;
+  subtotal?: unknown;
+  taxTotal?: unknown;
+  shippingTotal?: unknown;
+  discountTotal?: unknown;
+  items?: Array<{ unitPrice: unknown; total: unknown }>;
+  payments?: Array<{ amount: unknown }>;
+}>(order: T): Promise<T> {
+  const org = await prisma.organization.findUniqueOrThrow({
+    where: { id: orgId() },
+    select: { currency: true },
+  });
+  if (order.currency === org.currency) return order;
+  const conversion = await exchangeRates.convert(1, order.currency, org.currency);
+  const money = (value: unknown) => round2(Number(value) * conversion.rate);
+  return {
+    ...order,
+    currency: org.currency,
+    total: money(order.total),
+    ...(order.subtotal !== undefined ? { subtotal: money(order.subtotal) } : {}),
+    ...(order.taxTotal !== undefined ? { taxTotal: money(order.taxTotal) } : {}),
+    ...(order.shippingTotal !== undefined ? { shippingTotal: money(order.shippingTotal) } : {}),
+    ...(order.discountTotal !== undefined ? { discountTotal: money(order.discountTotal) } : {}),
+    ...(order.items ? { items: order.items.map((i) => ({ ...i, unitPrice: money(i.unitPrice), total: money(i.total) })) } : {}),
+    ...(order.payments ? { payments: order.payments.map((p) => ({ ...p, amount: money(p.amount) })) } : {}),
+    sourceCurrency: order.currency,
+    exchangeRate: conversion.rate,
+    exchangeRateAsOf: conversion.asOf,
+  } as T;
+}
+
 export const ordersService = {
   async list(dto: ListOrdersDto) {
     const rows = await prisma.order.findMany({
@@ -100,14 +137,14 @@ export const ordersService = {
       ...(dto.cursor ? { cursor: { id: dto.cursor }, skip: 1 } : {}),
     });
     const hasMore = rows.length > dto.limit;
-    const items = hasMore ? rows.slice(0, dto.limit) : rows;
+    const items = await Promise.all((hasMore ? rows.slice(0, dto.limit) : rows).map(orderForDisplay));
     return { items, nextCursor: hasMore ? items[items.length - 1]?.id ?? null : null };
   },
 
   async get(id: string) {
     const order = await prisma.order.findFirst({ where: { id }, select: detailSelect });
     if (!order) throw new NotFoundError('Order');
-    return order;
+    return orderForDisplay(order);
   },
 
   /**
@@ -140,8 +177,21 @@ export const ordersService = {
         throw new ValidationError(`"${v.product.name}" is not an active product`);
       }
     }
+    const org = await prisma.organization.findUniqueOrThrow({
+      where: { id: organizationId },
+      select: { currency: true },
+    });
+    const convertedVariantPrices = new Map<string, number>();
+    await Promise.all(variants.map(async (variant) => {
+      const converted = await exchangeRates.convert(
+        Number(variant.price),
+        variant.currency,
+        org.currency,
+      );
+      convertedVariantPrices.set(variant.id, converted.amount);
+    }));
 
-    return prisma.$transaction(async (tx) => {
+    const created = await prisma.$transaction(async (tx) => {
       // Reserve stock (row-by-row so error messages are precise).
       for (const item of dto.items) {
         const v = variantMap.get(item.variantId)!;
@@ -167,7 +217,9 @@ export const ordersService = {
       let taxTotal = 0;
       const itemRows = dto.items.map((item) => {
         const v = variantMap.get(item.variantId)!;
-        const unitPrice = round2(item.unitPrice ?? Number(v.price));
+        // An explicit price is entered in the organization's preferred
+        // currency; catalog prices are converted before totals are calculated.
+        const unitPrice = round2(item.unitPrice ?? convertedVariantPrices.get(v.id)!);
         const lineNet = round2(unitPrice * item.quantity);
         const taxRate = Number(v.product.taxRate);
         const lineTax = round2((lineNet * taxRate) / 100);
@@ -195,7 +247,7 @@ export const ordersService = {
           source: dto.source,
           warehouseId: warehouse.id,
           shippingAddressId: dto.shippingAddressId ?? null,
-          currency: variants[0]?.currency ?? 'USD',
+          currency: org.currency,
           subtotal,
           taxTotal,
           shippingTotal: dto.shippingTotal,
@@ -210,6 +262,25 @@ export const ordersService = {
       });
       return order;
     });
+    await activityService.record({
+      type: 'SYSTEM',
+      entityType: 'ORDER',
+      entityId: created.id,
+      title: `Order ${created.number} placed`,
+      body: `${created.currency} ${Number(created.total).toFixed(2)} · ${dto.source}`,
+      also: [{ entityType: 'CUSTOMER', entityId: dto.customerId }],
+    });
+    await workflowService.dispatch(
+      'order.placed',
+      { number: created.number, total: Number(created.total), source: dto.source, currency: created.currency },
+      { entityType: 'ORDER', entityId: created.id, customerId: dto.customerId },
+    );
+    // Notify any subscribed external integrations (public API webhooks).
+    void webhooksService.dispatch(organizationId, 'order.created', {
+      id: created.id, number: created.number, status: created.status,
+      total: Number(created.total), currency: created.currency, customerId: dto.customerId,
+    });
+    return created;
   },
 
   async transition(id: string, dto: TransitionDto, actorUserId: string) {
@@ -226,7 +297,7 @@ export const ordersService = {
       });
     }
 
-    return prisma.$transaction(async (tx) => {
+    const updated = await prisma.$transaction(async (tx) => {
       // Stock effects.
       if (dto.status === 'DISPATCHED' && order.warehouseId) {
         for (const item of order.items) {
@@ -297,6 +368,15 @@ export const ordersService = {
       });
       return updated;
     });
+    await activityService.record({
+      type: 'STATUS_CHANGE',
+      entityType: 'ORDER',
+      entityId: id,
+      title: `Order ${order.number} → ${dto.status.toLowerCase().replace(/_/g, ' ')}`,
+      body: dto.note ?? undefined,
+      also: [{ entityType: 'CUSTOMER', entityId: order.customerId }],
+    });
+    return updated;
   },
 
   async recordPayment(id: string, dto: RecordPaymentDto, actorMembershipId: string | null) {
@@ -316,7 +396,7 @@ export const ordersService = {
     const newPaid = round2(paidSoFar + dto.amount);
     const fullyPaid = newPaid >= Number(order.total) - 0.005;
 
-    return prisma.$transaction(async (tx) => {
+    const paidResult = await prisma.$transaction(async (tx) => {
       await tx.payment.create({
         data: {
           organizationId: order.organizationId,
@@ -352,5 +432,21 @@ export const ordersService = {
       }
       return updated;
     });
+    await activityService.record({
+      type: 'SYSTEM',
+      entityType: 'ORDER',
+      entityId: id,
+      title: `Payment recorded — ${order.currency} ${dto.amount.toFixed(2)}`,
+      body: `${dto.method.replace(/_/g, ' ').toLowerCase()}${fullyPaid ? ' · fully paid' : ''}`,
+      also: [{ entityType: 'CUSTOMER', entityId: order.customerId }],
+    });
+    if (fullyPaid) {
+      await workflowService.dispatch(
+        'order.paid',
+        { number: order.number, total: Number(order.total), method: dto.method, currency: order.currency },
+        { entityType: 'ORDER', entityId: id, customerId: order.customerId },
+      );
+    }
+    return paidResult;
   },
 };
