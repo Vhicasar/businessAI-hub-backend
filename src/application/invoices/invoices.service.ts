@@ -123,7 +123,7 @@ function withDerivedStatus<T extends InvoiceRow>(inv: T): T & { isOverdue: boole
   return { ...inv, isOverdue };
 }
 
-async function nextInvoiceNumber(tx: Prisma.TransactionClient, organizationId: string): Promise<string> {
+async function nextInvoiceNumber(tx: Pick<typeof prisma, 'invoice'>, organizationId: string): Promise<string> {
   const year = new Date().getFullYear();
   const count = await tx.invoice.count({
     where: { organizationId, number: { startsWith: `INV-${year}-` } },

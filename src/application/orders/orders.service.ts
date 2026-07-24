@@ -82,7 +82,7 @@ const detailSelect = {
   },
 } as const;
 
-async function nextOrderNumber(tx: Prisma.TransactionClient, organizationId: string): Promise<string> {
+async function nextOrderNumber(tx: Pick<typeof prisma, 'order'>, organizationId: string): Promise<string> {
   const year = new Date().getFullYear();
   const count = await tx.order.count({
     where: { organizationId, number: { startsWith: `ORD-${year}-` } },

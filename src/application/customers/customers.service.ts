@@ -194,6 +194,7 @@ export const customersService = {
     await ensureUniqueContact(dto.email, dto.phone);
     return prisma.customer.create({
       data: {
+        organizationId: requestContext.get()!.organizationId!,
         firstName: dto.firstName,
         lastName: dto.lastName ?? null,
         email: dto.email ?? null,

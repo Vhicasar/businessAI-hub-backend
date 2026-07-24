@@ -211,6 +211,7 @@ export const catalogService = {
     const product = await prisma.$transaction(async (tx) => {
       const created = (await tx.product.create({
         data: {
+          organizationId: org,
           name: dto.name,
           slug,
           description: dto.description ?? null,
@@ -310,6 +311,7 @@ export const catalogService = {
     return prisma.$transaction(async (tx) => {
       const variant = await tx.productVariant.create({
         data: {
+          organizationId: org,
           productId,
           sku: dto.sku,
           barcode: dto.barcode ?? null,
@@ -451,7 +453,7 @@ export const catalogService = {
 
   async createCategory(name: string, parentId?: string | null) {
     return prisma.productCategory.create({
-      data: { name, slug: await uniqueSlug('productCategory', name), parentId: parentId ?? null },
+      data: { organizationId: orgId(), name, slug: await uniqueSlug('productCategory', name), parentId: parentId ?? null },
     });
   },
 
@@ -471,7 +473,7 @@ export const catalogService = {
 
   async createBrand(name: string) {
     return prisma.brand.create({
-      data: { name, slug: await uniqueSlug('brand', name) },
+      data: { organizationId: orgId(), name, slug: await uniqueSlug('brand', name) },
     });
   },
 

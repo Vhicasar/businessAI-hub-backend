@@ -86,6 +86,7 @@ export const inboxService = {
       const [firstName, ...rest] = displayName.split(' ');
       const customer = await prisma.customer.create({
         data: {
+          organizationId: account.organizationId,
           firstName: firstName || 'Unknown',
           lastName: rest.join(' ') || null,
           displayName,
@@ -94,6 +95,7 @@ export const inboxService = {
       });
       identity = await prisma.customerIdentity.create({
         data: {
+          organizationId: account.organizationId,
           customerId: customer.id,
           channelType: account.channelType,
           externalId: inbound.senderExternalId,
@@ -114,6 +116,7 @@ export const inboxService = {
     });
     conversation ??= await prisma.conversation.create({
       data: {
+        organizationId: account.organizationId,
         channelAccountId: account.id,
         customerId: identity.customerId,
         status: 'OPEN',
@@ -128,6 +131,7 @@ export const inboxService = {
 
     const message = await prisma.message.create({
       data: {
+        organizationId: account.organizationId,
         conversationId: conversation.id,
         direction: 'INBOUND',
         authorType: 'CUSTOMER',
@@ -247,6 +251,7 @@ export const inboxService = {
 
     const message = await prisma.message.create({
       data: {
+        organizationId: conversation.organizationId,
         conversationId,
         direction: 'OUTBOUND',
         authorType,
@@ -446,7 +451,7 @@ export const inboxService = {
       select: { id: true },
     });
     convo ??= await prisma.conversation.create({
-      data: { channelAccountId: account.id, customerId, status: 'OPEN' },
+      data: { organizationId: account.organizationId, channelAccountId: account.id, customerId, status: 'OPEN' },
       select: { id: true },
     });
     await this.sendMessage(convo.id, text, authorUserId, 'AGENT');

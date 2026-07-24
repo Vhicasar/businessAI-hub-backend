@@ -6,5 +6,7 @@ dist/
 .env.local
 keys/
 storage/
+!src/infrastructure/storage/
+!src/infrastructure/storage/storage.ts
 *.log
 .DS_Store

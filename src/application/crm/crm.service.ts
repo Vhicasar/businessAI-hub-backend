@@ -351,6 +351,7 @@ export const crmService = {
 
     const deal = await prisma.deal.create({
       data: {
+        organizationId: orgId(),
         title: dto.title,
         pipelineId: pipeline.id,
         stageId: stage.id,
@@ -719,6 +720,7 @@ export const crmService = {
       : (actorMembershipId() ?? (await resolveAssignee()));
     const lead = await prisma.lead.create({
       data: {
+        organizationId: orgId(),
         firstName: dto.firstName,
         lastName: dto.lastName ?? null,
         email: dto.email ?? null,
