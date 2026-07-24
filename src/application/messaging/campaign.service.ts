@@ -109,7 +109,13 @@ export const campaignService = {
   /** Preview the reachable, opted-in audience size without sending. */
   async audience(type: 'EMAIL' | 'SMS' | 'WHATSAPP') {
     const channel = channelFor(type);
-    const customers = await this.reachableCustomers(channel);
+    const [customers, account] = await Promise.all([
+      this.reachableCustomers(channel),
+      prisma.channelAccount.findFirst({
+        where: { channelType: channel, isActive: true, deletedAt: null },
+        select: { id: true, name: true },
+      }),
+    ]);
     const ent = await resolveEntitlements(orgId());
     const plan = await prisma.plan.findUnique({ where: { id: ent.planId }, select: { maxMarketingReach: true } });
     const limit = plan?.maxMarketingReach ?? null;
@@ -124,6 +130,8 @@ export const campaignService = {
       count: customers.length,
       reachable,
       limit,
+      channelConfigured: Boolean(account),
+      channelAccount: account,
       creditQuote,
       sample: customers.slice(0, 5).map((c) => c.firstName),
     };
@@ -158,10 +166,21 @@ export const campaignService = {
       throw new ConflictError('Campaign has already been sent');
     }
     const channel = channelFor(campaign.type);
-    const [customers, ent] = await Promise.all([
+    const [customers, ent, account] = await Promise.all([
       this.reachableCustomers(channel),
       resolveEntitlements(orgId()),
+      prisma.channelAccount.findFirst({
+        where: { channelType: channel, isActive: true, deletedAt: null },
+        select: { id: true, name: true },
+      }),
     ]);
+    if (!account) {
+      throw new AppError(
+        'CHANNEL_NOT_CONFIGURED',
+        400,
+        `Connect an active ${campaign.type} channel in Settings → Channels before sending this campaign.`,
+      );
+    }
     const plan = await prisma.plan.findUnique({ where: { id: ent.planId }, select: { maxMarketingReach: true } });
     if (plan?.maxMarketingReach !== null && plan?.maxMarketingReach !== undefined && customers.length > plan.maxMarketingReach) {
       throw new AppError(

@@ -34,9 +34,8 @@ const wrap =
 
 export const authController = {
   register: wrap(async (req, res) => {
-    const session = await authService.register(req.body, meta(req));
-    setRefreshCookie(res, session.refreshToken);
-    res.status(201).json({ success: true, data: session });
+    const result = await authService.register(req.body, meta(req));
+    res.status(201).json({ success: true, data: result });
   }),
 
   login: wrap(async (req, res) => {
@@ -92,6 +91,14 @@ export const authController = {
   verifyEmail: wrap(async (req, res) => {
     await authService.verifyEmail(req.body.token);
     res.json({ success: true, data: { message: 'Email verified' } });
+  }),
+
+  resendVerification: wrap(async (req, res) => {
+    await authService.resendEmailVerification(req.body.email);
+    res.json({
+      success: true,
+      data: { message: 'If that unverified account exists, a new verification link has been sent.' },
+    });
   }),
 
   twoFaSetup: wrap(async (req, res) => {

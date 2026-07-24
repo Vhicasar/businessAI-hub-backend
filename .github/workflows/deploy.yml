@@ -60,5 +60,8 @@ jobs:
             cd ${{ secrets.VPS_APP_DIR || '/opt/vhicasar-admin' }}
             echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
             docker compose pull agentv-backend
-            docker compose up -d agentv-backend
-            docker image prune -f
+            docker compose up -d --no-deps --force-recreate agentv-backend
+            docker image prune -af
+
+
+# docker compose up -d agentv-backend

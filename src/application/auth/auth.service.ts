@@ -241,7 +241,7 @@ async function provisionOrganization(
 
 export const authService = {
   // ---------------------------------------------------------------- register
-  async register(dto: RegisterDto, meta: RequestMeta): Promise<SessionResult> {
+  async register(dto: RegisterDto, meta: RequestMeta): Promise<{ verificationRequired: true; email: string }> {
     const existing = await prisma.user.findUnique({ where: { email: dto.email } });
     if (existing) throw new ConflictError('An account with this email already exists');
 
@@ -294,7 +294,7 @@ export const authService = {
     await mailer.sendEmailVerification(dto.email, rawToken);
     await audit('auth.register', userId, orgId, meta);
 
-    return buildSession(userId, meta, orgId);
+    return { verificationRequired: true, email: dto.email };
   },
 
   // --------------------------------------------------- multiple businesses
@@ -438,6 +438,12 @@ export const authService = {
     if (user.status === 'SUSPENDED') {
       throw new UnauthorizedError('Account suspended. Contact support.', 'ACCOUNT_SUSPENDED');
     }
+    if (!user.emailVerifiedAt) {
+      throw new UnauthorizedError(
+        'Verify your email address before signing in.',
+        'EMAIL_NOT_VERIFIED',
+      );
+    }
 
     await prisma.user.update({
       where: { id: user.id },
@@ -458,6 +464,9 @@ export const authService = {
     const user = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
     if (!user.twoFactorEnabled || !user.twoFactorSecretEnc) {
       throw new UnauthorizedError('Two-factor authentication is not enabled');
+    }
+    if (!user.emailVerifiedAt) {
+      throw new UnauthorizedError('Verify your email address before signing in.', 'EMAIL_NOT_VERIFIED');
     }
 
     let ok = false;
@@ -491,6 +500,11 @@ export const authService = {
   // ----------------------------------------------------------------- refresh
   async refresh(rawToken: string, meta: RequestMeta): Promise<SessionResult> {
     const { userId, newRaw } = await tokenService.rotateRefreshToken(rawToken, meta);
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { emailVerifiedAt: true } });
+    if (!user?.emailVerifiedAt) {
+      await tokenService.revokeAllForUser(userId);
+      throw new UnauthorizedError('Verify your email address before signing in.', 'EMAIL_NOT_VERIFIED');
+    }
     return buildSession(userId, meta, undefined, newRaw);
   },
 
@@ -575,6 +589,26 @@ export const authService = {
         data: { emailVerifiedAt: new Date() },
       }),
     ]);
+  },
+
+  async resendEmailVerification(email: string): Promise<void> {
+    const user = await prisma.user.findUnique({ where: { email } });
+    // Do not reveal whether an address is registered or already verified.
+    if (!user || user.deletedAt || user.emailVerifiedAt) return;
+    await prisma.securityToken.updateMany({
+      where: { userId: user.id, type: 'EMAIL_VERIFY', usedAt: null },
+      data: { usedAt: new Date() },
+    });
+    const rawToken = generateOpaqueToken();
+    await prisma.securityToken.create({
+      data: {
+        userId: user.id,
+        type: 'EMAIL_VERIFY',
+        tokenHash: sha256(rawToken),
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      },
+    });
+    await mailer.sendEmailVerification(user.email, rawToken);
   },
 
   // ------------------------------------------------------------------- 2FA

@@ -56,6 +56,29 @@ const FALLBACK: SiteCatalog = {
 };
 
 let cached: { value: SiteCatalog; expiresAt: number } | null = null;
+let brandingCache: { value: { name: string; logoUrl: string | null; themeColor: string }; expiresAt: number } | null = null;
+
+export async function getProductBranding() {
+  if (brandingCache && brandingCache.expiresAt > Date.now()) return brandingCache.value;
+  const fallback = { name: 'BusinessHub AI', logoUrl: null, themeColor: '#F97316' };
+  if (!env.adminCatalog.enabled) return fallback;
+  try {
+    const res = await fetch(`${env.adminCatalog.apiUrl}/api/v1/public/${env.adminCatalog.tenantSlug}/config`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = (await res.json()) as { data?: { profile?: { name?: string; logoUrl?: string | null; themeColor?: string | null } } };
+    const profile = body.data?.profile;
+    const value = {
+      name: profile?.name || fallback.name,
+      logoUrl: profile?.logoUrl || null,
+      themeColor: profile?.themeColor || fallback.themeColor,
+    };
+    brandingCache = { value, expiresAt: Date.now() + 60_000 };
+    return value;
+  } catch (err) {
+    logger.warn({ err: (err as Error).message }, 'Admin branding unavailable — using app fallback');
+    return fallback;
+  }
+}
 
 export async function getSiteCatalog(force = false): Promise<SiteCatalog> {
   if (!force && cached && cached.expiresAt > Date.now()) return cached.value;

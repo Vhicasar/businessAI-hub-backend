@@ -53,6 +53,7 @@ export const resetPasswordSchema = z.object({
 });
 
 export const verifyEmailSchema = z.object({ token: z.string().min(10) });
+export const resendVerificationSchema = z.object({ email });
 
 export const twoFaEnableSchema = z.object({
   code: z.string().trim().regex(/^\d{6}$/, 'Provide the 6-digit code'),

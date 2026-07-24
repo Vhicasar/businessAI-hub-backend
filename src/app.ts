@@ -43,6 +43,7 @@ import { billingRoutes } from './presentation/http/v1/billing.routes';
 import { serviceRoutes } from './presentation/http/v1/service.routes';
 import { filesRoutes } from './presentation/http/v1/files.routes';
 import { integrationsRoutes } from './presentation/http/v1/integrations.routes';
+import { brandingRoutes } from './presentation/http/v1/branding.routes';
 import { storage } from './infrastructure/storage/storage';
 import { paystackWebhookRoutes } from './presentation/http/paystack-webhook.routes';
 import { openApiDocument } from './presentation/http/swagger';
@@ -86,6 +87,7 @@ export function createApp(): Express {
   // v1 routes
   const v1 = express.Router();
   v1.use('/health', healthRoutes);
+  v1.use('/branding', brandingRoutes);
   v1.use('/auth', authRoutes);
   v1.use('/users', usersRoutes);
   v1.use('/invitations', invitationsRoutes);

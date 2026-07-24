@@ -15,6 +15,7 @@ import {
   twoFaDisableSchema,
   twoFaEnableSchema,
   verifyEmailSchema,
+  resendVerificationSchema,
 } from '../../../application/auth/auth.dto';
 import { CURRENCIES, resolveLocale } from '../../../shared/currency';
 
@@ -52,6 +53,12 @@ authRoutes.post(
 );
 authRoutes.post('/reset-password', authLimiter, validate({ body: resetPasswordSchema }), c.resetPassword);
 authRoutes.post('/verify-email', validate({ body: verifyEmailSchema }), c.verifyEmail);
+authRoutes.post(
+  '/resend-verification',
+  forgotPasswordLimiter,
+  validate({ body: resendVerificationSchema }),
+  c.resendVerification,
+);
 
 // Authenticated
 authRoutes.post('/logout', authenticate, c.logout);
