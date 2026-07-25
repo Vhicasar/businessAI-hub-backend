@@ -32,6 +32,15 @@ x-backend-env: &backend-env
   BILLING_CURRENCY: ${BILLING_CURRENCY:-NGN}
   PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY:-}
   PAYSTACK_PUBLIC_KEY: ${PAYSTACK_PUBLIC_KEY:-}
+  # Transactional mail (registration verification, password reset, notices).
+  SMTP_HOST: ${SMTP_HOST}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  SMTP_SECURE: ${SMTP_SECURE:-false}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASS: ${SMTP_PASS:-}
+  MAIL_FROM: ${MAIL_FROM}
+  # Mutual secret used by the Vhicasar Admin organization roster.
+  SERVICE_API_KEY: ${SERVICE_API_KEY}
   # Reads pricing + quota limits from the Vhicasar Admin.
   ADMIN_API_URL: ${ADMIN_API_URL:-https://admin.vhicasar.com}
   ADMIN_TENANT_SLUG: businesshub-ai

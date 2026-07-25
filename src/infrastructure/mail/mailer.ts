@@ -11,7 +11,12 @@ function buildTransport(): Transporter {
       auth: env.SMTP_USER ? { user: env.SMTP_USER, pass: env.SMTP_PASS } : undefined,
     });
   }
-  // Dev fallback: render emails to the log instead of sending.
+  if (env.isProd) {
+    throw new Error(
+      'SMTP_HOST is required in production; transactional emails cannot be delivered',
+    );
+  }
+  // Development/test fallback: render emails to the log instead of sending.
   logger.warn('SMTP_HOST not configured — emails will be logged, not sent');
   return nodemailer.createTransport({ jsonTransport: true });
 }

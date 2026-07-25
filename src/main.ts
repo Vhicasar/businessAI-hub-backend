@@ -14,6 +14,7 @@ import { createApp } from './app';
 
 async function bootstrap(): Promise<void> {
   await connectDatabase();
+  await startAiConfigSync(); // establish the admin-managed provider before serving AI traffic
 
   const app = createApp();
   const httpServer = createServer(app);
@@ -22,11 +23,17 @@ async function bootstrap(): Promise<void> {
   httpServer.listen(env.PORT, () => {
     logger.info(`🚀 BusinessHub AI API listening on port ${env.PORT} (${env.NODE_ENV})`);
     logger.info(`📚 API docs: ${env.API_BASE_URL}/api/docs`);
+    logger.info(
+      {
+        smtpConfigured: Boolean(env.SMTP_HOST),
+        serviceApiEnabled: env.service.enabled,
+      },
+      'Production integration configuration',
+    );
   });
 
   startEmailInboundPoller();
   startPlanSync(); // keep the plan catalog in sync with Vhicasar Admin
-  startAiConfigSync(); // keep the AI provider config in sync with Vhicasar Admin
   logger.info(
     queueEnabled()
       ? '📮 Queue mode: async — workflow & campaign jobs handed to the worker (run `npm run worker`)'

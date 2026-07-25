@@ -20,7 +20,10 @@ export async function syncAiConfigFromAdmin(): Promise<boolean> {
   if (!env.adminAi.enabled) return false;
   const url = `${env.adminCatalog.apiUrl}/api/v1/service/${env.adminCatalog.tenantSlug}/ai-config`;
   try {
-    const res = await fetch(url, { headers: { 'x-service-key': env.service.apiKey } });
+    const res = await fetch(url, {
+      headers: { 'x-service-key': env.service.apiKey },
+      signal: AbortSignal.timeout(8_000),
+    });
     if (res.status === 404) {
       // Nothing configured in the admin for this product — use local env.
       setAiConfigOverride(null);
@@ -48,9 +51,11 @@ export async function syncAiConfigFromAdmin(): Promise<boolean> {
 }
 
 /** Initial sync (best-effort) plus periodic refresh, mirroring plan-sync. */
-export function startAiConfigSync(): void {
+export async function startAiConfigSync(): Promise<void> {
   if (!env.adminAi.enabled) return;
-  void syncAiConfigFromAdmin();
+  // Finish the first sync before accepting AI requests. Otherwise the first
+  // requests can incorrectly use a stale AI_API_KEY from the server env.
+  await syncAiConfigFromAdmin();
   const ms = env.adminAi.intervalMin * 60_000;
   if (ms > 0) setInterval(() => void syncAiConfigFromAdmin(), ms).unref();
 }
