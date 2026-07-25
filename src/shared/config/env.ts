@@ -68,10 +68,21 @@ const envSchema = z
     /** For OpenAI-compatible servers (Ollama, vLLM, OpenRouter…). */
     AI_BASE_URL: z.string().optional().or(z.literal('')),
 
-    // --- Billing / Paystack (optional; billing degrades to manual mode if unset) ---
+    // --- Billing (optional; billing degrades to manual mode if unset) ---
+    // The admin (Vhicasar) is the source of truth for the active provider and
+    // its keys when payment-config sync is on; these env vars are the local
+    // fallback used when the admin has nothing configured or is unreachable.
     BILLING_CURRENCY: z.string().length(3).default('NGN'),
+    /** Local fallback provider when the admin hasn't chosen one. */
+    BILLING_PROVIDER: z.enum(['paystack', 'flutterwave']).default('paystack'),
+    /** Pull the active payment provider + keys from the admin service API. */
+    ADMIN_PAYMENT_SYNC: z.string().default('true').transform((v) => v !== 'false'),
     PAYSTACK_SECRET_KEY: z.string().optional().or(z.literal('')),
     PAYSTACK_PUBLIC_KEY: z.string().optional().or(z.literal('')),
+    FLUTTERWAVE_SECRET_KEY: z.string().optional().or(z.literal('')),
+    FLUTTERWAVE_PUBLIC_KEY: z.string().optional().or(z.literal('')),
+    /** Flutterwave webhook "Secret hash" (dashboard → Settings → Webhooks). */
+    FLUTTERWAVE_SECRET_HASH: z.string().optional().or(z.literal('')),
     /** Where Paystack redirects the customer after checkout. */
     BILLING_CALLBACK_URL: z.string().url().optional(),
     /**
@@ -161,16 +172,24 @@ export const env = {
   corsOrigins: raw.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean),
   billing: {
     currency: raw.BILLING_CURRENCY.toUpperCase(),
+    /** Local fallback provider when the admin hasn't chosen an active one. */
+    provider: raw.BILLING_PROVIDER,
     paystackSecretKey: raw.PAYSTACK_SECRET_KEY || '',
     paystackPublicKey: raw.PAYSTACK_PUBLIC_KEY || '',
-    /** Paystack is usable only when a secret key is configured. */
+    /** Paystack is usable locally only when a secret key is configured. */
     paystackEnabled: Boolean(raw.PAYSTACK_SECRET_KEY),
+    flutterwaveSecretKey: raw.FLUTTERWAVE_SECRET_KEY || '',
+    flutterwavePublicKey: raw.FLUTTERWAVE_PUBLIC_KEY || '',
+    flutterwaveSecretHash: raw.FLUTTERWAVE_SECRET_HASH || '',
+    flutterwaveEnabled: Boolean(raw.FLUTTERWAVE_SECRET_KEY),
     callbackUrl: raw.BILLING_CALLBACK_URL || `${raw.WEB_APP_URL}/settings/billing`,
     /** Currencies the merchant can settle; defaults to the settlement currency. */
     chargeCurrencies: (raw.PAYSTACK_CHARGE_CURRENCIES || raw.BILLING_CURRENCY)
       .split(',')
       .map((c) => c.trim().toUpperCase())
       .filter(Boolean),
+    /** Pull active provider + keys from the admin (needs the service key). */
+    adminSync: raw.ADMIN_PAYMENT_SYNC && Boolean(raw.SERVICE_API_KEY),
   },
   fx: {
     providerUrl: raw.FX_PROVIDER_URL.replace(/\/+$/, ''),

@@ -5,7 +5,8 @@ import { requestContext } from '../../shared/context';
 import { AppError, NotFoundError } from '../../shared/errors';
 import { env } from '../../shared/config/env';
 import { logger } from '../../shared/logger';
-import { paystack } from '../../infrastructure/payments/paystack';
+import { getActivePaymentProvider, getChargeCurrencies } from '../../infrastructure/payments';
+import { ensureFreshPaymentConfig } from './payment-config-sync';
 import { notifyService } from '../notifications/notify.service';
 import { randomUUID } from 'crypto';
 import { exchangeRates } from '../../shared/exchange-rates';
@@ -284,16 +285,18 @@ export const smsWalletService = {
   },
 
   async checkout(packageId: string) {
+    await ensureFreshPaymentConfig();
     const config = await pricing();
     const selected = config.packages.find((p) => p.id === packageId);
     if (!selected) throw new NotFoundError('SMS package');
-    if (!paystack.enabled) throw new AppError('PAYSTACK_NOT_CONFIGURED', 503, 'Online payments are not configured.');
+    const provider = getActivePaymentProvider();
+    if (!provider.enabled) throw new AppError('PAYMENTS_NOT_CONFIGURED', 503, 'Online payments are not configured.');
     const organizationId = orgId();
     const org = await prismaUnscoped.organization.findUniqueOrThrow({
       where: { id: organizationId },
       select: { currency: true },
     });
-    if (!env.billing.chargeCurrencies.includes(org.currency)) {
+    if (!getChargeCurrencies().includes(org.currency)) {
       throw new AppError(
         'PREFERRED_CURRENCY_NOT_SETTLEABLE',
         400,
@@ -307,7 +310,7 @@ export const smsWalletService = {
     });
     if (!owner) throw new NotFoundError('Workspace owner');
     const reference = `sms_topup_${organizationId.slice(0, 8)}_${Date.now().toString(36)}`;
-    const result = await paystack.initializeTransaction({
+    const result = await provider.initializeTransaction({
       email: owner.user.email,
       amount: Math.round(charge.amount * 100),
       reference,
@@ -331,7 +334,7 @@ export const smsWalletService = {
   },
 
   async verifyPurchase(reference: string) {
-    const txn = await paystack.verifyTransaction(reference);
+    const txn = await getActivePaymentProvider().verifyTransaction(reference);
     if (txn.status !== 'success') throw new AppError('PAYMENT_NOT_SUCCESSFUL', 400, `Payment not successful (${txn.status}).`);
     const meta = (txn.metadata ?? {}) as Record<string, unknown>;
     if (meta.kind !== 'sms_wallet') throw new AppError('INVALID_REFERENCE', 400, 'This is not an SMS wallet payment.');

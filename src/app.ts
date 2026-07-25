@@ -45,7 +45,7 @@ import { filesRoutes } from './presentation/http/v1/files.routes';
 import { integrationsRoutes } from './presentation/http/v1/integrations.routes';
 import { brandingRoutes } from './presentation/http/v1/branding.routes';
 import { storage } from './infrastructure/storage/storage';
-import { paystackWebhookRoutes } from './presentation/http/paystack-webhook.routes';
+import { paystackWebhookRoutes, flutterwaveWebhookRoutes } from './presentation/http/paystack-webhook.routes';
 import { openApiDocument } from './presentation/http/swagger';
 
 export function createApp(): Express {
@@ -153,9 +153,10 @@ export function createApp(): Express {
     });
   }
 
-  // Public payment webhook (Paystack, HMAC-verified) — mounted before the
-  // channel webhook receiver so its specific path wins.
+  // Public payment webhooks (signature-verified) — mounted before the channel
+  // webhook receiver so their specific paths win.
   app.use('/api/webhooks/paystack', paystackWebhookRoutes);
+  app.use('/api/webhooks/flutterwave', flutterwaveWebhookRoutes);
 
   // Public provider webhooks (adapter-verified, not JWT-authenticated).
   app.use('/api/webhooks', webhookRoutes);

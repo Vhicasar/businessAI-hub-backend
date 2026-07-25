@@ -1,10 +1,10 @@
 import { z } from 'zod';
 import type { Plan, Subscription } from '@prisma/client';
 import { prismaUnscoped } from '../../infrastructure/database/prisma';
-import { env } from '../../shared/config/env';
 import { logger } from '../../shared/logger';
 import { AppError, NotFoundError } from '../../shared/errors';
-import { paystack } from '../../infrastructure/payments/paystack';
+import { getActivePaymentProvider, getChargeCurrencies } from '../../infrastructure/payments';
+import type { NormalizedWebhookEvent, PaymentProvider } from '../../infrastructure/payments';
 import { toPriceBook } from '../../shared/billing-currency';
 import { exchangeRates, type MoneyConversion } from '../../shared/exchange-rates';
 import { resolveEntitlements, currentOrgId } from './entitlements';
@@ -12,6 +12,7 @@ import { usageService, USAGE_METRICS } from './usage.service';
 import { ensureFreshPlans } from './plan-sync';
 import { smsWalletService } from './sms-wallet.service';
 import { addOnsService } from './add-ons.service';
+import { ensureFreshPaymentConfig } from './payment-config-sync';
 
 export const checkoutSchema = z.object({
   planSlug: z.string().min(1),
@@ -102,6 +103,7 @@ export const billingService = {
 
   /** Current subscription + plan + live usage/limits for the billing page. */
   async getSummary() {
+    await ensureFreshPaymentConfig();
     await ensureFreshPlans(); // reflect admin pricing edits on load
     const orgId = currentOrgId();
     const ent = await resolveEntitlements(orgId);
@@ -143,7 +145,11 @@ export const billingService = {
         smsCredits,
         marketingReach: { used: marketingReach, limit: plan?.maxMarketingReach ?? null },
       },
-      paystackEnabled: env.billing.paystackEnabled,
+      // Active payment gateway (admin-selected, falling back to local env).
+      paymentProvider: getActivePaymentProvider().name,
+      paymentsEnabled: getActivePaymentProvider().enabled,
+      // Back-compat alias for older web clients.
+      paystackEnabled: getActivePaymentProvider().enabled,
     };
   },
 
@@ -184,6 +190,7 @@ export const billingService = {
    * Paystack checkout URL. Enterprise (non-public) must contact sales.
    */
   async checkout(dto: CheckoutDto) {
+    await ensureFreshPaymentConfig();
     const orgId = currentOrgId();
     const plan = await prismaUnscoped.plan.findUnique({ where: { slug: dto.planSlug } });
     if (!plan || !plan.isActive) throw new NotFoundError('Plan');
@@ -196,7 +203,7 @@ export const billingService = {
       select: { currency: true },
     });
     const preferredCurrency = org?.currency.toUpperCase() ?? plan.currency.toUpperCase();
-    if (!env.billing.chargeCurrencies.includes(preferredCurrency)) {
+    if (!getChargeCurrencies().includes(preferredCurrency)) {
       throw new AppError(
         'PREFERRED_CURRENCY_NOT_SETTLEABLE',
         400,
@@ -228,9 +235,10 @@ export const billingService = {
       return { type: 'activated' as const, subscription: subscriptionDto(sub) };
     }
 
-    if (!paystack.enabled) {
+    const provider = getActivePaymentProvider();
+    if (!provider.enabled) {
       throw new AppError(
-        'PAYSTACK_NOT_CONFIGURED',
+        'PAYMENTS_NOT_CONFIGURED',
         503,
         'Online payments are not configured. Contact the administrator to enable checkout.'
       );
@@ -238,12 +246,24 @@ export const billingService = {
 
     const email = await this.billingEmail(orgId);
     const reference = `bh_${orgId.slice(0, 8)}_${Date.now().toString(36)}`;
-    const init = await paystack.initializeTransaction({
+    // Gateways take the smallest unit (kobo, cents, pesewas).
+    const amountMinor = Math.round(price * 100);
+    // Create/reuse a real gateway plan so the charge starts a recurring
+    // Subscription (visible in the dashboard, auto-renewed). This is
+    // deliberately fail-closed: silently omitting the plan turns a subscription
+    // purchase into a one-off payment, which is never an acceptable fallback.
+    const planCode = await this.ensureProviderPlan(provider, {
+      plan,
+      interval: dto.interval,
+      currency: charge.currency,
+      amountMinor,
+    });
+    const init = await provider.initializeTransaction({
       email,
-      // Paystack takes the smallest unit (kobo, cents, pesewas).
-      amount: Math.round(price * 100),
+      amount: amountMinor,
       reference,
       currency: charge.currency,
+      planCode,
       metadata: {
         organizationId: orgId,
         planId: plan.id,
@@ -269,15 +289,17 @@ export const billingService = {
   },
 
   /**
-   * Verifies a Paystack reference and activates the subscription. Idempotent —
-   * safe to call from both the browser callback and the webhook.
+   * Verifies a payment reference and activates the subscription. Idempotent —
+   * safe to call from both the browser callback and the webhook. Routes to the
+   * SMS-wallet / add-on flows by the transaction metadata `kind`.
    */
   async verifyReference(reference: string) {
     // Already processed?
     const existing = await prismaUnscoped.billingRecord.findFirst({ where: { providerRef: reference } });
     if (existing) return { activated: true, alreadyProcessed: true };
 
-    const txn = await paystack.verifyTransaction(reference);
+    const provider = getActivePaymentProvider();
+    const txn = await provider.verifyTransaction(reference);
     if (txn.status !== 'success') {
       throw new AppError('PAYMENT_NOT_SUCCESSFUL', 400, `Payment not successful (${txn.status}).`);
     }
@@ -296,13 +318,24 @@ export const billingService = {
       throw new AppError('INVALID_REFERENCE', 400, 'Payment metadata is incomplete.');
     }
 
+    // Best-effort: link the gateway's recurring Subscription so we can renew and
+    // cancel it. Failure here must not block activation of a paid subscription.
+    let providerSubscriptionCode: string | null = null;
+    if (txn.subscriptionCode) {
+      providerSubscriptionCode = txn.subscriptionCode;
+    } else if (txn.customerCode && txn.planCode) {
+      providerSubscriptionCode = await provider.findSubscriptionCode(txn.customerCode, txn.planCode);
+    }
+
     await this.activate({
       orgId: organizationId,
       planId,
       interval,
       amount: txn.amount / 100,
+      provider: provider.name,
       providerRef: reference,
       providerCustomerCode: txn.customerCode,
+      providerSubscriptionCode,
       currency: txn.currency,
       sourceAmount: Number(meta.sourceAmount ?? txn.amount / 100),
       sourceCurrency: String(meta.sourceCurrency ?? txn.currency),
@@ -312,15 +345,111 @@ export const billingService = {
     return { activated: true, alreadyProcessed: false };
   },
 
-  /** Handles a verified Paystack webhook event. */
-  async handleWebhookEvent(event: { event: string; data?: { reference?: string } }) {
-    if (event.event === 'charge.success' && event.data?.reference) {
-      try {
-        await this.verifyReference(event.data.reference);
-      } catch (err) {
-        logger.error({ err, reference: event.data.reference }, 'Failed to process Paystack webhook');
+  /**
+   * Handles a verified, normalized payment webhook event (any provider):
+   *  - charge_success carrying our metadata → first charge or one-off purchase
+   *    (routed by verifyReference).
+   *  - charge_success on an existing recurring subscription (renewal) → extend
+   *    the local period and record the invoice.
+   *  - subscription_create → link the gateway subscription code.
+   *  - subscription_disable → schedule cancellation at period end.
+   */
+  async handleWebhookEvent(event: NormalizedWebhookEvent) {
+    try {
+      if (event.type === 'charge_success' && event.reference) {
+        try {
+          await this.verifyReference(event.reference);
+        } catch (err) {
+          // Renewal charges carry no metadata of ours — settle them by the
+          // subscription code instead of failing.
+          if (event.subscriptionCode) {
+            await this.recordRenewal(event);
+          } else {
+            throw err;
+          }
+        }
+        return;
       }
+      if (event.type === 'subscription_create' && event.subscriptionCode) {
+        await this.linkSubscriptionCode(event);
+        return;
+      }
+      if (event.type === 'subscription_disable' && event.subscriptionCode) {
+        await this.markCancelledByCode(event.subscriptionCode);
+        return;
+      }
+    } catch (err) {
+      logger.error({ err, event }, 'Failed to process payment webhook');
     }
+  },
+
+  /** Links the gateway's subscription code to the local subscription. */
+  async linkSubscriptionCode(event: NormalizedWebhookEvent) {
+    if (!event.customerEmail || !event.subscriptionCode) return;
+    // Match by the billing email captured on the org owner/organization.
+    const membership = await prismaUnscoped.membership.findFirst({
+      where: { isOwner: true, isActive: true, user: { email: event.customerEmail } },
+      select: { organizationId: true },
+    });
+    const orgId = membership?.organizationId
+      ?? (await prismaUnscoped.organization.findFirst({ where: { email: event.customerEmail }, select: { id: true } }))?.id;
+    if (!orgId) return;
+    const sub = await prismaUnscoped.subscription.findFirst({
+      where: { organizationId: orgId },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!sub || sub.providerSubscriptionCode) return;
+    await prismaUnscoped.subscription.update({
+      where: { id: sub.id },
+      data: { providerSubscriptionCode: event.subscriptionCode, provider: event.provider },
+    });
+  },
+
+  /** Extends the period + records the invoice for a recurring renewal charge. */
+  async recordRenewal(event: NormalizedWebhookEvent) {
+    if (!event.subscriptionCode || !event.reference) return;
+    const dup = await prismaUnscoped.billingRecord.findFirst({ where: { providerRef: event.reference } });
+    if (dup) return;
+    const sub = await prismaUnscoped.subscription.findFirst({
+      where: { providerSubscriptionCode: event.subscriptionCode },
+      include: { plan: true },
+    });
+    if (!sub) {
+      logger.warn({ event }, 'Renewal for unknown subscription code');
+      return;
+    }
+    const now = new Date();
+    const end = addInterval(now, sub.interval as Interval);
+    await prismaUnscoped.subscription.update({
+      where: { id: sub.id },
+      data: { status: 'ACTIVE', currentPeriodStart: now, currentPeriodEnd: end },
+    });
+    await prismaUnscoped.billingRecord.create({
+      data: {
+        subscriptionId: sub.id,
+        amount: sub.interval === 'YEARLY' ? Number(sub.plan.priceYearly) : Number(sub.plan.priceMonthly),
+        currency: sub.plan.currency,
+        status: 'PAID',
+        periodStart: now,
+        periodEnd: end,
+        provider: event.provider,
+        providerRef: event.reference,
+        paidAt: now,
+      },
+    });
+    logger.info({ subscriptionId: sub.id }, 'Subscription renewed from webhook');
+  },
+
+  /** Schedules cancellation when the gateway reports a subscription disabled. */
+  async markCancelledByCode(subscriptionCode: string) {
+    const sub = await prismaUnscoped.subscription.findFirst({
+      where: { providerSubscriptionCode: subscriptionCode },
+    });
+    if (!sub) return;
+    await prismaUnscoped.subscription.update({
+      where: { id: sub.id },
+      data: { cancelAtPeriodEnd: true, cancelledAt: new Date() },
+    });
   },
 
   /** Schedules cancellation at period end (org falls back to free plan after). */
@@ -331,6 +460,14 @@ export const billingService = {
       orderBy: { createdAt: 'desc' },
     });
     if (!sub) throw new NotFoundError('Active subscription');
+    // Stop the gateway from auto-charging again; the org keeps access until the
+    // period ends. Best-effort — a gateway error must not block cancellation.
+    if (sub.providerSubscriptionCode) {
+      const provider = getActivePaymentProvider();
+      if (provider.name === sub.provider) {
+        await provider.disableSubscription(sub.providerSubscriptionCode);
+      }
+    }
     const updated = await prismaUnscoped.subscription.update({
       where: { id: sub.id },
       data: { cancelAtPeriodEnd: true, cancelledAt: new Date() },
@@ -357,14 +494,69 @@ export const billingService = {
 
   // ---- internals ---------------------------------------------------------
 
+  /**
+   * Creates or reuses a recurring gateway plan for (plan × interval × currency),
+   * caching its code in ProviderPlan. Recreated when the price changes.
+   * Subscription checkout must fail if the provider plan cannot be created:
+   * continuing without a plan would create a one-off dashboard payment.
+   */
+  async ensureProviderPlan(
+    provider: PaymentProvider,
+    input: { plan: Plan; interval: Interval; currency: string; amountMinor: number },
+  ): Promise<string> {
+    const { plan, interval, currency, amountMinor } = input;
+    try {
+      const existing = await prismaUnscoped.providerPlan.findUnique({
+        where: {
+          provider_planId_interval_currency: {
+            provider: provider.name,
+            planId: plan.id,
+            interval,
+            currency,
+          },
+        },
+      });
+      if (existing && existing.amountMinor === amountMinor) return existing.providerPlanCode;
+
+      const { planCode } = await provider.ensurePlan({
+        name: `${plan.name} (${interval === 'YEARLY' ? 'Yearly' : 'Monthly'}, ${currency})`,
+        amount: amountMinor,
+        currency,
+        interval,
+      });
+      await prismaUnscoped.providerPlan.upsert({
+        where: {
+          provider_planId_interval_currency: {
+            provider: provider.name,
+            planId: plan.id,
+            interval,
+            currency,
+          },
+        },
+        create: { provider: provider.name, planId: plan.id, interval, currency, amountMinor, providerPlanCode: planCode },
+        update: { amountMinor, providerPlanCode: planCode },
+      });
+      return planCode;
+    } catch (err) {
+      logger.error({ err, provider: provider.name, planId: plan.id, interval, currency }, 'Recurring provider plan could not be created');
+      throw new AppError(
+        'RECURRING_PLAN_SETUP_FAILED',
+        502,
+        `Could not create the recurring ${provider.name === 'paystack' ? 'Paystack' : 'Flutterwave'} plan. No payment was started; check the gateway account, currency, and API permissions.`,
+      );
+    }
+  },
+
   /** Creates or updates the org's single subscription and records payment. */
   async activate(params: {
     orgId: string;
     planId: string;
     interval: Interval;
     amount: number;
+    provider?: string;
     providerRef?: string;
     providerCustomerCode?: string | null;
+    providerSubscriptionCode?: string | null;
     currency?: string;
     sourceAmount?: number;
     sourceCurrency?: string;
@@ -373,6 +565,7 @@ export const billingService = {
   }): Promise<Subscription & { plan: Plan }> {
     const now = new Date();
     const end = addInterval(now, params.interval);
+    const providerName = params.provider ?? getActivePaymentProvider().name;
 
     const existing = await prismaUnscoped.subscription.findFirst({
       where: { organizationId: params.orgId },
@@ -387,8 +580,9 @@ export const billingService = {
       currentPeriodEnd: end,
       cancelAtPeriodEnd: false,
       cancelledAt: null,
-      ...(params.amount > 0 ? { provider: 'paystack' } : {}),
+      ...(params.amount > 0 ? { provider: providerName } : {}),
       ...(params.providerCustomerCode ? { providerCustomerCode: params.providerCustomerCode } : {}),
+      ...(params.providerSubscriptionCode ? { providerSubscriptionCode: params.providerSubscriptionCode } : {}),
     };
 
     const sub = existing
@@ -419,7 +613,7 @@ export const billingService = {
             status: 'PAID',
             periodStart: now,
             periodEnd: end,
-            provider: 'paystack',
+            provider: providerName,
             providerRef: params.providerRef,
             paidAt: now,
           },

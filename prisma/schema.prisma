@@ -3102,6 +3102,28 @@ model Plan {
   subscriptions Subscription[]
 }
 
+/// Maps a local plan (× interval × currency) to the recurring plan created in a
+/// payment gateway (Paystack Plan code / Flutterwave Payment Plan id), so a
+/// subscription checkout charges through a real gateway plan and shows up as a
+/// Subscription in the provider dashboard. Reused across checkouts; recreated
+/// when the plan's price changes (see billing.service.ensureProviderPlan).
+model ProviderPlan {
+  id               String       @id @default(cuid())
+  provider         String // "paystack" | "flutterwave"
+  planId           String
+  interval         PlanInterval
+  currency         String       @db.Char(3)
+  /// Recurring amount in the smallest currency unit the plan was created with;
+  /// a change means the price moved and a new gateway plan is needed.
+  amountMinor      Int
+  providerPlanCode String
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  @@unique([provider, planId, interval, currency])
+  @@index([provider, providerPlanCode])
+}
+
 model Subscription {
   id             String             @id @default(cuid())
   organizationId String

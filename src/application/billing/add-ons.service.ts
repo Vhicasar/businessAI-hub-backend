@@ -1,11 +1,11 @@
 import { z } from 'zod';
 import { prismaUnscoped } from '../../infrastructure/database/prisma';
-import { paystack } from '../../infrastructure/payments/paystack';
+import { getActivePaymentProvider, getChargeCurrencies } from '../../infrastructure/payments';
 import { AppError, NotFoundError } from '../../shared/errors';
-import { env } from '../../shared/config/env';
 import { exchangeRates } from '../../shared/exchange-rates';
 import { currentOrgId } from './entitlements';
 import { getSiteCatalog, type CatalogAddOn } from '../catalog/site-catalog.service';
+import { ensureFreshPaymentConfig } from './payment-config-sync';
 
 export const addOnCheckoutSchema = z.object({ addOnId: z.string().min(1) });
 
@@ -50,17 +50,19 @@ export const addOnsService = {
   },
 
   async checkout(addOnId: string) {
+    await ensureFreshPaymentConfig();
     const organizationId = currentOrgId();
     const addOn = (await getSiteCatalog(true)).addOns.find((item) => item.id === addOnId && item.enabled);
     if (!addOn) throw new NotFoundError('Add-on');
     const org = await prismaUnscoped.organization.findUniqueOrThrow({ where: { id: organizationId }, select: { currency: true } });
-    if (!env.billing.chargeCurrencies.includes(org.currency)) {
+    if (!getChargeCurrencies().includes(org.currency)) {
       throw new AppError('PREFERRED_CURRENCY_NOT_SETTLEABLE', 400, `Checkout in ${org.currency} is not enabled.`);
     }
-    if (!paystack.enabled) throw new AppError('PAYSTACK_NOT_CONFIGURED', 503, 'Online payments are not configured.');
+    const provider = getActivePaymentProvider();
+    if (!provider.enabled) throw new AppError('PAYMENTS_NOT_CONFIGURED', 503, 'Online payments are not configured.');
     const price = await priced(addOn, org.currency);
     const reference = `addon_${organizationId.slice(0, 8)}_${Date.now().toString(36)}`;
-    const init = await paystack.initializeTransaction({
+    const init = await provider.initializeTransaction({
       email: await billingEmail(organizationId),
       amount: Math.round(price.amount * 100),
       reference,
@@ -73,7 +75,7 @@ export const addOnsService = {
   async verify(reference: string) {
     const existing = await prismaUnscoped.addOnPurchase.findUnique({ where: { providerRef: reference } });
     if (existing) return { addOnActivated: true, alreadyProcessed: true };
-    const txn = await paystack.verifyTransaction(reference);
+    const txn = await getActivePaymentProvider().verifyTransaction(reference);
     if (txn.status !== 'success') throw new AppError('PAYMENT_NOT_SUCCESSFUL', 400, `Payment not successful (${txn.status}).`);
     const meta = (txn.metadata ?? {}) as Record<string, unknown>;
     if (meta.kind !== 'add_on') throw new AppError('INVALID_REFERENCE', 400, 'This is not an add-on payment.');
@@ -84,7 +86,7 @@ export const addOnsService = {
       data: {
         organizationId: String(meta.organizationId), addOnId: String(meta.addOnId), title: String(meta.title),
         billingType, amount: txn.amount / 100, currency: txn.currency,
-        entitlements: (meta.entitlements ?? {}) as object, provider: 'paystack', providerRef: reference,
+        entitlements: (meta.entitlements ?? {}) as object, provider: getActivePaymentProvider().name, providerRef: reference,
         expiresAt: billingType === 'MONTHLY' ? expiresAt : null,
       },
     });

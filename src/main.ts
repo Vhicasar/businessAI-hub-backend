@@ -9,12 +9,14 @@ import {
 } from './infrastructure/channels/email.poller';
 import { startPlanSync } from './application/billing/plan-sync';
 import { startAiConfigSync } from './application/ai/ai-sync';
+import { startPaymentConfigSync } from './application/billing/payment-config-sync';
 import { closeQueues, queueEnabled } from './infrastructure/queue/queue';
 import { createApp } from './app';
 
 async function bootstrap(): Promise<void> {
   await connectDatabase();
   await startAiConfigSync(); // establish the admin-managed provider before serving AI traffic
+  await startPaymentConfigSync(); // resolve the active payment gateway before serving checkouts
 
   const app = createApp();
   const httpServer = createServer(app);
