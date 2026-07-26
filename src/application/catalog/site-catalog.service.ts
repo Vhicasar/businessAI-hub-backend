@@ -61,7 +61,10 @@ let brandingCache: { value: { name: string; logoUrl: string | null; themeColor: 
 export async function getProductBranding() {
   if (brandingCache && brandingCache.expiresAt > Date.now()) return brandingCache.value;
   const fallback = { name: 'BusinessHub AI', logoUrl: null, themeColor: '#F97316' };
-  if (!env.adminCatalog.enabled) return fallback;
+  // Branding only needs the admin's public API — it is independent of the plan
+  // sync toggle, so the product logo/name/favicon still track the admin even
+  // when ADMIN_PLAN_SYNC is off.
+  if (!env.adminCatalog.apiUrl || !env.adminCatalog.tenantSlug) return fallback;
   try {
     const res = await fetch(`${env.adminCatalog.apiUrl}/api/v1/public/${env.adminCatalog.tenantSlug}/config`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);

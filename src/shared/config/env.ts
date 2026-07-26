@@ -40,6 +40,15 @@ const envSchema = z
     SMTP_PASS: z.string().optional().or(z.literal('')),
     MAIL_FROM: z.string().default('BusinessHub AI <no-reply@businesshub.local>'),
 
+    // --- Push notifications (Firebase Cloud Messaging) ---
+    // Provide the Firebase Admin service account as an inline JSON string OR a
+    // path to the JSON key file. When neither is set, push is disabled and the
+    // app falls back to in-app + realtime notifications only.
+    FIREBASE_SERVICE_ACCOUNT: z.string().optional().or(z.literal('')),
+    FIREBASE_SERVICE_ACCOUNT_PATH: z.string().optional().or(z.literal('')),
+    /** Raw resource / file name (no extension) of the custom notification sound. */
+    PUSH_SOUND: z.string().default('notification'),
+
     // --- File storage ---
     // Cloudflare R2 in production (S3-compatible); local disk for dev so the
     // upload features work with no cloud credentials. 'auto' picks R2 when its
@@ -242,6 +251,12 @@ export const env = {
     verifyKey: keys.verifyKey,
     accessTtl: raw.ACCESS_TOKEN_TTL,
     refreshTtlDays: raw.REFRESH_TOKEN_TTL_DAYS,
+  },
+  push: {
+    enabled: Boolean(raw.FIREBASE_SERVICE_ACCOUNT || raw.FIREBASE_SERVICE_ACCOUNT_PATH),
+    serviceAccountJson: raw.FIREBASE_SERVICE_ACCOUNT || '',
+    serviceAccountPath: raw.FIREBASE_SERVICE_ACCOUNT_PATH || '',
+    sound: raw.PUSH_SOUND,
   },
 } as const;
 

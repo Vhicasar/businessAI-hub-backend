@@ -34,3 +34,58 @@ notificationsRoutes.post(
     res.json({ success: true, data: await notifyService.markRead(uid(req), req.params.id as string) });
   }),
 );
+
+// ── Device tokens (FCM) ────────────────────────────────────────────────────
+
+const PLATFORMS = new Set(['web', 'android', 'ios', 'windows', 'macos', 'linux']);
+
+/** Register/refresh this device's push token. */
+notificationsRoutes.post(
+  '/devices',
+  wrap(async (req, res) => {
+    const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+    const platform = typeof req.body?.platform === 'string' ? req.body.platform : '';
+    if (!token || !PLATFORMS.has(platform)) {
+      res.status(400).json({ success: false, error: { message: 'token and a valid platform are required' } });
+      return;
+    }
+    res.json({ success: true, data: await notifyService.registerDevice(uid(req), token, platform) });
+  }),
+);
+
+/** Unregister a push token (sign-out / revoke). */
+notificationsRoutes.delete(
+  '/devices/:token',
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await notifyService.removeDevice(uid(req), req.params.token as string) });
+  }),
+);
+
+// ── Preferences ────────────────────────────────────────────────────────────
+
+const CHANNELS = new Set(['PUSH', 'IN_APP', 'EMAIL']);
+
+notificationsRoutes.get(
+  '/preferences',
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await notifyService.getPreferences(uid(req)) });
+  }),
+);
+
+/** Toggle one preference: { type, channel, enabled }. */
+notificationsRoutes.put(
+  '/preferences',
+  wrap(async (req, res) => {
+    const type = typeof req.body?.type === 'string' ? req.body.type : '';
+    const channel = typeof req.body?.channel === 'string' ? req.body.channel : '';
+    const enabled = req.body?.enabled;
+    if (!type || !CHANNELS.has(channel) || typeof enabled !== 'boolean') {
+      res.status(400).json({ success: false, error: { message: 'type, channel and enabled are required' } });
+      return;
+    }
+    res.json({
+      success: true,
+      data: await notifyService.setPreference(uid(req), type, channel as 'PUSH' | 'IN_APP' | 'EMAIL', enabled),
+    });
+  }),
+);
