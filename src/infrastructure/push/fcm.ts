@@ -22,14 +22,32 @@ let appPromise: Promise<unknown | null> | null = null;
 
 function loadServiceAccount(): Record<string, unknown> | null {
   try {
-    if (env.push.serviceAccountJson) {
-      return JSON.parse(env.push.serviceAccountJson) as Record<string, unknown>;
+    let raw = env.push.serviceAccountJson;
+    if (!raw && env.push.serviceAccountPath) raw = readFileSync(env.push.serviceAccountPath, 'utf8');
+    if (!raw) return null;
+    raw = raw.trim();
+
+    // Common env-var gotcha: the JSON is base64-encoded to survive shells/CI.
+    if (!raw.startsWith('{')) {
+      try {
+        raw = Buffer.from(raw, 'base64').toString('utf8').trim();
+      } catch {
+        /* not base64 — fall through and let JSON.parse report */
+      }
     }
-    if (env.push.serviceAccountPath) {
-      return JSON.parse(readFileSync(env.push.serviceAccountPath, 'utf8')) as Record<string, unknown>;
+
+    const account = JSON.parse(raw) as Record<string, unknown>;
+    // The most common failure: the private key's newlines arrive escaped as
+    // literal "\n" (env vars can't hold real newlines). Restore them.
+    if (typeof account.private_key === 'string') {
+      account.private_key = account.private_key.replace(/\\n/g, '\n');
     }
+    return account;
   } catch (err) {
-    logger.error({ err: (err as Error).message }, 'FCM service account is invalid JSON');
+    logger.error(
+      { err: (err as Error).message },
+      'FCM service account could not be parsed (expected JSON or base64-encoded JSON). Push is disabled.',
+    );
   }
   return null;
 }
@@ -38,11 +56,16 @@ async function getApp(): Promise<unknown | null> {
   if (!env.push.enabled) return null;
   appPromise ??= (async () => {
     const account = loadServiceAccount();
-    if (!account) return null;
+    if (!account) {
+      logger.warn('Push is enabled but the FCM service account is missing/invalid — push will not send.');
+      return null;
+    }
     const { initializeApp, getApps, cert } = await import(ADMIN_APP);
     const existing = getApps();
     if (existing.length) return existing[0];
-    return initializeApp({ credential: cert(account) });
+    const app = initializeApp({ credential: cert(account) });
+    logger.info({ projectId: account.project_id }, 'FCM (push) initialised');
+    return app;
   })();
   return appPromise;
 }

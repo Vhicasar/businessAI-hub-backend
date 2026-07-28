@@ -48,7 +48,7 @@ export interface SessionResult {
     emailVerified: boolean;
     twoFactorEnabled: boolean;
   };
-  organization: { id: string; name: string; slug: string; logoUrl: string | null } | null;
+  organization: { id: string; name: string; slug: string; businessType: string; logoUrl: string | null } | null;
 }
 
 function slugify(name: string): string {
@@ -113,7 +113,7 @@ async function buildSession(
       ...(organizationId ? { organizationId } : {}),
     },
     orderBy: { createdAt: 'asc' },
-    include: { organization: { select: { id: true, name: true, slug: true, logoFileId: true } } },
+    include: { organization: { select: { id: true, name: true, slug: true, businessType: true, logoFileId: true } } },
   });
 
   const accessToken = tokenService.signAccessToken({
@@ -142,6 +142,7 @@ async function buildSession(
           id: membership.organization.id,
           name: membership.organization.name,
           slug: membership.organization.slug,
+          businessType: membership.organization.businessType,
           logoUrl: await filesService.urlFor(membership.organization.logoFileId),
         }
       : null,
