@@ -1,7 +1,7 @@
 import { env } from '../../shared/config/env';
 import { logger } from '../../shared/logger';
 import { AppError } from '../../shared/errors';
-import { getPaymentConfig } from './config';
+import { getPaymentConfig, type ResolvedPaymentConfig } from './config';
 import type {
   PaymentProvider,
   InitializeTxnInput,
@@ -45,11 +45,14 @@ function toMajor(amount: number): number {
   return Math.round(amount) / 100;
 }
 
-class FlutterwaveClient implements PaymentProvider {
+export class FlutterwaveClient implements PaymentProvider {
   readonly name = 'flutterwave' as const;
 
+  /** See PaystackClient: defaults to platform config; bind a resolver for per-org accounts. */
+  constructor(private readonly resolveConfig: () => ResolvedPaymentConfig = getPaymentConfig) {}
+
   private get config() {
-    return getPaymentConfig();
+    return this.resolveConfig();
   }
 
   private get secretKey(): string {

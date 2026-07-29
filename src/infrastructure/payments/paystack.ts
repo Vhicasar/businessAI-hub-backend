@@ -2,7 +2,7 @@ import { createHmac, timingSafeEqual } from 'crypto';
 import { env } from '../../shared/config/env';
 import { logger } from '../../shared/logger';
 import { AppError } from '../../shared/errors';
-import { getPaymentConfig } from './config';
+import { getPaymentConfig, type ResolvedPaymentConfig } from './config';
 import type {
   PaymentProvider,
   InitializeTxnInput,
@@ -39,11 +39,18 @@ interface PaystackEnvelope<T> {
   data: T;
 }
 
-class PaystackClient implements PaymentProvider {
+export class PaystackClient implements PaymentProvider {
   readonly name = 'paystack' as const;
 
+  /**
+   * By default the client reads the *platform* config (admin-synced billing
+   * keys). Pass a resolver to bind it to a specific merchant account — used for
+   * per-organization customer collections (payment links).
+   */
+  constructor(private readonly resolveConfig: () => ResolvedPaymentConfig = getPaymentConfig) {}
+
   private get config() {
-    return getPaymentConfig();
+    return this.resolveConfig();
   }
 
   private get secretKey(): string {

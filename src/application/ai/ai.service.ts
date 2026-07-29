@@ -1,12 +1,13 @@
 import { AppError, NotFoundError } from '../../shared/errors';
 import { prisma } from '../../infrastructure/database/prisma';
 import { logger } from '../../shared/logger';
-import { getAiProvider } from '../../infrastructure/ai';
+import { resolveAi, resolveAiOptional } from './org-ai.service';
 import { extractJson, type AiMessage } from './ai-provider';
 import { aiCredits } from '../billing/ai-credits';
 import { kbService } from '../support/kb.service';
 import { knowledgeService } from '../knowledge/knowledge.service';
 import { ordersService } from '../orders/orders.service';
+import { appointmentsService } from '../appointments/appointments.service';
 import { supportService } from '../support/support.service';
 import { notifyService } from '../notifications/notify.service';
 import { currentOrgId, resolveEntitlements } from '../billing/entitlements';
@@ -39,18 +40,6 @@ async function ticketContext(ticketId: string) {
   return { ticket, transcript: lines.join('\n') };
 }
 
-function requireAi() {
-  const provider = getAiProvider();
-  if (!provider) {
-    throw new AppError(
-      'AI_DISABLED',
-      503,
-      'AI is not configured. Set AI_PROVIDER, AI_API_KEY and AI_MODEL in the backend environment.'
-    );
-  }
-  return provider;
-}
-
 async function conversationTranscript(conversationId: string, limit = 50) {
   const conversation = await prisma.conversation.findFirst({
     where: { id: conversationId },
@@ -58,7 +47,7 @@ async function conversationTranscript(conversationId: string, limit = 50) {
       customer: {
         select: {
           id: true, firstName: true, lastName: true, lifetimeValue: true,
-          totalOrders: true, aiSummary: true,
+          totalOrders: true, aiSummary: true, email: true, phone: true,
         },
       },
       channelAccount: { select: { channelType: true } },
@@ -134,7 +123,21 @@ async function productContext(query: string) {
  * business's team confirms. Names are resolved to each product's default
  * active variant; unmatched names are skipped.
  */
-async function createDraftOrder(customerId: string, items: { name?: string; quantity?: number }[]) {
+/** Map a conversation's channel to a valid order source so an AI-taken order is
+ * attributed to the channel the customer actually used (not always web chat). */
+function channelToOrderSource(channelType?: string): 'WHATSAPP' | 'INSTAGRAM' | 'TELEGRAM' | 'TIKTOK' | 'MESSENGER' | 'WEB_CHAT' | 'API' {
+  switch (channelType) {
+    case 'WHATSAPP': return 'WHATSAPP';
+    case 'INSTAGRAM': return 'INSTAGRAM';
+    case 'TELEGRAM': return 'TELEGRAM';
+    case 'TIKTOK': return 'TIKTOK';
+    case 'FACEBOOK_MESSENGER': return 'MESSENGER';
+    case 'WEB_CHAT': return 'WEB_CHAT';
+    default: return 'API'; // email/sms/other — generic non-manual source
+  }
+}
+
+async function createDraftOrder(customerId: string, items: { name?: string; quantity?: number }[], channelType?: string) {
   const lines: { variantId: string; quantity: number }[] = [];
   for (const it of items) {
     const name = (it.name ?? '').trim();
@@ -162,7 +165,7 @@ async function createDraftOrder(customerId: string, items: { name?: string; quan
     lines.every((l) => recent.items.some((r) => r.variantId === l.variantId && Number(r.quantity) === l.quantity));
   if (sameCart) return recent;
 
-  return ordersService.create({ customerId, source: 'WEB_CHAT', items: lines, shippingTotal: 0 }, null);
+  return ordersService.create({ customerId, source: channelToOrderSource(channelType), items: lines, shippingTotal: 0 }, null);
 }
 
 export const aiService = {
@@ -178,7 +181,7 @@ export const aiService = {
     history: AiMessage[] = [],
     currentPath?: string,
   ): Promise<{ reply: string; suggestedActions: { label: string; path: string }[] }> {
-    const provider = requireAi();
+    const { provider, ownKey } = await resolveAi();
     const organizationId = currentOrgId();
     const ent = await resolveEntitlements(organizationId);
     const asksForInsights =
@@ -192,7 +195,7 @@ export const aiService = {
         { feature: 'ai_insights', plan: ent.planSlug },
       );
     }
-    await aiCredits.consume(organizationId);
+    if (!ownKey) await aiCredits.consume(organizationId);
 
     const org = await prisma.organization.findUniqueOrThrow({
       where: { id: organizationId },
@@ -246,8 +249,8 @@ export const aiService = {
 
   // ------------------------------------------------- conversation summary
   async summarizeConversation(conversationId: string): Promise<{ summary: string }> {
-    const provider = requireAi();
-    await aiCredits.consume();
+    const { provider, ownKey } = await resolveAi();
+    if (!ownKey) await aiCredits.consume();
     const { conversation, transcript } = await conversationTranscript(conversationId);
 
     const messages: AiMessage[] = [
@@ -274,8 +277,8 @@ export const aiService = {
 
   // ---------------------------------------------------------- reply draft
   async suggestReply(conversationId: string): Promise<{ suggestion: string }> {
-    const provider = requireAi();
-    await aiCredits.consume();
+    const { provider, ownKey } = await resolveAi();
+    if (!ownKey) await aiCredits.consume();
     const { conversation, transcript } = await conversationTranscript(conversationId);
 
     const messages: AiMessage[] = [
@@ -300,7 +303,7 @@ export const aiService = {
   // ------------------------------------------------------------ sentiment
   /** Fire-and-forget on inbound messages; failures only log. */
   async analyzeSentiment(conversationId: string, lastMessage: string): Promise<void> {
-    const provider = getAiProvider();
+    const { provider } = await resolveAiOptional();
     if (!provider) return;
     try {
       const raw = await provider.complete(
@@ -330,8 +333,8 @@ export const aiService = {
 
   // ------------------------------------------------------ customer summary
   async summarizeCustomer(customerId: string): Promise<{ summary: string }> {
-    const provider = requireAi();
-    await aiCredits.consume();
+    const { provider, ownKey } = await resolveAi();
+    if (!ownKey) await aiCredits.consume();
     const customer = await prisma.customer.findFirst({
       where: { id: customerId, deletedAt: null },
       include: {
@@ -393,7 +396,7 @@ export const aiService = {
    * silent and hand the conversation to a human.
    */
   async autoReplyDraft(conversationId: string): Promise<string | null> {
-    const provider = getAiProvider();
+    const { provider } = await resolveAiOptional();
     if (!provider) return null;
     const { conversation, transcript } = await conversationTranscript(conversationId, 20);
 
@@ -426,6 +429,27 @@ export const aiService = {
         return `- ${p.name}: ${price}${desc}`;
       })
       .join('\n');
+
+    // Appointment availability, so the assistant can offer real slots and book
+    // on ANY channel (spec #12) — not just the web-chat widget. Kept to a handful
+    // of upcoming slots with their exact ISO start so booking is unambiguous.
+    let apptCtx = '(booking not available)';
+    try {
+      const av = await appointmentsService.availableSlots(conversation.organizationId, undefined, 7);
+      if (av.enabled && av.slots.length > 0) {
+        const typeList = av.types.length ? ` Types: ${av.types.map((t) => `${t.name} (${t.id})`).join(', ')}.` : '';
+        apptCtx =
+          `Timezone: ${av.timezone}.${typeList}\n` +
+          av.slots.slice(0, 8).map((s) => {
+            const local = new Date(s.start).toLocaleString('en-US', {
+              timeZone: av.timezone, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+            });
+            return `- ${local} → start="${s.start}"`;
+          }).join('\n');
+      }
+    } catch {
+      /* booking optional — never block the reply */
+    }
 
     // A default webchat visitor has no real name yet — that's our cue to ask.
     const currentName = conversation.customer.firstName?.trim() ?? '';
@@ -469,12 +493,21 @@ export const aiService = {
             'explicitly confirms (e.g. "yes", "confirm", "go ahead") the order you just quoted, ' +
             'include "order.items" as [{"name","quantity"}] using exact PRODUCTS names. Never quote ' +
             'and place in the same message. If unsure whether they confirmed, ask again and omit "order".\n' +
+            'APPOINTMENTS: when the customer wants to book/schedule an appointment, viewing, or ' +
+            'consultation, offer the available times from APPOINTMENTS below in the customer\'s words ' +
+            '(their local, friendly time) and ask which works — do NOT include "booking" yet. ONLY in a ' +
+            'LATER message, after they pick one of the offered times, include "booking" with the exact ' +
+            'start ISO string copied verbatim from that slot (the value after start=), plus their name/' +
+            'email/phone if known, and confirm in "reply". Never offer times not listed. If APPOINTMENTS ' +
+            'says booking is unavailable, do not promise a booking — offer to connect them to the team.\n' +
             'Respond with JSON only. Shape: {"handoff": <bool>, "reply": "<text>", ' +
             '"save"?: {"name"?, "email"?, "phone"?}, "order"?: {"items": [{"name", "quantity"}]}, ' +
-            '"ticket"?: {"subject": "<short>", "priority": "LOW|MEDIUM|HIGH|URGENT"}}. ' +
+            '"ticket"?: {"subject": "<short>", "priority": "LOW|MEDIUM|HIGH|URGENT"}, ' +
+            '"booking"?: {"start": "<ISO from a listed slot>", "typeId"?, "notes"?}}. ' +
             'ALWAYS include a friendly "reply", even when handoff is true.\n\n' +
             `KNOWLEDGE:\n${knowledge || '(none retrieved for this message)'}\n\n` +
-            `PRODUCTS:\n${productsCtx || '(no products available)'}`,
+            `PRODUCTS:\n${productsCtx || '(no products available)'}\n\n` +
+            `APPOINTMENTS:\n${apptCtx}`,
         },
         {
           role: 'user',
@@ -490,6 +523,7 @@ export const aiService = {
       save?: { name?: string; email?: string; phone?: string };
       order?: { items?: { name?: string; quantity?: number }[] };
       ticket?: { subject?: string; priority?: string };
+      booking?: { start?: string; typeId?: string; notes?: string };
     }>(raw);
     if (!parsed) return null;
 
@@ -515,13 +549,40 @@ export const aiService = {
     // Place a draft order when the customer has confirmed their picks.
     if (parsed.order?.items?.length) {
       try {
-        const order = await createDraftOrder(conversation.customer.id, parsed.order.items);
+        const order = await createDraftOrder(conversation.customer.id, parsed.order.items, conversation.channelAccount.channelType);
         reply +=
           `\n\n✅ Draft order ${order.number} created — ${order.currency} ` +
           `${Number(order.total).toLocaleString()} total. Our team will confirm it shortly.`;
       } catch (err) {
         reply += `\n\n(I couldn't finalize that order right now — ${(err as Error).message}. I can connect you to our team.)`;
         logger.warn({ err }, 'Chat draft order failed');
+      }
+    }
+
+    // Book an appointment when the customer confirmed one of the offered slots.
+    // Works on every channel — the assistant offered real availability above.
+    if (parsed.booking?.start) {
+      try {
+        const appt = await appointmentsService.book(
+          conversation.organizationId,
+          {
+            start: parsed.booking.start,
+            typeId: parsed.booking.typeId,
+            notes: parsed.booking.notes,
+            name: knownName || undefined,
+            email: parsed.save?.email ?? conversation.customer.email ?? undefined,
+            phone: parsed.save?.phone ?? conversation.customer.phone ?? undefined,
+          },
+          'CHAT',
+          conversation.customer.id,
+        );
+        const when = new Date(appt.start).toLocaleString('en-US', {
+          timeZone: appt.timezone, weekday: 'long', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+        });
+        reply += `\n\n📅 Booked! You're confirmed for ${when} (${appt.timezone}). A confirmation with calendar details is on its way.`;
+      } catch (err) {
+        reply += `\n\n(I couldn't book that time — ${(err as Error).message}. Would you like me to connect you to the team?)`;
+        logger.warn({ err }, 'Chat appointment booking failed');
       }
     }
 
@@ -598,8 +659,8 @@ export const aiService = {
 
   // ---------------------------------------------------------- lead scoring
   async scoreLead(leadId: string): Promise<{ score: number; reason: string }> {
-    const provider = requireAi();
-    await aiCredits.consume();
+    const { provider, ownKey } = await resolveAi();
+    if (!ownKey) await aiCredits.consume();
     const lead = await prisma.lead.findFirst({ where: { id: leadId, deletedAt: null } });
     if (!lead) throw new NotFoundError('Lead');
     const engagement = await entityEngagement('LEAD', leadId);
@@ -644,8 +705,8 @@ export const aiService = {
 
   // ------------------------------------------------------ deal win probability
   async scoreDeal(dealId: string): Promise<{ winProbability: number; reason: string }> {
-    const provider = requireAi();
-    await aiCredits.consume();
+    const { provider, ownKey } = await resolveAi();
+    if (!ownKey) await aiCredits.consume();
     const deal = await prisma.deal.findFirst({
       where: { id: dealId, deletedAt: null },
       include: {
@@ -711,8 +772,8 @@ export const aiService = {
     entityType: 'LEAD' | 'DEAL',
     id: string
   ): Promise<{ action: string; rationale: string }> {
-    const provider = requireAi();
-    await aiCredits.consume();
+    const { provider, ownKey } = await resolveAi();
+    if (!ownKey) await aiCredits.consume();
 
     let facts: Record<string, unknown>;
     if (entityType === 'LEAD') {
@@ -771,8 +832,8 @@ export const aiService = {
 
   // ---------------------------------------------------------- support tickets
   async summarizeTicket(ticketId: string): Promise<{ summary: string }> {
-    const provider = requireAi();
-    await aiCredits.consume();
+    const { provider, ownKey } = await resolveAi();
+    if (!ownKey) await aiCredits.consume();
     const { transcript } = await ticketContext(ticketId);
     const summary = (
       await provider.complete(
@@ -792,8 +853,8 @@ export const aiService = {
   },
 
   async suggestTicketReply(ticketId: string): Promise<{ suggestion: string; articles: { id: string; title: string }[] }> {
-    const provider = requireAi();
-    await aiCredits.consume();
+    const { provider, ownKey } = await resolveAi();
+    if (!ownKey) await aiCredits.consume();
     const { ticket, transcript } = await ticketContext(ticketId);
     const articles = await kbService.suggest(`${ticket.subject}`, 3);
 
@@ -822,8 +883,8 @@ export const aiService = {
   // ------------------------------------------------------ recruitment scoring
   /** Score a candidate's fit for the role they applied to, from their CV text. */
   async scoreApplicant(applicantId: string): Promise<{ score: number; reason: string }> {
-    const provider = requireAi();
-    await aiCredits.consume();
+    const { provider, ownKey } = await resolveAi();
+    if (!ownKey) await aiCredits.consume();
     const applicant = await prisma.applicant.findFirst({
       where: { id: applicantId },
       select: {

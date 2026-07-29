@@ -5,7 +5,9 @@ import { logger } from '../../shared/logger';
 import { requestContext } from '../../shared/context';
 import { activityService } from './activity.service';
 import { workflowService } from './workflow.service';
+import { invoicesService } from '../invoices/invoices.service';
 import { exchangeRates } from '../../shared/exchange-rates';
+import { getAiProvider } from '../../infrastructure/ai';
 
 function orgId(): string {
   const id = requestContext.get()?.organizationId;
@@ -18,6 +20,48 @@ function actorMembershipId(): string | null {
 }
 
 const fullName = (first: string, last?: string | null) => `${first} ${last ?? ''}`.trim();
+
+/**
+ * A short AI summary of a lead/deal close for the audit timeline (spec #4).
+ * Best-effort: when AI is unavailable it falls back to the human outcome
+ * summary, so closing never depends on the AI engine being up.
+ */
+async function summarizeClose(
+  kind: 'deal' | 'lead',
+  context: { title: string; outcome: string; reason: string; description?: string; internalNotes?: string; outcomeSummary: string },
+): Promise<string> {
+  const fallback = context.outcomeSummary;
+  const provider = getAiProvider();
+  if (!provider) return fallback;
+  try {
+    const summary = (
+      await provider.complete(
+        [
+          {
+            role: 'system',
+            content:
+              `You write a one- or two-sentence CRM audit summary of why a ${kind} closed. ` +
+              'Be factual and neutral; capture the outcome and the key driver. No preamble, no markdown.',
+          },
+          {
+            role: 'user',
+            content:
+              `${kind === 'deal' ? 'Deal' : 'Lead'}: ${context.title}\nOutcome: ${context.outcome}\n` +
+              `Reason: ${context.reason}\n` +
+              (context.description ? `Description: ${context.description}\n` : '') +
+              (context.internalNotes ? `Internal notes: ${context.internalNotes}\n` : '') +
+              `Rep summary: ${context.outcomeSummary}`,
+          },
+        ],
+        { maxTokens: 120, temperature: 0.3 },
+      )
+    ).trim();
+    return summary || fallback;
+  } catch (err) {
+    logger.info({ err: (err as Error).message, kind }, 'AI close summary skipped');
+    return fallback;
+  }
+}
 
 // ------------------------------------------------------ lead assignment engine
 
@@ -114,6 +158,15 @@ export const updateLeadSchema = leadSchema.partial();
 
 export const leadStatusSchema = z.object({
   status: z.enum(['NEW', 'CONTACTED', 'QUALIFIED', 'UNQUALIFIED', 'LOST']),
+  /** Required when transitioning to a terminal status (LOST/UNQUALIFIED); see #4. */
+  close: z
+    .object({
+      reason: z.string().trim().min(3).max(500),
+      description: z.string().trim().max(2000).optional(),
+      internalNotes: z.string().trim().max(2000).optional(),
+      outcomeSummary: z.string().trim().min(3).max(1000),
+    })
+    .optional(),
 });
 
 export const dealSchema = z.object({
@@ -147,14 +200,50 @@ export const dealAutomationSchema = z.object({
   /** Older clients may not send this; keep their setting off rather than erroring. */
   onLeadConverted: z.boolean().default(false),
   pipelineId: z.string().min(1).nullable().optional(),
+  /** Auto-generate an invoice the moment a deal is marked won. */
+  autoInvoiceOnWon: z.boolean().default(false),
+  /** Net terms (days) for auto-generated deal invoices. */
+  invoiceDueDays: z.coerce.number().int().min(0).max(365).default(14),
+  /** Mark a deal won automatically once all its linked invoices are fully paid (#10). */
+  autoCompleteOnPaid: z.boolean().default(false),
 });
 
 export const moveDealSchema = z.object({ stageId: z.string().min(1) });
 
-export const closeDealSchema = z.object({
-  outcome: z.enum(['WON', 'LOST']),
-  lostReason: z.string().trim().max(300).optional(),
+/**
+ * Closing a deal (Won/Lost) requires a documented outcome (spec #4): a reason
+ * and a human outcome summary are mandatory; description and internal notes are
+ * optional context. `lostReason` is accepted for backward compatibility and, if
+ * given without `reason`, seeds it.
+ */
+export const closeDealSchema = z
+  .object({
+    outcome: z.enum(['WON', 'LOST']),
+    reason: z.string().trim().min(3).max(500).optional(),
+    description: z.string().trim().max(2000).optional(),
+    internalNotes: z.string().trim().max(2000).optional(),
+    outcomeSummary: z.string().trim().min(3).max(1000).optional(),
+    lostReason: z.string().trim().max(300).optional(), // legacy alias
+  })
+  .transform((v) => ({ ...v, reason: v.reason ?? v.lostReason }))
+  .refine((v) => Boolean(v.reason), { message: 'A reason is required to close a deal', path: ['reason'] })
+  .refine((v) => Boolean(v.outcomeSummary), {
+    message: 'An outcome summary is required to close a deal',
+    path: ['outcomeSummary'],
+  });
+export type CloseDealDto = z.infer<typeof closeDealSchema>;
+
+/** Documented outcome required when a lead reaches a terminal status (#4). */
+export const closeLeadSchema = z.object({
+  reason: z.string().trim().min(3).max(500),
+  description: z.string().trim().max(2000).optional(),
+  internalNotes: z.string().trim().max(2000).optional(),
+  outcomeSummary: z.string().trim().min(3).max(1000),
 });
+export type CloseLeadDto = z.infer<typeof closeLeadSchema>;
+
+/** Lead statuses that are terminal and therefore need a documented close. */
+export const TERMINAL_LEAD_STATUSES = ['LOST', 'UNQUALIFIED'] as const;
 
 const ENTITY_TYPES = [
   'CUSTOMER', 'LEAD', 'DEAL', 'COMPANY', 'ORDER', 'PRODUCT', 'INVOICE', 'TICKET', 'PROPERTY',
@@ -240,6 +329,11 @@ const dealSelect = {
   stage: { select: { id: true, name: true, position: true, isWonStage: true, isLostStage: true } },
   customer: { select: { id: true, firstName: true, lastName: true } },
   lead: { select: { id: true, firstName: true, lastName: true } },
+  invoices: {
+    where: { deletedAt: null, status: { not: 'VOID' } },
+    select: { id: true, number: true, status: true },
+    orderBy: { createdAt: 'desc' as const },
+  },
 } as const;
 
 export const crmService = {
@@ -388,14 +482,17 @@ export const crmService = {
       where: { id: stageId, pipelineId: deal.pipelineId },
     });
     if (!stage) throw new NotFoundError('Stage');
+    // Closing a deal must go through the documented-outcome flow (spec #4), not
+    // a silent drag onto a won/lost stage.
+    if (stage.isWonStage || stage.isLostStage) {
+      throw new ValidationError(
+        `Use the close flow to mark a deal ${stage.isWonStage ? 'won' : 'lost'} — an outcome reason and summary are required`,
+      );
+    }
 
     const updated = await prisma.deal.update({
       where: { id: dealId },
-      data: {
-        stageId,
-        ...(stage.isWonStage ? { status: 'WON', closedAt: new Date() } : {}),
-        ...(stage.isLostStage ? { status: 'LOST', closedAt: new Date() } : {}),
-      },
+      data: { stageId },
       select: dealSelect,
     });
     await activityService.record({
@@ -414,13 +511,15 @@ export const crmService = {
     await workflowService.dispatch('deal.stage_changed', wfPayload, wfTarget);
     if (stage.isWonStage) await workflowService.dispatch('deal.won', wfPayload, wfTarget);
     if (stage.isLostStage) await workflowService.dispatch('deal.lost', wfPayload, wfTarget);
+    if (stage.isWonStage) await this.maybeAutoInvoiceDeal(dealId);
     return updated;
   },
 
-  async closeDeal(dealId: string, outcome: 'WON' | 'LOST', lostReason?: string) {
+  async closeDeal(dealId: string, dto: CloseDealDto) {
+    const { outcome, reason, description, internalNotes, outcomeSummary } = dto;
     const deal = await prisma.deal.findFirst({
       where: { id: dealId, deletedAt: null },
-      include: { pipeline: { include: { stages: true } } },
+      include: { pipeline: { include: { stages: true } }, stage: { select: { name: true } } },
     });
     if (!deal) throw new NotFoundError('Deal');
     if (deal.status !== 'OPEN') throw new ConflictError('Deal is already closed');
@@ -430,30 +529,76 @@ export const crmService = {
     );
     if (!target) throw new ValidationError(`Pipeline has no ${outcome.toLowerCase()} stage`);
 
+    // Snapshot the previous values for the audit trail before mutating.
+    const previous = { status: deal.status, stageId: deal.stageId, stage: deal.stage?.name ?? null, value: Number(deal.value) };
+
     const updated = await prisma.deal.update({
       where: { id: dealId },
       data: {
         status: outcome,
         stageId: target.id,
         closedAt: new Date(),
-        ...(outcome === 'LOST' ? { lostReason: lostReason ?? null } : {}),
+        // Keep the legacy lostReason column populated for LOST closes.
+        ...(outcome === 'LOST' ? { lostReason: reason ?? null } : {}),
       },
       select: dealSelect,
     });
+
+    const aiSummary = await summarizeClose('deal', {
+      title: updated.title, outcome, reason: reason!, description, internalNotes, outcomeSummary: outcomeSummary!,
+    });
+
+    // Full audit record on the timeline: who, before→after, the documented
+    // reason/notes/summary and the AI summary (spec #4).
     await activityService.record({
       type: 'STATUS_CHANGE',
       entityType: 'DEAL',
       entityId: dealId,
       title: outcome === 'WON' ? `Deal won 🎉 — ${updated.title}` : `Deal lost — ${updated.title}`,
-      body: outcome === 'LOST' && lostReason ? `Reason: ${lostReason}` : undefined,
+      body: `Reason: ${reason}\nOutcome: ${outcomeSummary}${aiSummary ? `\n\nAI summary: ${aiSummary}` : ''}`,
+      metadata: {
+        outcome,
+        reason,
+        description: description ?? null,
+        internalNotes: internalNotes ?? null,
+        outcomeSummary,
+        aiSummary,
+        previous,
+        next: { status: outcome, stageId: target.id, stage: target.name, value: Number(updated.value) },
+      },
       also: updated.customer ? [{ entityType: 'CUSTOMER', entityId: updated.customer.id }] : undefined,
     });
     await workflowService.dispatch(
       outcome === 'WON' ? 'deal.won' : 'deal.lost',
-      { title: updated.title, value: Number(updated.value), lostReason: lostReason ?? '' },
+      { title: updated.title, value: Number(updated.value), lostReason: reason ?? '' },
       { entityType: 'DEAL', entityId: dealId, customerId: updated.customer?.id ?? null },
     );
+    if (outcome === 'WON') await this.maybeAutoInvoiceDeal(dealId);
     return updated;
+  },
+
+  /**
+   * When a deal is won and the org has opted in, generate its invoice
+   * automatically. Best-effort: a deal with no customer (or one already
+   * invoiced) must never block the win itself, so failures are swallowed
+   * and logged rather than propagated.
+   */
+  async maybeAutoInvoiceDeal(dealId: string) {
+    let auto;
+    try {
+      auto = await this.getDealAutomation();
+    } catch {
+      return;
+    }
+    if (!auto.autoInvoiceOnWon) return;
+    try {
+      await invoicesService.createFromDeal(dealId, auto.invoiceDueDays);
+    } catch (err) {
+      logger.info(
+        { dealId, err: err instanceof Error ? err.message : String(err) },
+        'auto-invoice on deal won skipped',
+      );
+    }
   },
 
   // ------------------------------------------------------- pipeline management
@@ -566,7 +711,16 @@ export const crmService = {
       select: { settings: true },
     });
     const crm = ((org.settings as Record<string, unknown>) ?? {}).crm as
-      | { dealAutomation?: { onLeadQualified?: boolean; onLeadConverted?: boolean; pipelineId?: string | null } }
+      | {
+          dealAutomation?: {
+            onLeadQualified?: boolean;
+            onLeadConverted?: boolean;
+            pipelineId?: string | null;
+            autoInvoiceOnWon?: boolean;
+            invoiceDueDays?: number;
+            autoCompleteOnPaid?: boolean;
+          };
+        }
       | undefined;
     return {
       onLeadQualified: crm?.dealAutomation?.onLeadQualified ?? false,
@@ -574,6 +728,9 @@ export const crmService = {
       // deals appear on conversion.
       onLeadConverted: crm?.dealAutomation?.onLeadConverted ?? false,
       pipelineId: crm?.dealAutomation?.pipelineId ?? null,
+      autoInvoiceOnWon: crm?.dealAutomation?.autoInvoiceOnWon ?? false,
+      invoiceDueDays: crm?.dealAutomation?.invoiceDueDays ?? 14,
+      autoCompleteOnPaid: crm?.dealAutomation?.autoCompleteOnPaid ?? false,
     };
   },
 
@@ -588,6 +745,9 @@ export const crmService = {
       onLeadQualified: dto.onLeadQualified,
       onLeadConverted: dto.onLeadConverted,
       pipelineId: dto.pipelineId ?? null,
+      autoInvoiceOnWon: dto.autoInvoiceOnWon,
+      invoiceDueDays: dto.invoiceDueDays,
+      autoCompleteOnPaid: dto.autoCompleteOnPaid,
     };
     await prisma.organization.update({
       where: { id: orgId() },
@@ -788,16 +948,54 @@ export const crmService = {
     return updated;
   },
 
-  async updateLeadStatus(leadId: string, status: 'NEW' | 'CONTACTED' | 'QUALIFIED' | 'UNQUALIFIED' | 'LOST') {
+  async updateLeadStatus(
+    leadId: string,
+    status: 'NEW' | 'CONTACTED' | 'QUALIFIED' | 'UNQUALIFIED' | 'LOST',
+    close?: CloseLeadDto,
+  ) {
     const lead = await prisma.lead.findFirst({ where: { id: leadId, deletedAt: null } });
     if (!lead) throw new NotFoundError('Lead');
     if (lead.status === 'CONVERTED') throw new ConflictError('Converted leads cannot change status');
+
+    // Terminal statuses need a documented outcome (spec #4).
+    const isTerminal = (TERMINAL_LEAD_STATUSES as readonly string[]).includes(status);
+    if (isTerminal && !close) {
+      throw new ValidationError(`Marking a lead ${status.toLowerCase()} requires a reason and outcome summary`);
+    }
+
+    const previous = { status: lead.status };
     const updated = await prisma.lead.update({ where: { id: leadId }, data: { status } });
+
+    const aiSummary =
+      isTerminal && close
+        ? await summarizeClose('lead', {
+            title: fullName(lead.firstName, lead.lastName),
+            outcome: status,
+            reason: close.reason,
+            description: close.description,
+            internalNotes: close.internalNotes,
+            outcomeSummary: close.outcomeSummary,
+          })
+        : null;
+
     await activityService.record({
       type: 'STATUS_CHANGE',
       entityType: 'LEAD',
       entityId: leadId,
       title: `Lead status → ${status.toLowerCase()}`,
+      body: close ? `Reason: ${close.reason}\nOutcome: ${close.outcomeSummary}${aiSummary ? `\n\nAI summary: ${aiSummary}` : ''}` : undefined,
+      metadata: close
+        ? {
+            status,
+            reason: close.reason,
+            description: close.description ?? null,
+            internalNotes: close.internalNotes ?? null,
+            outcomeSummary: close.outcomeSummary,
+            aiSummary,
+            previous,
+            next: { status },
+          }
+        : { previous, next: { status } },
       also: lead.customerId ? [{ entityType: 'CUSTOMER', entityId: lead.customerId }] : undefined,
     });
     const wfTarget = {

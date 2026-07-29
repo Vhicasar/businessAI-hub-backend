@@ -10,13 +10,19 @@ import {
 import { startPlanSync } from './application/billing/plan-sync';
 import { startAiConfigSync } from './application/ai/ai-sync';
 import { startPaymentConfigSync } from './application/billing/payment-config-sync';
+import { startEmailRetrySweep } from './application/auth/email-retry.service';
+import { startWorkspaceConfigSync } from './application/settings/workspace-config-sync';
+import { startAppointmentReminderSweep } from './application/appointments/appointments.service';
+import { reconcileSystemRolePermissions } from './application/roles/reconcile-permissions';
 import { closeQueues, queueEnabled } from './infrastructure/queue/queue';
 import { createApp } from './app';
 
 async function bootstrap(): Promise<void> {
   await connectDatabase();
+  await reconcileSystemRolePermissions(); // grant newly-added permissions to existing system roles
   await startAiConfigSync(); // establish the admin-managed provider before serving AI traffic
   await startPaymentConfigSync(); // resolve the active payment gateway before serving checkouts
+  await startWorkspaceConfigSync(); // pull admin-managed feature flags / comms / storage config
 
   const app = createApp();
   const httpServer = createServer(app);
@@ -36,6 +42,8 @@ async function bootstrap(): Promise<void> {
 
   startEmailInboundPoller();
   startPlanSync(); // keep the plan catalog in sync with Vhicasar Admin
+  startEmailRetrySweep(); // durably re-send verification emails that failed delivery
+  startAppointmentReminderSweep(); // email appointment reminders as they come due
   logger.info(
     queueEnabled()
       ? '📮 Queue mode: async — workflow & campaign jobs handed to the worker (run `npm run worker`)'

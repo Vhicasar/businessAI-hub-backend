@@ -20,6 +20,7 @@ import { inventoryRoutes } from './presentation/http/v1/inventory.routes';
 import { ordersRoutes } from './presentation/http/v1/orders.routes';
 import { invoicesRoutes } from './presentation/http/v1/invoices.routes';
 import { settingsRoutes } from './presentation/http/v1/settings.routes';
+import { searchRoutes } from './presentation/http/v1/search.routes';
 import { realestateRoutes } from './presentation/http/v1/realestate.routes';
 import { marketingRoutes } from './presentation/http/v1/marketing.routes';
 import { auditRoutes } from './presentation/http/v1/audit.routes';
@@ -30,6 +31,10 @@ import { crmRoutes } from './presentation/http/v1/crm.routes';
 import { inboxRoutes } from './presentation/http/v1/inbox.routes';
 import { webhookRoutes } from './presentation/http/webhooks.routes';
 import { webchatRoutes } from './presentation/http/webchat.routes';
+import { payRoutes } from './presentation/http/pay.routes';
+import { appointmentsPublicRoutes } from './presentation/http/appointments.routes';
+import { appointmentsRoutes } from './presentation/http/v1/appointments.routes';
+import { paymentLinksRoutes } from './presentation/http/v1/payment-links.routes';
 import { aiRoutes } from './presentation/http/v1/ai.routes';
 import { knowledgeRoutes } from './presentation/http/v1/knowledge.routes';
 import { notificationsRoutes } from './presentation/http/v1/notifications.routes';
@@ -99,6 +104,7 @@ export function createApp(): Express {
   v1.use('/invoices', invoicesRoutes);
   v1.use('/settings', settingsRoutes);
   v1.use('/realestate', realestateRoutes);
+  v1.use('/appointments', appointmentsRoutes);
   v1.use('/marketing', marketingRoutes);
   v1.use('/audit', auditRoutes);
   v1.use('/data', dataTransferRoutes);
@@ -112,7 +118,9 @@ export function createApp(): Express {
   v1.use('/sites', sitesRoutes);
   v1.use('/designs', designsRoutes);
   v1.use('/analytics', analyticsRoutes);
+  v1.use('/search', searchRoutes);
   v1.use('/billing', billingRoutes);
+  v1.use('/payment-links', paymentLinksRoutes);
   v1.use('/files', filesRoutes);
   v1.use('/developer', developerRoutes);
   v1.use('/integrations', integrationsRoutes);
@@ -130,6 +138,9 @@ export function createApp(): Express {
   // Public REST API for a business's own integrations — API-key authenticated,
   // permissive CORS, scope-gated and per-key rate-limited (see the router).
   app.use('/api/public/v1', cors({ origin: true, credentials: false }), publicApiRoutes);
+
+  // Public payment-link pages (/pay/<token>) — token-authenticated, any origin.
+  app.use('/api/pay', cors({ origin: true, credentials: false }), payRoutes);
 
   // Serve locally-stored uploads. Only meaningful with the local driver (R2
   // serves its own objects); harmless otherwise since keys won't resolve.
@@ -165,6 +176,7 @@ export function createApp(): Express {
   // These are embedded on arbitrary customer websites, so unlike the rest of
   // the API they must allow any origin (auth = unguessable visitor ids).
   app.use('/api/webchat', cors({ origin: true, credentials: false }), webchatRoutes);
+  app.use('/api/appointments', cors({ origin: true, credentials: false }), appointmentsPublicRoutes);
 
   // Public website hosting: renders a published site's pages by subdomain.
   app.use('/site', cors({ origin: true, credentials: false }), siteHostRoutes);

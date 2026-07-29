@@ -3,8 +3,10 @@ import { authenticate, requireTenant } from '../middleware/authenticate';
 import { requirePermission } from '../middleware/require-permission';
 import { prisma } from '../../../infrastructure/database/prisma';
 import { analyticsService } from '../../../application/analytics/analytics.service';
+import { productIntelligenceService } from '../../../application/analytics/product-intelligence.service';
 import { requestContext } from '../../../shared/context';
 import { exchangeRates } from '../../../shared/exchange-rates';
+import { resolveDateRange, previousRange } from '../../../shared/date-range';
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<void>): RequestHandler =>
@@ -22,8 +24,7 @@ analyticsRoutes.get(
   '/crm',
   requirePermission('analytics.view', 'crm.read'),
   wrap(async (req, res) => {
-    const days = Math.min(365, Math.max(1, Number(req.query.days) || 30));
-    res.json({ success: true, data: await analyticsService.crmDashboard(days) });
+    res.json({ success: true, data: await analyticsService.crmDashboard(resolveDateRange(req.query)) });
   })
 );
 
@@ -32,45 +33,72 @@ analyticsRoutes.get(
   '/support',
   requirePermission('analytics.view', 'support.read'),
   wrap(async (req, res) => {
-    const days = Math.min(365, Math.max(1, Number(req.query.days) || 30));
-    res.json({ success: true, data: await analyticsService.supportDashboard(days) });
+    res.json({ success: true, data: await analyticsService.supportDashboard(resolveDateRange(req.query)) });
   })
 );
 
-/** Dashboard overview: 30-day KPIs + 14-day revenue trend. */
+/** Product Intelligence: per-product sales / customer / behaviour / inventory dashboard. */
+analyticsRoutes.get(
+  '/products/:id',
+  requirePermission('analytics.view', 'catalog.read'),
+  wrap(async (req, res) => {
+    res.json({
+      success: true,
+      data: await productIntelligenceService.productDashboard(req.params.id as string, resolveDateRange(req.query)),
+    });
+  })
+);
+
+/** AI-generated insights for a product (demand, restocking, pricing, health). */
+analyticsRoutes.get(
+  '/products/:id/insights',
+  requirePermission('analytics.view', 'catalog.read'),
+  wrap(async (req, res) => {
+    res.json({
+      success: true,
+      data: await productIntelligenceService.productInsights(req.params.id as string, resolveDateRange(req.query)),
+    });
+  })
+);
+
+/**
+ * Dashboard overview: KPIs over the selected date range + a revenue trend, with
+ * period-over-period deltas against the equal-length previous window. Field
+ * names keep the `30` suffix for backwards compatibility with existing clients.
+ */
 analyticsRoutes.get(
   '/overview',
   requirePermission('dashboard.view', 'analytics.view'),
-  wrap(async (_req, res) => {
-    const since30 = new Date(Date.now() - 30 * DAY);
-    const prev30 = new Date(Date.now() - 60 * DAY);
-    const since14 = new Date(Date.now() - 14 * DAY);
+  wrap(async (req, res) => {
+    const range = resolveDateRange(req.query);
+    const prev = previousRange(range);
+    const { from, to } = range;
 
     const [
-      payments30,
+      paymentsCur,
       paymentsPrev,
-      orders30,
+      ordersCur,
       ordersPrev,
       openConversations,
-      leads30,
+      leadsCur,
       trendPayments,
     ] = await Promise.all([
       prisma.payment.findMany({
-        where: { status: 'PAID', paidAt: { gte: since30 } },
+        where: { status: 'PAID', paidAt: { gte: from, lte: to } },
         select: { amount: true, currency: true },
       }),
       prisma.payment.findMany({
-        where: { status: 'PAID', paidAt: { gte: prev30, lt: since30 } },
+        where: { status: 'PAID', paidAt: { gte: prev.from, lt: prev.to } },
         select: { amount: true, currency: true },
       }),
-      prisma.order.count({ where: { createdAt: { gte: since30 }, status: { not: 'CANCELLED' } } }),
+      prisma.order.count({ where: { createdAt: { gte: from, lte: to }, status: { not: 'CANCELLED' } } }),
       prisma.order.count({
-        where: { createdAt: { gte: prev30, lt: since30 }, status: { not: 'CANCELLED' } },
+        where: { createdAt: { gte: prev.from, lt: prev.to }, status: { not: 'CANCELLED' } },
       }),
       prisma.conversation.count({ where: { status: { in: ['OPEN', 'PENDING'] } } }),
-      prisma.lead.count({ where: { createdAt: { gte: since30 }, deletedAt: null } }),
+      prisma.lead.count({ where: { createdAt: { gte: from, lte: to }, deletedAt: null } }),
       prisma.payment.findMany({
-        where: { status: 'PAID', paidAt: { gte: since14 } },
+        where: { status: 'PAID', paidAt: { gte: from, lte: to } },
         select: { amount: true, currency: true, paidAt: true },
       }),
     ]);
@@ -80,46 +108,47 @@ analyticsRoutes.get(
       where: { id: organizationId },
       select: { currency: true },
     });
-    const converted30 = await Promise.all(payments30.map(
+    const convertedCur = await Promise.all(paymentsCur.map(
       (p) => exchangeRates.convert(Number(p.amount), p.currency, org.currency),
     ));
     const convertedPrev = await Promise.all(paymentsPrev.map(
       (p) => exchangeRates.convert(Number(p.amount), p.currency, org.currency),
     ));
     const convertedTrend = await Promise.all(trendPayments.map(async (p) => ({
-      ...p,
+      paidAt: p.paidAt,
       amount: (await exchangeRates.convert(Number(p.amount), p.currency, org.currency)).amount,
     })));
 
-    // Bucket the last 14 days (oldest → newest).
+    // Bucket the window (daily, or weekly for long ranges) oldest → newest.
+    const bucketMs = (range.days > 92 ? 7 : 1) * DAY;
     const trend: { date: string; revenue: number }[] = [];
-    for (let i = 13; i >= 0; i--) {
-      const day = new Date(Date.now() - i * DAY);
-      trend.push({ date: day.toISOString().slice(0, 10), revenue: 0 });
+    for (let t = from.getTime(); t < to.getTime(); t += bucketMs) {
+      trend.push({ date: new Date(t).toISOString().slice(0, 10), revenue: 0 });
     }
-    const byDate = new Map(trend.map((t) => [t.date, t]));
+    if (trend.length === 0) trend.push({ date: from.toISOString().slice(0, 10), revenue: 0 });
     for (const p of convertedTrend) {
-      const key = p.paidAt?.toISOString().slice(0, 10);
-      const bucket = key ? byDate.get(key) : undefined;
-      if (bucket) bucket.revenue += Number(p.amount);
+      if (!p.paidAt) continue;
+      const idx = Math.floor((p.paidAt.getTime() - from.getTime()) / bucketMs);
+      if (idx >= 0 && idx < trend.length) trend[idx]!.revenue += p.amount;
     }
 
-    const revenue30 = converted30.reduce((sum, p) => sum + p.amount, 0);
+    const revenueCur = convertedCur.reduce((sum, p) => sum + p.amount, 0);
     const revenuePrev = convertedPrev.reduce((sum, p) => sum + p.amount, 0);
-    const pct = (curr: number, prev: number): number | null =>
-      prev > 0 ? Math.round(((curr - prev) / prev) * 1000) / 10 : null;
+    const pct = (curr: number, previous: number): number | null =>
+      previous > 0 ? Math.round(((curr - previous) / previous) * 1000) / 10 : null;
 
     res.json({
       success: true,
       data: {
-        revenue30,
+        revenue30: revenueCur,
         currency: org.currency,
-        revenueChangePct: pct(revenue30, revenuePrev),
-        orders30,
-        ordersChangePct: pct(orders30, ordersPrev),
+        revenueChangePct: pct(revenueCur, revenuePrev),
+        orders30: ordersCur,
+        ordersChangePct: pct(ordersCur, ordersPrev),
         openConversations,
-        leads30,
+        leads30: leadsCur,
         trend,
+        range: { from: from.toISOString(), to: to.toISOString(), days: range.days, preset: range.preset },
       },
     });
   })

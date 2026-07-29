@@ -7,6 +7,7 @@ import {
   createOrderSchema,
   listOrdersSchema,
   recordPaymentSchema,
+  refundOrderSchema,
   transitionSchema,
 } from '../../../application/orders/orders.dto';
 
@@ -52,6 +53,16 @@ ordersRoutes.post(
   validate({ body: transitionSchema }),
   wrap(async (req, res) => {
     const data = await ordersService.transition(req.params.id as string, req.body, req.auth!.userId);
+    res.json({ success: true, data });
+  })
+);
+
+ordersRoutes.post(
+  '/:id/refund',
+  requirePermission('orders.refund'),
+  validate({ body: refundOrderSchema }),
+  wrap(async (req, res) => {
+    const data = await ordersService.refund(req.params.id as string, req.body, req.auth!.userId);
     res.json({ success: true, data });
   })
 );

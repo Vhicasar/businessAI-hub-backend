@@ -4,6 +4,7 @@ import { decrypt } from '../../shared/crypto';
 import { getAdapter } from '../../infrastructure/channels/registry';
 import { logger } from '../../shared/logger';
 import { smsWalletService } from '../billing/sms-wallet.service';
+import { isChannelEnabled } from '../settings/workspace-config';
 
 /**
  * Single outbound-send path shared by campaigns and workflow actions. Resolves
@@ -24,6 +25,15 @@ export const messagingService = {
     text: string,
     context: { campaignId?: string; subject?: string; templateName?: string; templateLanguage?: string } = {},
   ): Promise<SendOutcome> {
+    // Respect the admin's centrally-managed channel switches (spec #2): a
+    // channel disabled in the Vhicasar Admin is off for every workspace.
+    if (
+      (channelType === 'EMAIL' || channelType === 'SMS' || channelType === 'WHATSAPP' || channelType === 'WEB_CHAT') &&
+      !isChannelEnabled(channelType)
+    ) {
+      return { ok: false, error: `${channelType} messaging is disabled by the administrator` };
+    }
+
     const account = await prisma.channelAccount.findFirst({
       where: { channelType, isActive: true, deletedAt: null },
     });

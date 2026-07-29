@@ -242,7 +242,10 @@ async function provisionOrganization(
 
 export const authService = {
   // ---------------------------------------------------------------- register
-  async register(dto: RegisterDto, meta: RequestMeta): Promise<{ verificationRequired: true; email: string }> {
+  async register(
+    dto: RegisterDto,
+    meta: RequestMeta,
+  ): Promise<{ verificationRequired: true; email: string; emailSent: boolean }> {
     const existing = await prisma.user.findUnique({ where: { email: dto.email } });
     if (existing) throw new ConflictError('An account with this email already exists');
 
@@ -292,10 +295,21 @@ export const authService = {
         expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
       },
     });
-    await mailer.sendEmailVerification(dto.email, rawToken);
+    // Send the verification email immediately. The mailer retries internally
+    // (3× with backoff) and never throws, so a mail hiccup can't fail a
+    // registration whose user is already created. The outcome is persisted to
+    // EmailDeliveryLog; if it didn't get through, the durable retry sweep
+    // (email-retry.service) re-sends — surviving restarts, unlike a setTimeout.
+    const result = await mailer.sendEmailVerification(dto.email, rawToken, userId);
+    if (!result.delivered) {
+      logger.warn(
+        { email: dto.email, userId, error: result.error },
+        'Verification email not delivered — durable retry sweep will re-send',
+      );
+    }
     await audit('auth.register', userId, orgId, meta);
 
-    return { verificationRequired: true, email: dto.email };
+    return { verificationRequired: true, email: dto.email, emailSent: result.delivered };
   },
 
   // --------------------------------------------------- multiple businesses
@@ -538,7 +552,7 @@ export const authService = {
         expiresAt: new Date(Date.now() + 60 * 60 * 1000),
       },
     });
-    await mailer.sendPasswordReset(email, raw);
+    await mailer.sendPasswordReset(email, raw, user.id);
   },
 
   async resetPassword(rawToken: string, newPassword: string, meta: RequestMeta): Promise<void> {
@@ -568,7 +582,7 @@ export const authService = {
     await tokenService.revokeAllForUser(record.userId);
 
     const user = await prisma.user.findUniqueOrThrow({ where: { id: record.userId } });
-    await mailer.sendPasswordChangedNotice(user.email);
+    await mailer.sendPasswordChangedNotice(user.email, user.id);
     await audit('auth.password_reset', record.userId, null, meta);
   },
 
@@ -592,10 +606,27 @@ export const authService = {
     ]);
   },
 
-  async resendEmailVerification(email: string): Promise<void> {
+  async resendEmailVerification(email: string): Promise<{ sent: boolean }> {
     const user = await prisma.user.findUnique({ where: { email } });
     // Do not reveal whether an address is registered or already verified.
-    if (!user || user.deletedAt || user.emailVerifiedAt) return;
+    if (!user || user.deletedAt || user.emailVerifiedAt) return { sent: false };
+
+    // Dedup: if a verification email was already issued in the last 60s, don't
+    // send another — prevents duplicate emails from double-clicks / retries.
+    const recent = await prisma.securityToken.findFirst({
+      where: {
+        userId: user.id,
+        type: 'EMAIL_VERIFY',
+        usedAt: null,
+        createdAt: { gt: new Date(Date.now() - 60_000) },
+      },
+    });
+    if (recent) {
+      logger.info({ userId: user.id }, 'Verification resend skipped — one was just sent (dedup)');
+      return { sent: true };
+    }
+
+    // Invalidate outstanding tokens and issue a fresh one.
     await prisma.securityToken.updateMany({
       where: { userId: user.id, type: 'EMAIL_VERIFY', usedAt: null },
       data: { usedAt: new Date() },
@@ -609,7 +640,8 @@ export const authService = {
         expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
       },
     });
-    await mailer.sendEmailVerification(user.email, rawToken);
+    const result = await mailer.sendEmailVerification(user.email, rawToken, user.id);
+    return { sent: result.delivered };
   },
 
   // ------------------------------------------------------------------- 2FA

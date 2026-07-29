@@ -3,6 +3,7 @@ import rateLimit from 'express-rate-limit';
 import { authenticate, requireTenant } from '../middleware/authenticate';
 import { requirePermission } from '../middleware/require-permission';
 import { aiService } from '../../../application/ai/ai.service';
+import { orgAiAccountService, aiAccountSchema } from '../../../application/ai/org-ai.service';
 import { getAiStatus } from '../../../infrastructure/ai';
 import { syncAiConfigFromAdmin } from '../../../application/ai/ai-sync';
 import { requireFeature } from '../middleware/plan-guard';
@@ -47,6 +48,28 @@ aiRoutes.post(
     const applied = await syncAiConfigFromAdmin();
     res.json({ success: true, data: { applied, ...getAiStatus() } });
   })
+);
+
+/**
+ * Per-workspace "bring your own key" AI provider (#13). When enabled, the
+ * workspace's AI runs on the tenant's own key and its usage counts against the
+ * tenant's own provider account instead of the BusinessHub plan quota.
+ */
+aiRoutes.get(
+  '/provider',
+  requirePermission('ai.configure'),
+  wrap(async (_req, res) => { res.json({ success: true, data: await orgAiAccountService.get() }); }),
+);
+aiRoutes.put(
+  '/provider',
+  requirePermission('ai.configure'),
+  validate({ body: aiAccountSchema }),
+  wrap(async (req, res) => { res.json({ success: true, data: await orgAiAccountService.save(req.body) }); }),
+);
+aiRoutes.delete(
+  '/provider',
+  requirePermission('ai.configure'),
+  wrap(async (_req, res) => { res.json({ success: true, data: await orgAiAccountService.remove() }); }),
 );
 
 aiRoutes.post(

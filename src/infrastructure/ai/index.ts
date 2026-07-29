@@ -26,6 +26,11 @@ export function setAiConfigOverride(next: AiConfigSource | null): void {
   if (changed) provider = undefined; // force rebuild on next getAiProvider()
 }
 
+/** Build an AI provider from an explicit config — used for per-workspace BYO keys. */
+export function buildAiProvider(src: AiConfigSource): AiProvider | null {
+  return build(src);
+}
+
 function build(src: AiConfigSource): AiProvider | null {
   switch (src.provider) {
     case 'anthropic': {

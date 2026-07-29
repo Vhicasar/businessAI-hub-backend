@@ -5,6 +5,8 @@ import { z } from 'zod';
 import { prismaUnscoped, prisma } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { inboxService } from '../../application/inbox/inbox.service';
+import { getProductBranding } from '../../application/catalog/site-catalog.service';
+import { appointmentsEnabled } from '../../application/appointments/appointments.service';
 import { validate } from './middleware/validate';
 
 /**
@@ -34,6 +36,38 @@ async function activeAccount(accountId: string) {
     where: { id: accountId, channelType: 'WEB_CHAT', isActive: true, deletedAt: null },
   });
 }
+
+/**
+ * Public widget config — lets the embed auto-inherit the business's branding
+ * (theme colour, name, logo, greeting) instead of hard-coding data-color. The
+ * embedder can still override via data-* attributes. No visitor identity needed.
+ */
+webchatRoutes.get(
+  '/:accountId/config',
+  wrap(async (req, res) => {
+    const account = await activeAccount(req.params.accountId as string);
+    if (!account) {
+      res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Chat unavailable' } });
+      return;
+    }
+    const branding = await getProductBranding();
+    const meta = (account.metadata as Record<string, unknown> | null) ?? {};
+    res.json({
+      success: true,
+      data: {
+        color: (typeof meta.widgetColor === 'string' && meta.widgetColor) || branding.themeColor,
+        businessName: branding.name,
+        logoUrl: branding.logoUrl,
+        title: (typeof meta.widgetTitle === 'string' && meta.widgetTitle) || `Chat with ${branding.name}`,
+        greeting:
+          (typeof meta.widgetGreeting === 'string' && meta.widgetGreeting) ||
+          'Hi there 👋 How can we help you today?',
+        // Lets the widget show a "Book appointment" action when enabled (#12).
+        appointmentsEnabled: await appointmentsEnabled(account.organizationId),
+      },
+    });
+  })
+);
 
 const sessionSchema = z.object({
   name: z.string().trim().max(80).optional(),

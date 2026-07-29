@@ -24,8 +24,10 @@ export const TRIGGERS = [
   'deal.lost',
   'order.placed',
   'order.paid',
+  'order.refunded',
   'invoice.paid',
   'payroll.paid',
+  'appointment.booked',
 ] as const;
 export type Trigger = (typeof TRIGGERS)[number];
 

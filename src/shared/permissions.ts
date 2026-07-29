@@ -21,6 +21,7 @@ export const PERMISSION_MODULES = {
   pos: ['operate'],
   invoices: ['read', 'create', 'update', 'void', 'send'],
   payments: ['read', 'record', 'refund'],
+  payment_links: ['read', 'create', 'cancel', 'share'],
   marketing: ['read', 'create', 'update', 'delete', 'send'],
   segments: ['read', 'create', 'update', 'delete'],
   automations: ['read', 'create', 'update', 'delete'],
@@ -30,6 +31,7 @@ export const PERMISSION_MODULES = {
   properties: ['read', 'create', 'update', 'delete'],
   leases: ['read', 'create', 'update', 'terminate'],
   bookings: ['read', 'create', 'update', 'cancel'],
+  appointments: ['read', 'create', 'cancel', 'configure'],
   maintenance: ['read', 'create', 'update', 'assign'],
   commissions: ['read', 'approve', 'pay'],
   // People. The HR areas below are deliberately separate modules rather than

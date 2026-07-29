@@ -104,7 +104,7 @@ export const channelsService = {
       setupNote =
         `Add this to your website before </body>:\n` +
         `<script src="${env.API_BASE_URL}/widget.js" data-account="${account.id}" ` +
-        `data-color="#4f46e5" data-title="Chat with us"></script>`;
+        `data-color="#F97316" data-title="Chat with us"></script>`;
     } else if (adapter.onAccountConnected) {
       setupNote = await adapter.onAccountConnected(
         {

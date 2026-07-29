@@ -5,7 +5,13 @@ import { prisma } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { activityService } from '../crm/activity.service';
 import { workflowService } from '../crm/workflow.service';
+import { orderNotifyService } from '../notifications/order-notify.service';
+import { paymentLinksService } from '../payments/payment-links.service';
+import { logger } from '../../shared/logger';
+import { env } from '../../shared/config/env';
 import { exchangeRates } from '../../shared/exchange-rates';
+
+const payUrl = (token: string) => `${env.WEB_APP_URL.replace(/\/+$/, '')}/pay/${token}`;
 
 /** Mirror an invoice event onto the CRM timeline (invoice + its customer). */
 async function recordInvoiceActivity(
@@ -34,6 +40,7 @@ function orgId(): string {
 export const listInvoicesSchema = z.object({
   status: z.enum(['DRAFT', 'SENT', 'PAID', 'PARTIALLY_PAID', 'OVERDUE', 'VOID']).optional(),
   customerId: z.string().optional(),
+  dealId: z.string().optional(),
   search: z.string().trim().max(120).optional(),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(100).default(25),
@@ -53,6 +60,11 @@ export const createInvoiceSchema = z.object({
   // DRAFT invoices can still be edited; SENT ones are issued to the customer.
   status: z.enum(['DRAFT', 'SENT']).default('SENT'),
   items: z.array(invoiceItemSchema).min(1),
+  /**
+   * Auto-generate a shareable payment link for the new invoice (spec #9). When
+   * omitted, the org's Settings → Invoices default applies.
+   */
+  autoPaymentLink: z.boolean().optional(),
 });
 
 export const updateInvoiceSchema = z.object({
@@ -101,8 +113,10 @@ const invoiceSelect = {
   paidAt: true,
   notes: true,
   createdAt: true,
+  dealId: true,
   customer: { select: { id: true, firstName: true, lastName: true, email: true } },
   order: { select: { id: true, number: true } },
+  deal: { select: { id: true, title: true, status: true } },
   items: {
     select: { id: true, description: true, quantity: true, unitPrice: true, taxRate: true, total: true },
   },
@@ -175,6 +189,7 @@ export const invoicesService = {
         deletedAt: null,
         ...(overdueFilter as object),
         ...(dto.customerId ? { customerId: dto.customerId } : {}),
+        ...(dto.dealId ? { dealId: dto.dealId } : {}),
         ...(dto.search ? { number: { contains: dto.search, mode: 'insensitive' as const } } : {}),
       },
       select: invoiceSelect,
@@ -239,7 +254,8 @@ export const invoicesService = {
       isSent ? `Invoice ${inv.number} issued` : `Draft invoice ${inv.number} created`,
       `${inv.currency} ${Number(inv.total).toFixed(2)}`,
     );
-    return inv;
+    const paymentLink = await this.maybeAttachPaymentLink(inv, dto.autoPaymentLink);
+    return { ...inv, paymentLink };
   },
 
   /** Edit a DRAFT invoice — items/notes/customer/due date. Issued invoices are immutable. */
@@ -347,7 +363,114 @@ export const invoicesService = {
       return withDerivedStatus(invoice);
     });
     await recordInvoiceActivity(inv, `Invoice ${inv.number} generated from order ${order.number}`);
-    return inv;
+    return { ...inv, paymentLink: await this.maybeAttachPaymentLink(inv) };
+  },
+
+  /**
+   * Generate an invoice from a CRM deal. If the deal has an accepted quotation
+   * we mirror its line items and totals; otherwise we fall back to a single
+   * line for the deal's value. Idempotent-ish: refuses if the deal already has
+   * a live (non-void) invoice.
+   */
+  async createFromDeal(dealId: string, dueInDays = 14) {
+    const deal = await prisma.deal.findFirst({
+      where: { id: dealId, deletedAt: null },
+      select: {
+        id: true,
+        organizationId: true,
+        title: true,
+        value: true,
+        currency: true,
+        customerId: true,
+        invoices: { where: { deletedAt: null, status: { not: 'VOID' } }, select: { id: true, number: true } },
+        quotations: {
+          where: { deletedAt: null, status: 'ACCEPTED' },
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          select: {
+            currency: true,
+            subtotal: true,
+            taxTotal: true,
+            discountTotal: true,
+            total: true,
+            items: {
+              select: { description: true, quantity: true, unitPrice: true, taxRate: true, total: true },
+            },
+          },
+        },
+      },
+    });
+    if (!deal) throw new NotFoundError('Deal');
+    if (!deal.customerId) {
+      throw new ValidationError('This deal has no customer, so it cannot be invoiced');
+    }
+    if (deal.invoices.length > 0) {
+      throw new ConflictError('This deal already has an invoice', {
+        invoiceId: deal.invoices[0]?.id,
+      });
+    }
+
+    const quote = deal.quotations[0];
+    const dueAt = new Date(Date.now() + dueInDays * 24 * 60 * 60 * 1000);
+
+    const inv = await prisma.$transaction(async (tx) => {
+      const number = await nextInvoiceNumber(tx, deal.organizationId);
+      const base = {
+        organizationId: deal.organizationId,
+        number,
+        customerId: deal.customerId as string,
+        dealId: deal.id,
+        status: 'SENT' as const,
+        issuedAt: new Date(),
+        dueAt,
+      };
+
+      const invoice = quote
+        ? await tx.invoice.create({
+            data: {
+              ...base,
+              currency: quote.currency,
+              subtotal: quote.subtotal,
+              taxTotal: quote.taxTotal,
+              discountTotal: quote.discountTotal,
+              total: quote.total,
+              items: {
+                create: quote.items.map((i) => ({
+                  description: i.description,
+                  quantity: i.quantity,
+                  unitPrice: i.unitPrice,
+                  taxRate: i.taxRate,
+                  total: i.total,
+                })),
+              },
+            },
+            select: invoiceSelect,
+          })
+        : await tx.invoice.create({
+            data: {
+              ...base,
+              currency: deal.currency,
+              subtotal: deal.value,
+              taxTotal: 0,
+              total: deal.value,
+              items: {
+                create: [
+                  {
+                    description: deal.title,
+                    quantity: 1,
+                    unitPrice: deal.value,
+                    taxRate: 0,
+                    total: deal.value,
+                  },
+                ],
+              },
+            },
+            select: invoiceSelect,
+          });
+      return withDerivedStatus(invoice);
+    });
+    await recordInvoiceActivity(inv, `Invoice ${inv.number} generated from deal “${deal.title}”`);
+    return { ...inv, paymentLink: await this.maybeAttachPaymentLink(inv) };
   },
 
   async recordPayment(id: string, dto: InvoicePaymentDto, actorMembershipId: string | null) {
@@ -402,8 +525,122 @@ export const invoicesService = {
         { number: paid.number, total: Number(paid.total), method: dto.method, currency: paid.currency },
         { entityType: 'INVOICE', entityId: id, customerId: paid.customer?.id ?? null },
       );
+      void orderNotifyService.notify(orgId(), 'invoice.paid', {
+        title: `Invoice ${paid.number} paid`,
+        lines: [`Total: ${paid.currency} ${Number(paid.total).toFixed(2)}`],
+      });
+      // Roll the payment up to the linked deal (#10).
+      await this.settleDealForInvoice(id).catch((err) =>
+        logger.warn({ err: (err as Error).message, invoiceId: id }, 'deal settle from invoice failed'),
+      );
     }
     return paid;
+  },
+
+  /**
+   * Auto-generate a shareable payment link for an invoice (spec #9). Opt-in per
+   * request or via the org's Settings → Invoices default. Skips drafts, invoices
+   * with nothing outstanding, and re-uses an existing pending link. Best-effort:
+   * a link failure must never fail invoice creation. Returns the link or null.
+   */
+  async maybeAttachPaymentLink(
+    invoice: { id: string; status: string; total: unknown; amountPaid: unknown },
+    override?: boolean,
+  ): Promise<{ id: string; url: string; token: string } | null> {
+    try {
+      let enabled = override;
+      if (enabled === undefined) {
+        const org = await prisma.organization.findUnique({ where: { id: orgId() }, select: { settings: true } });
+        const inv = ((org?.settings as Record<string, unknown>) ?? {}).invoices as { autoPaymentLink?: boolean } | undefined;
+        enabled = inv?.autoPaymentLink ?? false;
+      }
+      if (!enabled) return null;
+      if (invoice.status === 'DRAFT') return null;
+      if (round2(Number(invoice.total) - Number(invoice.amountPaid)) <= 0) return null;
+
+      // Reuse an active link for this invoice rather than piling up duplicates.
+      const existing = await prisma.paymentLink.findFirst({
+        where: { resourceType: 'INVOICE', resourceId: invoice.id, status: { in: ['PENDING', 'PARTIALLY_PAID'] } },
+        select: { id: true, token: true },
+      });
+      if (existing) {
+        return { id: existing.id, token: existing.token, url: payUrl(existing.token) };
+      }
+      const link = await paymentLinksService.create(
+        { resourceType: 'INVOICE', resourceId: invoice.id, allowPartial: true },
+        null,
+      );
+      return { id: link.id, token: link.token, url: link.url };
+    } catch (err) {
+      logger.warn({ err: (err as Error).message, invoiceId: invoice.id }, 'auto payment link on invoice failed');
+      return null;
+    }
+  },
+
+  /**
+   * Roll a fully-paid invoice up to its deal (spec #10): records payment
+   * progress across all the deal's invoices on the timeline and, when every
+   * invoice is settled and the org opted in (crm.dealAutomation.autoCompleteOnPaid),
+   * marks the deal won. Multiple invoices per deal are aggregated.
+   */
+  async settleDealForInvoice(invoiceId: string): Promise<void> {
+    const invoice = await prisma.invoice.findUnique({
+      where: { id: invoiceId },
+      select: { dealId: true, organizationId: true, currency: true },
+    });
+    if (!invoice?.dealId) return;
+
+    const invoices = await prisma.invoice.findMany({
+      where: { dealId: invoice.dealId, deletedAt: null, status: { not: 'VOID' } },
+      select: { total: true, amountPaid: true },
+    });
+    const invoiced = round2(invoices.reduce((s, i) => s + Number(i.total), 0));
+    const paidTotal = round2(invoices.reduce((s, i) => s + Number(i.amountPaid), 0));
+    const outstanding = round2(invoiced - paidTotal);
+    const allPaid = invoices.length > 0 && outstanding <= 0.005;
+
+    await activityService.record({
+      type: 'SYSTEM',
+      entityType: 'DEAL',
+      entityId: invoice.dealId,
+      title: 'Invoice payment applied to deal',
+      body: `Paid ${invoice.currency} ${paidTotal.toFixed(2)} of ${invoiced.toFixed(2)} · outstanding ${outstanding.toFixed(2)}`,
+      metadata: { invoiced, paid: paidTotal, outstanding, invoiceCount: invoices.length, allPaid },
+    });
+
+    if (!allPaid) return;
+
+    // Auto-complete the deal when configured and it's still open.
+    const org = await prisma.organization.findUnique({ where: { id: invoice.organizationId }, select: { settings: true } });
+    const autoComplete = Boolean(
+      (((org?.settings as Record<string, unknown>) ?? {}).crm as { dealAutomation?: { autoCompleteOnPaid?: boolean } } | undefined)
+        ?.dealAutomation?.autoCompleteOnPaid,
+    );
+    if (!autoComplete) return;
+
+    const deal = await prisma.deal.findFirst({
+      where: { id: invoice.dealId, deletedAt: null, status: 'OPEN' },
+      include: { pipeline: { include: { stages: true } } },
+    });
+    if (!deal) return;
+    const wonStage = deal.pipeline.stages.find((s) => s.isWonStage);
+    await prisma.deal.update({
+      where: { id: deal.id },
+      data: { status: 'WON', closedAt: new Date(), ...(wonStage ? { stageId: wonStage.id } : {}) },
+    });
+    await activityService.record({
+      type: 'STATUS_CHANGE',
+      entityType: 'DEAL',
+      entityId: deal.id,
+      title: `Deal won 🎉 — ${deal.title}`,
+      body: 'Automatically closed: all linked invoices fully paid.',
+      metadata: { auto: true, reason: 'invoices_fully_paid', invoiced, paid: paidTotal },
+    });
+    await workflowService.dispatch(
+      'deal.won',
+      { title: deal.title, value: Number(deal.value), currency: deal.currency },
+      { entityType: 'DEAL', entityId: deal.id, customerId: deal.customerId ?? null },
+    );
   },
 
   async voidInvoice(id: string) {

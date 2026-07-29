@@ -1,8 +1,8 @@
 import { prisma } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { exchangeRates } from '../../shared/exchange-rates';
+import type { DateRange } from '../../shared/date-range';
 
-const DAY = 24 * 60 * 60 * 1000;
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
 /**
@@ -10,8 +10,9 @@ const round2 = (n: number) => Math.round(n * 100) / 100;
  * extension, so no organizationId filters are needed here.
  */
 export const analyticsService = {
-  async crmDashboard(days = 30) {
-    const since = new Date(Date.now() - days * DAY);
+  async crmDashboard(range: DateRange) {
+    const since = range.from;
+    const until = range.to;
     const organizationId = requestContext.get()?.organizationId;
     if (!organizationId) throw new Error('No tenant in request context');
     const org = await prisma.organization.findUniqueOrThrow({
@@ -31,16 +32,16 @@ export const analyticsService = {
           },
         }),
         prisma.deal.findMany({
-          where: { deletedAt: null, status: 'WON', closedAt: { gte: since } },
+          where: { deletedAt: null, status: 'WON', closedAt: { gte: since, lte: until } },
           select: { value: true, currency: true, ownerId: true },
         }),
-        prisma.deal.count({ where: { deletedAt: null, status: 'LOST', closedAt: { gte: since } } }),
+        prisma.deal.count({ where: { deletedAt: null, status: 'LOST', closedAt: { gte: since, lte: until } } }),
         prisma.lead.groupBy({ by: ['status'], where: { deletedAt: null }, _count: { _all: true } }),
-        prisma.lead.count({ where: { deletedAt: null, createdAt: { gte: since } } }),
-        prisma.lead.count({ where: { status: 'CONVERTED', convertedAt: { gte: since } } }),
+        prisma.lead.count({ where: { deletedAt: null, createdAt: { gte: since, lte: until } } }),
+        prisma.lead.count({ where: { status: 'CONVERTED', convertedAt: { gte: since, lte: until } } }),
         prisma.lead.groupBy({
           by: ['source'],
-          where: { deletedAt: null, createdAt: { gte: since } },
+          where: { deletedAt: null, createdAt: { gte: since, lte: until } },
           _count: { _all: true },
         }),
         prisma.membership.findMany({
@@ -112,7 +113,7 @@ export const analyticsService = {
     const owners = [...ownerMap.values()].sort((a, b) => b.openValue - a.openValue);
 
     return {
-      period: { days },
+      period: { days: range.days, from: range.from.toISOString(), to: range.to.toISOString(), preset: range.preset },
       currency: org.currency,
       pipeline: { stages, totalOpenValue, weightedForecast },
       deals: { openCount: convertedOpenDeals.length, wonCount, wonValue, lostCount: lostDeals, winRate },
@@ -129,12 +130,13 @@ export const analyticsService = {
   },
 
   // ------------------------------------------------------- support analytics
-  async supportDashboard(days = 30) {
-    const since = new Date(Date.now() - days * DAY);
+  async supportDashboard(range: DateRange) {
+    const since = range.from;
+    const until = range.to;
 
     const [tickets, members] = await Promise.all([
       prisma.ticket.findMany({
-        where: { deletedAt: null, createdAt: { gte: since } },
+        where: { deletedAt: null, createdAt: { gte: since, lte: until } },
         select: {
           status: true, priority: true, assigneeId: true, createdAt: true,
           firstRespondedAt: true, firstResponseDueAt: true,
@@ -202,7 +204,7 @@ export const analyticsService = {
       .sort((x, y) => y.assigned - x.assigned);
 
     return {
-      period: { days },
+      period: { days: range.days, from: range.from.toISOString(), to: range.to.toISOString(), preset: range.preset },
       volume: { total, open: open.length, resolved: resolved.length, escalated: escalated.length },
       times: { avgFirstResponseMins: avg(firstResponseTimes), avgResolutionMins: avg(resolutionTimes) },
       sla: {

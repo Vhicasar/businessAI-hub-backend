@@ -6,6 +6,7 @@ import { inventoryService } from '../inventory/inventory.service';
 import { activityService } from '../crm/activity.service';
 import { webhooksService } from '../api-keys/webhooks.service';
 import { workflowService } from '../crm/workflow.service';
+import { orderNotifyService } from '../notifications/order-notify.service';
 import { exchangeRates } from '../../shared/exchange-rates';
 import type { CreateOrderDto, ListOrdersDto, RecordPaymentDto, TransitionDto } from './orders.dto';
 
@@ -280,6 +281,14 @@ export const ordersService = {
       id: created.id, number: created.number, status: created.status,
       total: Number(created.total), currency: created.currency, customerId: dto.customerId,
     });
+    // Email the business's configured order-notification recipients.
+    void orderNotifyService.notify(organizationId, 'order.received', {
+      title: `Order ${created.number}`,
+      lines: [
+        `Total: ${created.currency} ${Number(created.total).toFixed(2)}`,
+        `Source: ${dto.source}`,
+      ],
+    });
     return created;
   },
 
@@ -379,6 +388,55 @@ export const ordersService = {
     return updated;
   },
 
+  /**
+   * Mark an order refunded and notify the business (spec #7). Status-level only —
+   * moving the money happens in the payment gateway, out of this flow. Gated by
+   * `orders.refund` at the route. A refund can be issued once payment has been
+   * taken and the order isn't already refunded/cancelled.
+   */
+  async refund(id: string, dto: { reason?: string; amount?: number }, actorUserId: string) {
+    const order = await prisma.order.findFirst({ where: { id } });
+    if (!order) throw new NotFoundError('Order');
+    if (order.status === 'REFUNDED') throw new ConflictError('Order is already refunded');
+    if (order.paymentStatus === 'PENDING') {
+      throw new ConflictError('Nothing to refund — no payment has been recorded on this order');
+    }
+
+    const updated = await prisma.order.update({
+      where: { id },
+      data: {
+        status: 'REFUNDED',
+        paymentStatus: 'REFUNDED',
+        statusHistory: {
+          create: { fromStatus: order.status, toStatus: 'REFUNDED', actorUserId, note: dto.reason ?? null },
+        },
+      },
+      select: detailSelect,
+    });
+
+    await activityService.record({
+      type: 'STATUS_CHANGE',
+      entityType: 'ORDER',
+      entityId: id,
+      title: `Refund issued for order ${order.number}`,
+      body: dto.reason ?? undefined,
+      also: [{ entityType: 'CUSTOMER', entityId: order.customerId }],
+    });
+    void orderNotifyService.notify(order.organizationId, 'refund.issued', {
+      title: `Refund issued for order ${order.number}`,
+      lines: [
+        `Amount: ${order.currency} ${(dto.amount ?? Number(order.total)).toFixed(2)}`,
+        ...(dto.reason ? [`Reason: ${dto.reason}`] : []),
+      ],
+    });
+    await workflowService.dispatch(
+      'order.refunded',
+      { number: order.number, total: Number(order.total), currency: order.currency, reason: dto.reason ?? '' },
+      { entityType: 'ORDER', entityId: id, customerId: order.customerId },
+    );
+    return updated;
+  },
+
   async recordPayment(id: string, dto: RecordPaymentDto, actorMembershipId: string | null) {
     const order = await prisma.order.findFirst({
       where: { id },
@@ -446,6 +504,22 @@ export const ordersService = {
         { number: order.number, total: Number(order.total), method: dto.method, currency: order.currency },
         { entityType: 'ORDER', entityId: id, customerId: order.customerId },
       );
+    }
+    // Email the business's configured recipients: always for the payment, plus
+    // a confirmation once the order is fully settled.
+    void orderNotifyService.notify(order.organizationId, 'payment.received', {
+      title: `Payment on order ${order.number}`,
+      lines: [
+        `Amount: ${order.currency} ${dto.amount.toFixed(2)}`,
+        `Method: ${dto.method.replace(/_/g, ' ').toLowerCase()}`,
+        fullyPaid ? 'Order is now fully paid.' : 'Partial payment.',
+      ],
+    });
+    if (fullyPaid) {
+      void orderNotifyService.notify(order.organizationId, 'payment.confirmed', {
+        title: `Order ${order.number} fully paid`,
+        lines: [`Total: ${order.currency} ${Number(order.total).toFixed(2)}`],
+      });
     }
     return paidResult;
   },

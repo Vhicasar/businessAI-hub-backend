@@ -83,7 +83,7 @@ export const usersService = {
       },
     });
 
-    await mailer.sendInvitation(dto.email, org.name, raw);
+    await mailer.sendInvitation(dto.email, org.name, raw, organizationId);
     await auditService.record({
       action: 'member.invited',
       entityType: 'INVITATION',

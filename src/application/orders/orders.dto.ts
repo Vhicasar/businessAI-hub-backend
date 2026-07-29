@@ -49,6 +49,12 @@ export const recordPaymentSchema = z.object({
   reference: z.string().trim().max(120).optional(),
 });
 
+export const refundOrderSchema = z.object({
+  reason: z.string().trim().max(500).optional(),
+  /** Optional partial-refund amount for the record; defaults to the order total. */
+  amount: z.coerce.number().positive().optional(),
+});
+
 export type ListOrdersDto = z.infer<typeof listOrdersSchema>;
 export type CreateOrderDto = z.infer<typeof createOrderSchema>;
 export type TransitionDto = z.infer<typeof transitionSchema>;

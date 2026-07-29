@@ -762,6 +762,32 @@ model SecurityToken {
   @@index([userId, type])
 }
 
+/// Durable record of every transactional-email delivery attempt, so failures
+/// are troubleshootable after the fact (the app logger is ephemeral) and a
+/// background sweep can re-send verification emails that never got through.
+/// One row per send() call, carrying the final outcome after the mailer's
+/// internal retries.
+model EmailDeliveryLog {
+  id             String   @id @default(cuid())
+  organizationId String?
+  userId         String?
+  /// EMAIL_VERIFY | PASSWORD_RESET | INVITATION | PASSWORD_CHANGED | NOTICE
+  type           String
+  recipient      String
+  subject        String
+  /// SENT | FAILED
+  status         String
+  attempts       Int      @default(1)
+  provider       String? // SMTP host, or "dev-log" when no SMTP configured
+  messageId      String?
+  error          String?
+  createdAt      DateTime @default(now())
+
+  @@index([recipient, type, createdAt])
+  @@index([userId, type, createdAt])
+  @@index([status, type, createdAt])
+}
+
 model Invitation {
   id             String    @id @default(cuid())
   organizationId String
@@ -1155,6 +1181,7 @@ model Deal {
   lead       Lead?         @relation(fields: [leadId], references: [id])
   quotations Quotation[]
   contracts  Contract[]
+  invoices   Invoice[]
 
   @@index([organizationId, status])
   @@index([pipelineId, stageId])
@@ -1209,18 +1236,32 @@ model Meeting {
   meetingUrl     String?
   startAt        DateTime
   endAt          DateTime
-  organizerId    String? // Membership id
+  organizerId    String? // Membership id (assigned staff/agent)
   entityType     EntityType?
   entityId       String?
-  attendees      Json? // [{type: 'user'|'customer', id, response}]
+  attendees      Json? // [{type: 'user'|'customer', id, name, email, response}]
   aiSummary      String?   @db.Text
   transcription  String?   @db.Text
+  /// CONFIRMED | CANCELLED | COMPLETED — appointment lifecycle (#12).
+  status         String    @default("CONFIRMED")
+  /// Customer this appointment is for (booking flows); scalar, matches entityId style.
+  customerId     String?
+  /// Appointment type id from the org's appointment config.
+  typeId         String?
+  /// Where the booking came from: CHAT | MANUAL | WEB.
+  source         String?
+  /// Unguessable token for the public manage/cancel link in confirmations.
+  bookingToken   String?   @unique
+  /// Set once a reminder has been emailed, so the sweep never double-sends.
+  reminderSentAt DateTime?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
   deletedAt      DateTime?
 
   @@index([organizationId, startAt])
   @@index([entityType, entityId])
+  @@index([customerId])
+  @@index([status, startAt])
 }
 
 model Note {
@@ -1953,6 +1994,7 @@ model Invoice {
   number         String
   customerId     String
   orderId        String?
+  dealId         String? // CRM deal this invoice was generated from
   leaseId        String? // real-estate rent invoices
   status         InvoiceStatus @default(DRAFT)
   currency       String        @default("USD") @db.Char(3)
@@ -1972,6 +2014,7 @@ model Invoice {
 
   customer Customer      @relation(fields: [customerId], references: [id])
   order    Order?        @relation(fields: [orderId], references: [id])
+  deal     Deal?         @relation(fields: [dealId], references: [id])
   lease    Lease?        @relation(fields: [leaseId], references: [id])
   items    InvoiceItem[]
   payments Payment[]
@@ -1979,6 +2022,7 @@ model Invoice {
   @@unique([organizationId, number])
   @@index([organizationId, status, dueAt])
   @@index([customerId])
+  @@index([dealId])
 }
 
 model InvoiceItem {
@@ -2024,6 +2068,57 @@ model Payment {
   @@index([customerId])
   @@index([orderId])
   @@index([providerRef])
+}
+
+enum PaymentLinkStatus {
+  PENDING
+  PARTIALLY_PAID
+  PAID
+  EXPIRED
+  CANCELLED
+}
+
+enum PaymentLinkResource {
+  ORDER
+  INVOICE
+  PROPERTY_PURCHASE
+  PROPERTY_RESERVATION
+  BOOKING
+  QUOTATION
+  SUBSCRIPTION
+  DEPOSIT
+  CUSTOM
+}
+
+/// A shareable, secure link to collect payment for any payable resource.
+/// Scalar resourceId (no FK) keeps it universal across orders, invoices,
+/// property sales/reservations, bookings, quotations, deposits and custom
+/// charges. The public token drives the /pay/<token> page.
+model PaymentLink {
+  id             String              @id @default(cuid())
+  organizationId String
+  resourceType   PaymentLinkResource
+  resourceId     String?
+  customerId     String?
+  token          String              @unique
+  amount         Decimal             @db.Decimal(14, 2)
+  amountPaid     Decimal             @default(0) @db.Decimal(14, 2)
+  currency       String              @default("USD") @db.Char(3)
+  description    String?
+  status         PaymentLinkStatus   @default(PENDING)
+  allowPartial   Boolean             @default(false)
+  expiresAt      DateTime?
+  provider       String? // gateway used for the latest attempt
+  providerRef    String? // latest gateway reference
+  createdById    String? // Membership id
+  metadata       Json?
+  paidAt         DateTime?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  @@index([organizationId, status, createdAt])
+  @@index([customerId])
+  @@index([resourceType, resourceId])
 }
 
 // ============================================================

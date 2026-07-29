@@ -3,6 +3,14 @@ import { prisma } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { CURRENCIES, isSupportedCurrency } from '../../shared/currency';
 import { filesService } from '../files/files.service';
+import { orderNotifyService } from '../notifications/order-notify.service';
+
+/** Recipients + per-event toggles for order/payment email notifications. */
+export const orderNotificationsSchema = z.object({
+  emails: z.array(z.string().trim().toLowerCase().email()).max(20).default([]),
+  events: z.record(z.boolean()).optional(),
+});
+export type OrderNotificationsDto = z.infer<typeof orderNotificationsSchema>;
 
 function orgId(): string {
   const id = requestContext.get()?.organizationId;
@@ -116,6 +124,21 @@ export const settingsService = {
       data: { settings },
     });
     return dto;
+  },
+
+  /** Order/payment notification recipients + per-event toggles. */
+  async getOrderNotifications() {
+    return orderNotifyService.getConfig(orgId());
+  },
+
+  async saveOrderNotifications(dto: OrderNotificationsDto) {
+    const org = await prisma.organization.findUniqueOrThrow({
+      where: { id: orgId() },
+      select: { settings: true },
+    });
+    const settings = { ...((org.settings as Record<string, unknown>) ?? {}), orderNotifications: dto };
+    await prisma.organization.update({ where: { id: orgId() }, data: { settings } });
+    return orderNotifyService.getConfig(orgId());
   },
 
   async getOrganization() {

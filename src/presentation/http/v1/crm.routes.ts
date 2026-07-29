@@ -27,6 +27,7 @@ import {
 } from '../../../application/crm/crm.service';
 import { activityService, listTimelineSchema } from '../../../application/crm/activity.service';
 import { saveWorkflowsSchema, workflowService } from '../../../application/crm/workflow.service';
+import { invoicesService } from '../../../application/invoices/invoices.service';
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<void>): RequestHandler =>
@@ -180,10 +181,23 @@ crmRoutes.post(
   wrap(async (req, res) => {
     res.json({
       success: true,
-      data: await crmService.closeDeal(
+      data: await crmService.closeDeal(req.params.id as string, req.body),
+    });
+  })
+);
+
+// Generate an invoice from a deal (manual). Auto-generation on win is
+// controlled by the deal-automation settings.
+crmRoutes.post(
+  '/deals/:id/invoice',
+  requirePermission('invoices.create'),
+  wrap(async (req, res) => {
+    const dueInDays = Number(req.body?.dueInDays);
+    res.status(201).json({
+      success: true,
+      data: await invoicesService.createFromDeal(
         req.params.id as string,
-        req.body.outcome,
-        req.body.lostReason
+        Number.isFinite(dueInDays) ? dueInDays : undefined,
       ),
     });
   })
@@ -224,7 +238,7 @@ crmRoutes.patch(
   wrap(async (req, res) => {
     res.json({
       success: true,
-      data: await crmService.updateLeadStatus(req.params.id as string, req.body.status),
+      data: await crmService.updateLeadStatus(req.params.id as string, req.body.status, req.body.close),
     });
   })
 );
