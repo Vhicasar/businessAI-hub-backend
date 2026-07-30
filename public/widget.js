@@ -1,12 +1,12 @@
 /**
- * BusinessHub AI — website live chat widget (vanilla JS, no dependencies).
+ * Vhicasar Hub AI — website live chat widget (vanilla JS, no dependencies).
  *
  * Embed:
  *   <script src="https://YOUR_API_HOST/widget.js"
  *           data-account="CHANNEL_ACCOUNT_ID"></script>
  *
  * Branding (theme colour, title, greeting, logo) is fetched from the business's
- * BusinessHub workspace automatically, so it always matches their brand — the
+ * Vhicasar Hub workspace automatically, so it always matches their brand — the
  * platform primary is orange (#F97316). The optional data-color / data-title
  * attributes still override the fetched values when set.
  */
@@ -16,7 +16,7 @@
   var script = document.currentScript;
   var ACCOUNT = script.getAttribute('data-account');
   var BASE = script.src.replace(/\/widget\.js.*$/, '');
-  if (!ACCOUNT) return console.warn('[BusinessHub] widget: data-account missing');
+  if (!ACCOUNT) return console.warn('[Vhicasar Hub] widget: data-account missing');
 
   // Config resolves from data-* attributes first, then the fetched branding,
   // then these platform defaults (orange).
@@ -27,6 +27,8 @@
     businessName: '',
     logoUrl: '',
     appointments: false,
+    showPoweredBy: true,
+    poweredBy: { name: 'Vhicasar Hub AI', logoUrl: '', url: '' },
   };
   var DEFAULT_COLOR = '#F97316';
 
@@ -81,6 +83,8 @@
       '.bhw-panel.open{opacity:1;transform:none;pointer-events:auto}' +
       '.bhw-head{background:var(--bhw);color:var(--bhw-on);padding:14px 16px;display:flex;align-items:center;gap:10px}' +
       '.bhw-logo{width:32px;height:32px;border-radius:50%;object-fit:cover;background:rgba(255,255,255,.25);flex:none}' +
+      '.bhw-logo-fallback{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;' +
+      'background:rgba(255,255,255,.22);font-size:14px;font-weight:800;flex:none}' +
       '.bhw-htext{flex:1;min-width:0}' +
       '.bhw-title{font-weight:700;font-size:15px;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
       '.bhw-sub{font-size:12px;opacity:.85;display:flex;align-items:center;gap:5px}' +
@@ -101,8 +105,11 @@
       '.bhw-send:disabled{opacity:.5;cursor:default}' +
       '.bhw-send:focus-visible{outline:2px solid var(--bhw);outline-offset:2px}' +
       '.bhw-send svg{width:18px;height:18px;fill:currentColor}' +
-      '.bhw-foot{text-align:center;font-size:11px;color:#9ca3af;padding:6px;background:#fff}' +
-      '.bhw-foot a{color:#9ca3af;text-decoration:none}' +
+      '.bhw-foot{text-align:center;font-size:10px;color:#9ca3af;padding:5px 6px 7px;background:#fff}' +
+      '.bhw-foot a{color:#1f2937;text-decoration:none;display:inline-flex;align-items:center;gap:0;vertical-align:middle}' +
+      '.bhw-powered-logo{width:28px;height:28px;object-fit:contain}' +
+      '.bhw-powered-word{font-size:12px;line-height:28px;font-weight:800;letter-spacing:-.025em;color:#1f2937}' +
+      '.bhw-powered-ai{color:#F97316}' +
       '.bhw-book{background:none;border:1px solid rgba(255,255,255,.6);color:inherit;cursor:pointer;' +
       'font-size:12px;font-weight:600;border-radius:8px;padding:5px 9px;white-space:nowrap}' +
       '.bhw-book:hover{background:rgba(255,255,255,.16)}' +
@@ -155,7 +162,9 @@
   function buildPanel() {
     panel.innerHTML =
       '<div class="bhw-head">' +
-      (cfg.logoUrl ? '<img class="bhw-logo" src="' + esc(cfg.logoUrl) + '" alt="">' : '') +
+      (cfg.logoUrl
+        ? '<img class="bhw-logo" src="' + esc(cfg.logoUrl) + '" alt="">'
+        : '<span class="bhw-logo-fallback" aria-hidden="true">' + esc((cfg.businessName || 'V').charAt(0).toUpperCase()) + '</span>') +
       '<div class="bhw-htext">' +
       '<div class="bhw-title">' + esc(cfg.title || 'Chat with us') + '</div>' +
       '<div class="bhw-sub"><span class="bhw-dot"></span> We reply as soon as we can</div>' +
@@ -168,7 +177,11 @@
       '<input class="bhw-input" aria-label="Type your message" placeholder="Type a message…" maxlength="2000" autocomplete="off">' +
       '<button class="bhw-send" type="submit" aria-label="Send message" disabled>' + ICON_SEND + '</button>' +
       '</form>' +
-      '<div class="bhw-foot">Powered by <a href="https://businesshub.ai" target="_blank" rel="noopener">BusinessHub AI</a></div>';
+      (cfg.showPoweredBy ? '<div class="bhw-foot">Powered by <a href="' + esc(cfg.poweredBy.url || BASE) +
+        '" target="_blank" rel="noopener">' +
+        '<span class="bhw-powered-word">Vhicasar</span>' +
+        '<span class="bhw-powered-word bhw-powered-ai">&nbsp;Hub AI</span>' +
+        '</a></div>' : '');
 
     msgsEl = panel.querySelector('.bhw-msgs');
     formEl = panel.querySelector('.bhw-form');
@@ -179,6 +192,14 @@
     panel.querySelector('.bhw-close').addEventListener('click', function () { toggle(false); });
     var bookBtn = panel.querySelector('.bhw-book');
     if (bookBtn) bookBtn.addEventListener('click', startBooking);
+    var businessLogo = panel.querySelector('.bhw-logo');
+    if (businessLogo) businessLogo.addEventListener('error', function () {
+      var fallback = document.createElement('span');
+      fallback.className = 'bhw-logo-fallback';
+      fallback.setAttribute('aria-hidden', 'true');
+      fallback.textContent = (cfg.businessName || 'V').charAt(0).toUpperCase();
+      businessLogo.replaceWith(fallback);
+    });
     inputEl.addEventListener('input', function () { sendEl.disabled = !inputEl.value.trim(); });
     inputEl.addEventListener('keydown', function (e) { if (e.key === 'Escape') toggle(false); });
     formEl.addEventListener('submit', onSubmit);
@@ -380,6 +401,8 @@
         cfg.businessName = d.businessName || '';
         cfg.logoUrl = d.logoUrl || '';
         cfg.appointments = !!d.appointmentsEnabled;
+        cfg.showPoweredBy = d.showPoweredBy !== false;
+        cfg.poweredBy = d.poweredBy || cfg.poweredBy;
       }
     })
     .catch(function () { /* use defaults */ })

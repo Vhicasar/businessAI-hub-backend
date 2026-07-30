@@ -24,6 +24,8 @@ export const API_SCOPES = [
   'orders.read',
   'orders.write',
   'inventory.read',
+  'crm.read',
+  'ai.use',
 ] as const;
 export type ApiScope = (typeof API_SCOPES)[number];
 

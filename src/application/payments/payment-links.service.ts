@@ -214,7 +214,7 @@ export const paymentLinksService = {
 
     return {
       token: link.token,
-      businessName: org?.name ?? 'BusinessHub AI',
+      businessName: org?.name ?? 'Vhicasar Hub AI',
       description: link.description,
       amount: Number(link.amount),
       amountPaid: Number(link.amountPaid),
@@ -406,7 +406,7 @@ export const paymentLinksService = {
     const receiptUrl = `${publicUrl(receipt.token)}/receipt`;
     const text =
       `Payment confirmed — ${receipt.currency} ${receipt.amount.toFixed(2)} for ${receipt.description}.\n` +
-      `Receipt ${receipt.receiptNumber}: ${receiptUrl}\n— ${org?.name ?? 'BusinessHub AI'}`;
+      `Receipt ${receipt.receiptNumber}: ${receiptUrl}\n— ${org?.name ?? 'Vhicasar Hub AI'}`;
     // Only channels that make sense for a receipt; each is a no-op if the
     // customer has no address there or the channel isn't connected.
     const channels: ChannelType[] = ['EMAIL', 'WHATSAPP', 'SMS'];
@@ -529,7 +529,7 @@ export const paymentLinksService = {
     const totalPaid = round2(payments.reduce((s, p) => s + Number(p.amount), 0));
     return {
       receiptNumber: (meta.receiptNumber as string) ?? latest.id,
-      businessName: org?.name ?? 'BusinessHub AI',
+      businessName: org?.name ?? 'Vhicasar Hub AI',
       businessEmail: org?.email ?? null,
       description: link.description,
       currency: latest.currency,

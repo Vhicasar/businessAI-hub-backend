@@ -1,5 +1,5 @@
 /**
- * BusinessHub AI — Subscription plan catalog (single source of truth).
+ * Vhicasar Hub AI — Subscription plan catalog (single source of truth).
  *
  * Mirrors the public pricing page (businessAI-hub-home). Seeded into the `Plan`
  * table and used by the billing entitlements resolver for feature gating and
@@ -63,7 +63,7 @@ export const PLAN_CATALOG: PlanSeed[] = [
   {
     name: 'Starter',
     slug: 'starter',
-    description: 'Perfect for trying BusinessHub AI.',
+    description: 'Perfect for trying Vhicasar Hub AI.',
     priceMonthly: 0,
     priceYearly: 0,
     currency: 'NGN',

@@ -654,7 +654,7 @@ export const authService = {
       where: { id: userId },
       data: { twoFactorSecretEnc: encrypt(secret) },
     });
-    const otpauthUrl = authenticator.keyuri(user.email, 'BusinessHub AI', secret);
+    const otpauthUrl = authenticator.keyuri(user.email, 'Vhicasar Hub AI', secret);
     return { secret, otpauthUrl };
   },
 

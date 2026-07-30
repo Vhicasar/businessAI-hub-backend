@@ -47,7 +47,7 @@ const errorResponse = {
 export const openApiDocument = {
   openapi: '3.0.3',
   info: {
-    title: 'BusinessHub AI API',
+    title: 'Vhicasar Hub AI API',
     version: '1.0.0',
     description:
       'Omnichannel AI CRM — REST API v1. All responses use the `{ success, data }` / `{ success: false, error }` envelope.',

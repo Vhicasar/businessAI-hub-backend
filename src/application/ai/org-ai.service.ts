@@ -12,7 +12,7 @@ import type { AiProvider } from './ai-provider';
  * connect *their own* OpenAI / Anthropic / Gemini / Azure / Ollama / OpenRouter
  * / custom key. When enabled, the workspace's AI runs on that key and its usage
  * counts against the tenant's own provider account — so those calls DON'T draw
- * down the BusinessHub plan's AI quota. When not configured, the workspace uses
+ * down the Vhicasar Hub plan's AI quota. When not configured, the workspace uses
  * the platform provider and the plan quota, exactly as before. Stored on
  * `Organization.settings.aiProvider`; the key is encrypted at rest (AES-256-GCM).
  */

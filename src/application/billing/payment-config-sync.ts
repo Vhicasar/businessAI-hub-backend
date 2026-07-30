@@ -20,7 +20,7 @@ interface AdminPaymentConfig {
   callbackUrl: string | null;
 }
 
-const SUPPORTED: PaymentProviderName[] = ['paystack', 'flutterwave'];
+const SUPPORTED: PaymentProviderName[] = ['paystack', 'flutterwave', 'stripe'];
 let lastSyncAt = 0;
 let inFlight: Promise<boolean> | null = null;
 

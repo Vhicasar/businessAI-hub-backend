@@ -42,7 +42,7 @@ import { developerRoutes } from './presentation/http/v1/developer.routes';
 import { publicApiRoutes } from './presentation/http/public/public-api.routes';
 import { sitesRoutes } from './presentation/http/v1/sites.routes';
 import { designsRoutes } from './presentation/http/v1/designs.routes';
-import { siteHostRoutes } from './presentation/http/site-host.routes';
+import { customDomainHost, siteHostRoutes } from './presentation/http/site-host.routes';
 import { analyticsRoutes } from './presentation/http/v1/analytics.routes';
 import { billingRoutes } from './presentation/http/v1/billing.routes';
 import { serviceRoutes } from './presentation/http/v1/service.routes';
@@ -50,7 +50,7 @@ import { filesRoutes } from './presentation/http/v1/files.routes';
 import { integrationsRoutes } from './presentation/http/v1/integrations.routes';
 import { brandingRoutes } from './presentation/http/v1/branding.routes';
 import { storage } from './infrastructure/storage/storage';
-import { paystackWebhookRoutes, flutterwaveWebhookRoutes } from './presentation/http/paystack-webhook.routes';
+import { paystackWebhookRoutes, flutterwaveWebhookRoutes, stripeWebhookRoutes } from './presentation/http/paystack-webhook.routes';
 import { openApiDocument } from './presentation/http/swagger';
 
 export function createApp(): Express {
@@ -168,6 +168,7 @@ export function createApp(): Express {
   // webhook receiver so their specific paths win.
   app.use('/api/webhooks/paystack', paystackWebhookRoutes);
   app.use('/api/webhooks/flutterwave', flutterwaveWebhookRoutes);
+  app.use('/api/webhooks/stripe', stripeWebhookRoutes);
 
   // Public provider webhooks (adapter-verified, not JWT-authenticated).
   app.use('/api/webhooks', webhookRoutes);
@@ -183,12 +184,12 @@ export function createApp(): Express {
   app.get('/widget.js', (_req, res) => {
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.setHeader('Cache-Control', 'public, max-age=60');
     res.type('application/javascript');
     // cwd = backend/ in both dev (tsx) and prod (npm start) — survives the dist build.
     res.sendFile(path.join(process.cwd(), 'public', 'widget.js'));
   });
-
+  app.use(customDomainHost);
   app.use(notFoundHandler);
   app.use(errorHandler);
 

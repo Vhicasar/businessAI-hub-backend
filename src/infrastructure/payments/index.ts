@@ -1,5 +1,6 @@
 import { paystack, PaystackClient } from './paystack';
 import { flutterwave, FlutterwaveClient } from './flutterwave';
+import { stripe, StripeClient } from './stripe';
 import { getPaymentConfig, type ResolvedPaymentConfig } from './config';
 import type { PaymentProvider } from './types';
 
@@ -9,7 +10,8 @@ import type { PaymentProvider } from './types';
  * subscription flows go through this so no consumer hard-codes a gateway.
  */
 export function getActivePaymentProvider(): PaymentProvider {
-  return getPaymentConfig().provider === 'flutterwave' ? flutterwave : paystack;
+  const p = getPaymentConfig().provider;
+  return p === 'flutterwave' ? flutterwave : p === 'stripe' ? stripe : paystack;
 }
 
 /**
@@ -20,10 +22,12 @@ export function getActivePaymentProvider(): PaymentProvider {
 export function buildPaymentProvider(cfg: ResolvedPaymentConfig): PaymentProvider {
   return cfg.provider === 'flutterwave'
     ? new FlutterwaveClient(() => cfg)
-    : new PaystackClient(() => cfg);
+    : cfg.provider === 'stripe'
+      ? new StripeClient(() => cfg)
+      : new PaystackClient(() => cfg);
 }
 
-export { paystack, flutterwave };
+export { paystack, flutterwave, stripe };
 export { getPaymentConfig, getChargeCurrencies, setPaymentConfigOverride } from './config';
 export type { ResolvedPaymentConfig, PaymentConfigOverride } from './config';
 export * from './types';

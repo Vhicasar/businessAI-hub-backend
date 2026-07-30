@@ -36,11 +36,15 @@ export function setPaymentConfigOverride(cfg: PaymentConfigOverride | null): voi
 }
 
 function localSecret(provider: PaymentProviderName): string {
-  return provider === 'flutterwave' ? env.billing.flutterwaveSecretKey : env.billing.paystackSecretKey;
+  return provider === 'flutterwave' ? env.billing.flutterwaveSecretKey
+    : provider === 'stripe' ? env.billing.stripeSecretKey
+    : env.billing.paystackSecretKey;
 }
 
 function localPublic(provider: PaymentProviderName): string {
-  return provider === 'flutterwave' ? env.billing.flutterwavePublicKey : env.billing.paystackPublicKey;
+  return provider === 'flutterwave' ? env.billing.flutterwavePublicKey
+    : provider === 'stripe' ? env.billing.stripePublicKey
+    : env.billing.paystackPublicKey;
 }
 
 /** The resolved active provider config used by every checkout. */
@@ -55,7 +59,9 @@ export function getPaymentConfig(): ResolvedPaymentConfig {
       ? override.webhookSecret || ''
       : provider === 'flutterwave'
         ? env.billing.flutterwaveSecretHash
-        : '';
+        : provider === 'stripe'
+          ? env.billing.stripeWebhookSecret
+          : '';
   const chargeCurrencies =
     override && override.chargeCurrencies.length > 0
       ? override.chargeCurrencies.map((c) => c.toUpperCase())

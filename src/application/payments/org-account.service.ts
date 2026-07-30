@@ -18,7 +18,7 @@ import {
  * encrypted at rest (AES-256-GCM). The platform billing provider is untouched.
  */
 
-const PROVIDERS = ['paystack', 'flutterwave'] as const;
+const PROVIDERS = ['paystack', 'flutterwave', 'stripe'] as const;
 
 export const paymentAccountSchema = z.object({
   provider: z.enum(PROVIDERS),

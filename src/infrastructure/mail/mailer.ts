@@ -137,15 +137,21 @@ const BRAND = '#F97316';
 const button = (url: string, label: string) =>
   `<a href="${url}" style="background:${BRAND};color:#fff;padding:11px 20px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block">${label}</a>`;
 
-const layout = (title: string, bodyHtml: string) => `
+const layout = async (title: string, bodyHtml: string) => {
+  const lockup =
+    '<div style="font-size:18px;line-height:32px;font-weight:800;letter-spacing:-.025em;color:#1f2937">Vhicasar<span style="color:#F97316">&nbsp;Hub AI</span></div>';
+  return `
 <div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:520px;margin:0 auto;padding:24px">
-  <h2 style="color:${BRAND};margin-bottom:4px">BusinessHub AI</h2>
+  <div style="margin-bottom:18px">
+    ${lockup}
+  </div>
   <h3 style="margin-top:0">${title}</h3>
   ${bodyHtml}
   <p style="color:#6b778c;font-size:12px;margin-top:32px">
     If you didn't request this, you can safely ignore this email.
   </p>
 </div>`;
+};
 
 export const mailer = {
   async sendEmailVerification(to: string, token: string, userId?: string | null): Promise<MailResult> {
@@ -153,7 +159,7 @@ export const mailer = {
     return send(
       to,
       'Verify your email',
-      layout(
+      await layout(
         'Verify your email address',
         `<p>Welcome! Confirm your email to activate your workspace.</p>
          <p>${button(url, 'Verify email')}</p>
@@ -169,7 +175,7 @@ export const mailer = {
     return send(
       to,
       'Reset your password',
-      layout(
+      await layout(
         'Reset your password',
         `<p>We received a request to reset your password.</p>
          <p>${button(url, 'Choose a new password')}</p>
@@ -184,12 +190,12 @@ export const mailer = {
     return send(
       to,
       'Your password was changed',
-      layout(
+      await layout(
         'Password changed',
-        `<p>Your BusinessHub AI password was just changed and all active sessions were signed out.
+        `<p>Your Vhicasar Hub AI password was just changed and all active sessions were signed out.
          If this wasn't you, reset your password immediately and contact support.</p>`
       ),
-      'Your BusinessHub AI password was changed. If this was not you, reset it immediately.',
+      'Your Vhicasar Hub AI password was changed. If this was not you, reset it immediately.',
       { context: { type: 'PASSWORD_CHANGED', userId } },
     );
   },
@@ -199,13 +205,13 @@ export const mailer = {
     return send(
       to,
       `You've been invited to ${orgName}`,
-      layout(
-        `Join ${orgName} on BusinessHub AI`,
+      await layout(
+        `Join ${orgName} on Vhicasar Hub AI`,
         `<p>You've been invited to collaborate in <b>${orgName}</b>.</p>
          <p>${button(url, 'Accept invitation')}</p>
          <p style="font-size:12px;color:#6b778c">Invitation expires in 7 days.</p>`
       ),
-      `Join ${orgName} on BusinessHub AI: ${url} (expires in 7 days)`,
+      `Join ${orgName} on Vhicasar Hub AI: ${url} (expires in 7 days)`,
       { context: { type: 'INVITATION', organizationId } },
     );
   },
@@ -219,7 +225,7 @@ export const mailer = {
     text: string,
     context?: { organizationId?: string | null },
   ): Promise<MailResult> {
-    return send(to, subject, layout(title, bodyHtml), text, {
+    return send(to, subject, await layout(title, bodyHtml), text, {
       context: { type: 'NOTICE', organizationId: context?.organizationId ?? null },
     });
   },

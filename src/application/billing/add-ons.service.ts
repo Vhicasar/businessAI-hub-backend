@@ -55,12 +55,31 @@ export const addOnsService = {
     const addOn = (await getSiteCatalog(true)).addOns.find((item) => item.id === addOnId && item.enabled);
     if (!addOn) throw new NotFoundError('Add-on');
     const org = await prismaUnscoped.organization.findUniqueOrThrow({ where: { id: organizationId }, select: { currency: true } });
+    const active = await prismaUnscoped.addOnPurchase.findFirst({
+      where: { organizationId, addOnId, OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
+    });
+    if (active) return { activated: true, alreadyActive: true, purchaseId: active.id };
+    const price = await priced(addOn, org.currency);
+    // Free promotions must never be sent to a payment gateway as a zero-value
+    // transaction. Activate the entitlement immediately and keep the same
+    // expiry semantics as a paid monthly purchase.
+    if (price.amount === 0) {
+      const expiresAt = addOn.billingType === 'MONTHLY' ? new Date() : null;
+      if (expiresAt) expiresAt.setUTCMonth(expiresAt.getUTCMonth() + 1);
+      const purchase = await prismaUnscoped.addOnPurchase.create({
+        data: {
+          organizationId, addOnId: addOn.id, title: addOn.title,
+          billingType: addOn.billingType, amount: 0, currency: price.currency,
+          entitlements: addOn.entitlements as object, expiresAt,
+        },
+      });
+      return { activated: true, alreadyActive: false, purchaseId: purchase.id };
+    }
     if (!getChargeCurrencies().includes(org.currency)) {
       throw new AppError('PREFERRED_CURRENCY_NOT_SETTLEABLE', 400, `Checkout in ${org.currency} is not enabled.`);
     }
     const provider = getActivePaymentProvider();
     if (!provider.enabled) throw new AppError('PAYMENTS_NOT_CONFIGURED', 503, 'Online payments are not configured.');
-    const price = await priced(addOn, org.currency);
     const reference = `addon_${organizationId.slice(0, 8)}_${Date.now().toString(36)}`;
     const init = await provider.initializeTransaction({
       email: await billingEmail(organizationId),

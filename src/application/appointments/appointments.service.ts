@@ -176,7 +176,7 @@ const icsStamp = (d: Date) => d.toISOString().replace(/[-:]/g, '').replace(/\.\d
 
 function buildIcs(appt: { id: string; title: string; description?: string | null; location?: string | null; start: Date; end: Date }): string {
   return [
-    'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//BusinessHub AI//Appointments//EN', 'BEGIN:VEVENT',
+    'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Vhicasar Hub AI//Appointments//EN', 'BEGIN:VEVENT',
     `UID:${appt.id}@businesshub.ai`,
     `DTSTAMP:${icsStamp(new Date())}`,
     `DTSTART:${icsStamp(appt.start)}`,

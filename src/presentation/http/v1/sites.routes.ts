@@ -19,6 +19,11 @@ sitesRoutes.get('/', requirePermission('marketing.read'), wrap(async (_req, res)
   res.json({ success: true, data: await siteService.ensureSite() });
 }));
 
+// Full, interactive draft preview. Authenticated so unpublished work remains private.
+sitesRoutes.get('/preview', requirePermission('marketing.read'), validate({ query: z.object({ slug: z.string().optional() }) }), wrap(async (req, res) => {
+  res.type('html').send(await siteService.renderPreviewHtml(String(req.query.slug ?? '')));
+}));
+
 sitesRoutes.patch('/', requirePermission('marketing.update'), validate({ body: updateSiteSchema }), wrap(async (req, res) => {
   res.json({ success: true, data: await siteService.updateSite(req.body) });
 }));
@@ -27,12 +32,28 @@ sitesRoutes.get('/subdomain-available', requirePermission('marketing.read'), val
   res.json({ success: true, data: await siteService.subdomainAvailable(String(req.query.subdomain)) });
 }));
 
+sitesRoutes.get('/deployment-config', requirePermission('marketing.read'), wrap(async (_req, res) => {
+  res.json({ success: true, data: await siteService.subdomainDeploymentInfo() });
+}));
+
 sitesRoutes.post('/publish', requirePermission('marketing.update'), validate({ body: publishSchema }), wrap(async (req, res) => {
   res.json({ success: true, data: await siteService.publish(req.body.subdomain) });
 }));
 
 sitesRoutes.post('/unpublish', requirePermission('marketing.update'), wrap(async (_req, res) => {
   res.json({ success: true, data: await siteService.unpublish() });
+}));
+
+sitesRoutes.post('/domain', requirePermission('marketing.update'), validate({ body: z.object({ domain: z.string().trim().min(4).max(253) }) }), wrap(async (req, res) => {
+  res.json({ success: true, data: await siteService.connectDomain(req.body.domain) });
+}));
+
+sitesRoutes.post('/domain/verify', requirePermission('marketing.update'), wrap(async (_req, res) => {
+  res.json({ success: true, data: await siteService.verifyDomain() });
+}));
+
+sitesRoutes.delete('/domain', requirePermission('marketing.update'), wrap(async (_req, res) => {
+  res.json({ success: true, data: await siteService.disconnectDomain() });
 }));
 
 sitesRoutes.post('/ai-generate', requirePermission('marketing.update'), validate({ body: z.object({ prompt: z.string().trim().min(3).max(1000) }) }), wrap(async (req, res) => {

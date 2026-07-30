@@ -1,5 +1,5 @@
 /**
- * BusinessHub AI — Permission catalog (single source of truth).
+ * Vhicasar Hub AI — Permission catalog (single source of truth).
  * Seeded into the Permission table; imported by backend middleware and web UI;
  * codegen'd to Dart for Flutter (scripts/gen-dart-constants, Phase 4).
  *

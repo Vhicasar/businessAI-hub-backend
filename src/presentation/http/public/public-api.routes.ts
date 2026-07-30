@@ -1,12 +1,14 @@
 import { Router, type Request, type RequestHandler, type Response } from 'express';
+import { z } from 'zod';
 import rateLimit from 'express-rate-limit';
 import { apiKeyAuth, requireScope } from '../middleware/api-key-auth';
 import { validate } from '../middleware/validate';
 import { prisma } from '../../../infrastructure/database/prisma';
 import { customersService } from '../../../application/customers/customers.service';
-import { createCustomerSchema } from '../../../application/customers/customers.dto';
+import { createCustomerSchema, updateCustomerSchema } from '../../../application/customers/customers.dto';
 import { ordersService } from '../../../application/orders/orders.service';
-import { createOrderSchema } from '../../../application/orders/orders.dto';
+import { createOrderSchema, refundOrderSchema } from '../../../application/orders/orders.dto';
+import { aiService } from '../../../application/ai/ai.service';
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<void>): RequestHandler =>
@@ -67,12 +69,37 @@ publicApiRoutes.get(
   })
 );
 
+publicApiRoutes.get(
+  '/customers/:id',
+  requireScope('customers.read'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await customersService.get(req.params.id as string) });
+  })
+);
+
 publicApiRoutes.post(
   '/customers',
   requireScope('customers.write'),
   validate({ body: createCustomerSchema }),
   wrap(async (req, res) => {
     res.status(201).json({ success: true, data: await customersService.create(req.body) });
+  })
+);
+
+publicApiRoutes.put(
+  '/customers/:id',
+  requireScope('customers.write'),
+  validate({ body: updateCustomerSchema }),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await customersService.update(req.params.id as string, req.body) });
+  })
+);
+
+publicApiRoutes.delete(
+  '/customers/:id',
+  requireScope('customers.write'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await customersService.remove(req.params.id as string) });
   })
 );
 
@@ -111,6 +138,30 @@ publicApiRoutes.get(
   })
 );
 
+publicApiRoutes.get(
+  '/products/:id',
+  requireScope('catalog.read'),
+  wrap(async (req, res) => {
+    const product = await prisma.product.findFirst({
+      where: { id: req.params.id as string, deletedAt: null },
+      select: {
+        id: true, name: true, description: true, status: true,
+        variants: { where: { deletedAt: null }, select: { id: true, sku: true, name: true, price: true, currency: true, costPrice: true } },
+      },
+    });
+    if (!product) { res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Product not found' } }); return; }
+    res.json({ success: true, data: product });
+  })
+);
+
+publicApiRoutes.get(
+  '/orders/:id',
+  requireScope('orders.read'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await ordersService.get(req.params.id as string) });
+  })
+);
+
 publicApiRoutes.post(
   '/orders',
   requireScope('orders.write'),
@@ -118,5 +169,44 @@ publicApiRoutes.post(
   wrap(async (req, res) => {
     // No acting member for a key-authenticated call.
     res.status(201).json({ success: true, data: await ordersService.create({ ...req.body, source: 'API' }, null) });
+  })
+);
+
+/** Refund an order (marks it refunded + fires notifications). */
+publicApiRoutes.post(
+  '/orders/:id/refund',
+  requireScope('orders.write'),
+  validate({ body: refundOrderSchema }),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await ordersService.refund(req.params.id as string, req.body, req.apiKey!.keyId) });
+  })
+);
+
+// ── AI ─────────────────────────────────────────────────────────────────────
+/** Ask the workspace AI assistant a question grounded in your business data. */
+publicApiRoutes.post(
+  '/ai/assist',
+  requireScope('ai.use'),
+  validate({ body: z.object({ prompt: z.string().trim().min(1).max(2000) }) }),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await aiService.workspaceAssistant(req.body.prompt) });
+  })
+);
+
+/** AI summary of a customer (recent activity, orders, sentiment). */
+publicApiRoutes.post(
+  '/ai/customers/:id/summary',
+  requireScope('ai.use'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await aiService.summarizeCustomer(req.params.id as string) });
+  })
+);
+
+/** AI lead score (0–100) with a rationale. */
+publicApiRoutes.post(
+  '/ai/leads/:id/score',
+  requireScope('ai.use'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await aiService.scoreLead(req.params.id as string) });
   })
 );

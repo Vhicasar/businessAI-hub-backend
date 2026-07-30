@@ -7,6 +7,9 @@ import { requestContext } from '../../shared/context';
 import { inboxService } from '../../application/inbox/inbox.service';
 import { getProductBranding } from '../../application/catalog/site-catalog.service';
 import { appointmentsEnabled } from '../../application/appointments/appointments.service';
+import { resolveEntitlements } from '../../application/billing/entitlements';
+import { filesService } from '../../application/files/files.service';
+import { env } from '../../shared/config/env';
 import { validate } from './middleware/validate';
 
 /**
@@ -50,18 +53,38 @@ webchatRoutes.get(
       res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Chat unavailable' } });
       return;
     }
-    const branding = await getProductBranding();
+    const [platformBranding, organization, entitlements] = await Promise.all([
+      getProductBranding(),
+      prismaUnscoped.organization.findUnique({
+        where: { id: account.organizationId },
+        select: { name: true, logoFileId: true },
+      }),
+      resolveEntitlements(account.organizationId),
+    ]);
+    const logoUrl = organization?.logoFileId
+      ? await requestContext.run(
+          { requestId: randomUUID(), organizationId: account.organizationId },
+          () => filesService.urlFor(organization.logoFileId),
+        )
+      : null;
     const meta = (account.metadata as Record<string, unknown> | null) ?? {};
+    const businessName = organization?.name || 'Our team';
     res.json({
       success: true,
       data: {
-        color: (typeof meta.widgetColor === 'string' && meta.widgetColor) || branding.themeColor,
-        businessName: branding.name,
-        logoUrl: branding.logoUrl,
-        title: (typeof meta.widgetTitle === 'string' && meta.widgetTitle) || `Chat with ${branding.name}`,
+        color: (typeof meta.widgetColor === 'string' && meta.widgetColor) || platformBranding.themeColor,
+        businessName,
+        logoUrl,
+        title: (typeof meta.widgetTitle === 'string' && meta.widgetTitle) || `Chat with ${businessName}`,
         greeting:
           (typeof meta.widgetGreeting === 'string' && meta.widgetGreeting) ||
           'Hi there 👋 How can we help you today?',
+        showPoweredBy: !entitlements.features.has('white_label'),
+        poweredBy: {
+          name: platformBranding.name || 'Vhicasar Hub AI',
+          logoUrl: null,
+          url: env.WEB_APP_URL,
+        },
         // Lets the widget show a "Book appointment" action when enabled (#12).
         appointmentsEnabled: await appointmentsEnabled(account.organizationId),
       },

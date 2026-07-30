@@ -29,7 +29,7 @@ async function bootstrap(): Promise<void> {
   initSocketServer(httpServer);
 
   httpServer.listen(env.PORT, () => {
-    logger.info(`🚀 BusinessHub AI API listening on port ${env.PORT} (${env.NODE_ENV})`);
+    logger.info(`🚀 Vhicasar Hub AI API listening on port ${env.PORT} (${env.NODE_ENV})`);
     logger.info(`📚 API docs: ${env.API_BASE_URL}/api/docs`);
     logger.info(
       {

@@ -61,7 +61,7 @@ async function fetchPage(url: string): Promise<{ text: string; links: string[] }
   try {
     const res = await fetch(url, {
       signal: controller.signal,
-      headers: { 'User-Agent': 'BusinessHubAI-KnowledgeBot/1.0' },
+      headers: { 'User-Agent': 'VhicasarHubAI-KnowledgeBot/1.0' },
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const html = (await res.text()).slice(0, MAX_HTML_BYTES);

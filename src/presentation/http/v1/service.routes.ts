@@ -6,6 +6,7 @@ import { env } from '../../../shared/config/env';
 import { logger } from '../../../shared/logger';
 import { ForbiddenError, NotFoundError } from '../../../shared/errors';
 import { prismaUnscoped } from '../../../infrastructure/database/prisma';
+import { domainConfigSchema, domainConfigService } from '../../../application/sites/domain-config.service';
 
 /**
  * Service API — for the Vhicasar Admin, not for tenants or end users.
@@ -49,6 +50,24 @@ const requireServiceKey: RequestHandler = (req, _res, next) => {
 
 export const serviceRoutes = Router();
 serviceRoutes.use(requireServiceKey);
+
+// Platform-admin domain deployment configuration. The external Vhicasar Admin
+// uses these endpoints to add providers/domains and switch the active target.
+serviceRoutes.get('/domain-configs', wrap(async (_req, res) => {
+  res.json({ success: true, data: await domainConfigService.list() });
+}));
+serviceRoutes.post('/domain-configs', validate({ body: domainConfigSchema }), wrap(async (req, res) => {
+  res.status(201).json({ success: true, data: await domainConfigService.create(req.body) });
+}));
+serviceRoutes.patch('/domain-configs/:id', validate({ body: domainConfigSchema.partial() }), wrap(async (req, res) => {
+  res.json({ success: true, data: await domainConfigService.update(req.params.id as string, req.body) });
+}));
+serviceRoutes.post('/domain-configs/:id/activate', wrap(async (req, res) => {
+  res.json({ success: true, data: await domainConfigService.activate(req.params.id as string) });
+}));
+serviceRoutes.delete('/domain-configs/:id', wrap(async (req, res) => {
+  res.json({ success: true, data: await domainConfigService.remove(req.params.id as string) });
+}));
 
 const listQuery = z.object({
   search: z.string().trim().max(120).optional(),

@@ -1,5 +1,5 @@
 /**
- * BusinessHub AI — locale → currency resolution (single source of truth).
+ * Vhicasar Hub AI — locale → currency resolution (single source of truth).
  *
  * Used at signup to pick an organisation's currency from the owner's location,
  * and by the web signup form (mirrored client-side) to prefill the picker.

@@ -53,7 +53,7 @@ aiRoutes.post(
 /**
  * Per-workspace "bring your own key" AI provider (#13). When enabled, the
  * workspace's AI runs on the tenant's own key and its usage counts against the
- * tenant's own provider account instead of the BusinessHub plan quota.
+ * tenant's own provider account instead of the Vhicasar Hub plan quota.
  */
 aiRoutes.get(
   '/provider',

@@ -59,7 +59,7 @@ async function bootstrap(): Promise<void> {
     w.on('failed', (job, err) => logger.error({ queue: name, jobId: job?.id, err }, 'job failed'));
   }
 
-  logger.info('🛠️  BusinessHub AI worker started (queues: workflow, campaign)');
+  logger.info('🛠️  Vhicasar Hub AI worker started (queues: workflow, campaign)');
 
   const shutdown = async (signal: string): Promise<void> => {
     logger.info(`${signal} received — draining worker`);

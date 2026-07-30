@@ -38,7 +38,7 @@ const envSchema = z
       .transform((v) => v === 'true'),
     SMTP_USER: z.string().optional().or(z.literal('')),
     SMTP_PASS: z.string().optional().or(z.literal('')),
-    MAIL_FROM: z.string().default('BusinessHub AI <no-reply@businesshub.local>'),
+    MAIL_FROM: z.string().default('Vhicasar Hub AI <no-reply@vhicasar.com>'),
 
     // --- Push notifications (Firebase Cloud Messaging) ---
     // Provide the Firebase Admin service account as an inline JSON string OR a
@@ -83,7 +83,7 @@ const envSchema = z
     // fallback used when the admin has nothing configured or is unreachable.
     BILLING_CURRENCY: z.string().length(3).default('NGN'),
     /** Local fallback provider when the admin hasn't chosen one. */
-    BILLING_PROVIDER: z.enum(['paystack', 'flutterwave']).default('paystack'),
+    BILLING_PROVIDER: z.enum(['paystack', 'flutterwave', 'stripe']).default('paystack'),
     /** Pull the active payment provider + keys from the admin service API. */
     ADMIN_PAYMENT_SYNC: z.string().default('true').transform((v) => v !== 'false'),
     PAYSTACK_SECRET_KEY: z.string().optional().or(z.literal('')),
@@ -92,6 +92,10 @@ const envSchema = z
     FLUTTERWAVE_PUBLIC_KEY: z.string().optional().or(z.literal('')),
     /** Flutterwave webhook "Secret hash" (dashboard → Settings → Webhooks). */
     FLUTTERWAVE_SECRET_HASH: z.string().optional().or(z.literal('')),
+    STRIPE_SECRET_KEY: z.string().optional().or(z.literal('')),
+    STRIPE_PUBLIC_KEY: z.string().optional().or(z.literal('')),
+    /** Stripe webhook signing secret (whsec_…), for signature verification. */
+    STRIPE_WEBHOOK_SECRET: z.string().optional().or(z.literal('')),
     /** Where Paystack redirects the customer after checkout. */
     BILLING_CALLBACK_URL: z.string().url().optional(),
     /**
@@ -191,6 +195,10 @@ export const env = {
     flutterwavePublicKey: raw.FLUTTERWAVE_PUBLIC_KEY || '',
     flutterwaveSecretHash: raw.FLUTTERWAVE_SECRET_HASH || '',
     flutterwaveEnabled: Boolean(raw.FLUTTERWAVE_SECRET_KEY),
+    stripeSecretKey: raw.STRIPE_SECRET_KEY || '',
+    stripePublicKey: raw.STRIPE_PUBLIC_KEY || '',
+    stripeWebhookSecret: raw.STRIPE_WEBHOOK_SECRET || '',
+    stripeEnabled: Boolean(raw.STRIPE_SECRET_KEY),
     callbackUrl: raw.BILLING_CALLBACK_URL || `${raw.WEB_APP_URL}/settings/billing`,
     /** Currencies the merchant can settle; defaults to the settlement currency. */
     chargeCurrencies: (raw.PAYSTACK_CHARGE_CURRENCIES || raw.BILLING_CURRENCY)

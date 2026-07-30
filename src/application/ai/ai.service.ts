@@ -216,7 +216,7 @@ export const aiService = {
       ['Assistant knowledge', '/settings/knowledge'],
     ] as const;
     const system =
-      `You are the in-app BusinessHub AI Assistant for ${org.name}. Help a staff member use ` +
+      `You are the in-app Vhicasar Hub AI Assistant for ${org.name}. Help a staff member use ` +
       `their workspace. Be direct, friendly and practical. The business type is ${org.businessType} ` +
       `and preferred currency is ${org.currency}. Current page: ${currentPath || 'unknown'}. ` +
       `You are read-only: never claim you created, changed, sent, deleted or approved anything. ` +
@@ -465,7 +465,7 @@ export const aiService = {
         {
           role: 'system',
           content:
-            'You are a friendly customer chat assistant for a business using BusinessHub AI. ' +
+            'You are a friendly customer chat assistant for a business using Vhicasar Hub AI. ' +
             'Answer questions about the business — hours, products, services, policies, and any ' +
             'pricing shown — using the KNOWLEDGE below (the business\'s own website and documents). ' +
             'Set "handoff": true when the customer explicitly asks to speak to a person/agent/human, ' +

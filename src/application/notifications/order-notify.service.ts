@@ -68,7 +68,7 @@ export const orderNotifyService = {
       if (emails.length === 0) return;
       if (cfg.events?.[event] === false) return; // event disabled by the business
 
-      const subject = `${SUBJECT[event]} — ${org?.name ?? 'BusinessHub AI'}`;
+      const subject = `${SUBJECT[event]} — ${org?.name ?? 'Vhicasar Hub AI'}`;
       const bodyHtml =
         `<p style="font-weight:600">${payload.title}</p>` +
         payload.lines.map((l) => `<p style="margin:3px 0">${l}</p>`).join('');

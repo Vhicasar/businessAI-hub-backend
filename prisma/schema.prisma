@@ -3581,6 +3581,10 @@ model Site {
   name           String
   /// Platform subdomain: <subdomain>.sites.host. Unique across the platform.
   subdomain      String?    @unique
+  /// Optional customer-owned hostname, e.g. www.example.com.
+  customDomain   String?    @unique
+  domainVerificationToken String?
+  domainVerifiedAt DateTime?
   status         SiteStatus @default(DRAFT)
   /// { primaryColor, accentColor, font }
   theme          Json?
@@ -3624,6 +3628,21 @@ model SiteVersion {
 
   @@index([siteId])
   @@index([organizationId])
+}
+
+/// Platform-wide subdomain hosting destinations managed by Vhicasar Admin.
+/// Hostinger is seeded as the default provider; only one configuration is active.
+model DomainDeploymentConfig {
+  id            String   @id @default(cuid())
+  name          String
+  provider      String   @default("HOSTINGER")
+  baseDomain    String   @unique
+  cnameTarget   String
+  verificationTarget String?
+  isActive      Boolean  @default(false)
+  isDefault     Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 }
 
 // ── Marketing visual editor (Canva-style designs) ──────────────────────────

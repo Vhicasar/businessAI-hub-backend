@@ -4,6 +4,7 @@ import { requirePermission } from '../middleware/require-permission';
 import { prisma } from '../../../infrastructure/database/prisma';
 import { analyticsService } from '../../../application/analytics/analytics.service';
 import { productIntelligenceService } from '../../../application/analytics/product-intelligence.service';
+import { aiInsightsService } from '../../../application/analytics/ai-insights.service';
 import { requestContext } from '../../../shared/context';
 import { exchangeRates } from '../../../shared/exchange-rates';
 import { resolveDateRange, previousRange } from '../../../shared/date-range';
@@ -34,6 +35,15 @@ analyticsRoutes.get(
   requirePermission('analytics.view', 'support.read'),
   wrap(async (req, res) => {
     res.json({ success: true, data: await analyticsService.supportDashboard(resolveDateRange(req.query)) });
+  })
+);
+
+/** AI Insights: org-wide business intelligence + AI recommendations/risks/opportunities. */
+analyticsRoutes.get(
+  '/ai-insights',
+  requirePermission('analytics.view', 'dashboard.view'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await aiInsightsService.dashboard(resolveDateRange(req.query)) });
   })
 );
 

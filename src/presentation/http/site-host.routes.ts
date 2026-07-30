@@ -1,4 +1,4 @@
-import { Router, type Request, type Response } from 'express';
+import { Router, type NextFunction, type Request, type Response } from 'express';
 import express from 'express';
 import { siteService, recordSiteLead } from '../../application/sites/site.service';
 
@@ -38,3 +38,20 @@ async function serve(req: Request, res: Response) {
 
 siteHostRoutes.get('/:subdomain', (req, res, next) => serve(req, res).catch(next));
 siteHostRoutes.get('/:subdomain/:slug', (req, res, next) => serve(req, res).catch(next));
+
+/** Serve verified customer domains. Mounted last so API and app routes always win. */
+export function customDomainHost(req: Request, res: Response, next: NextFunction) {
+  if (req.method !== 'GET') return next();
+  const hostname = req.hostname.toLowerCase();
+  const slug = req.path.replace(/^\/+|\/+$/g, '');
+  if (slug.includes('/')) return next();
+  Promise.all([
+    siteService.renderHtmlByManagedHost(hostname, slug),
+    siteService.renderHtmlByDomain(hostname, slug),
+  ]).then(([managed, custom]) => managed ?? custom)
+    .then((html) => {
+      if (!html) return next();
+      res.type('html').send(html);
+    })
+    .catch(next);
+}
