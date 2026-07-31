@@ -53,32 +53,17 @@ let appPromise: Promise<unknown | null> | null = null;
 //   return null;
 // }
 
-function loadServiceAccount(): any {
+function loadServiceAccount(): admin.ServiceAccount | null {
   try {
-    // let raw;
-    // if (!raw && env.push.serviceAccountPath) raw = readFileSync(env.push.serviceAccountPath, 'utf8');
-    // if (!raw) return null;
-    // raw = raw.trim();
-
-    // Common env-var gotcha: the JSON is base64-encoded to survive shells/CI.
-    // if (!raw.startsWith('{')) {
-    //   try {
-    const raw = JSON.parse(Buffer.from(env.push.serviceAccountJson, "base64").toString("utf-8").trim());
-    //   } catch {
-    //     /* not base64 — fall through and let JSON.parse report */
-    //   }
-    // }
-
-    return raw;
-
-    // const account = JSON.parse(raw) as Record<string, unknown>;
-    // // The most common failure: the private key's newlines arrive escaped as
-    // // literal "\n" (env vars can't hold real newlines). Restore them.
-    // if (typeof account.private_key === 'string') {
-    //   account.private_key = account.private_key.replace(/\\n/g, '\n');
-    // }
-    // return account;
-
+    let raw = env.push.serviceAccountJson;
+    if (!raw && env.push.serviceAccountPath) raw = readFileSync(env.push.serviceAccountPath, 'utf8');
+    if (!raw) return null;
+    raw = raw.trim();
+    if (!raw.startsWith('{')) raw = Buffer.from(raw, 'base64').toString('utf8').trim();
+    const account = JSON.parse(raw) as admin.ServiceAccount & { private_key?: string; privateKey?: string };
+    if (typeof account.private_key === 'string') account.private_key = account.private_key.replace(/\\n/g, '\n');
+    if (typeof account.privateKey === 'string') account.privateKey = account.privateKey.replace(/\\n/g, '\n');
+    return account;
   } catch (err) {
     logger.error(
       { err: (err as Error).message },
@@ -88,13 +73,16 @@ function loadServiceAccount(): any {
   return null;
 }
 
-// Promise<unknown | null>
+let firebaseApp: admin.app.App | null | undefined;
 
-function getApp() {
-  if (!env.push.enabled) return null;
+function getApp(): admin.app.App | null {
+  if (firebaseApp !== undefined) return firebaseApp;
+  if (!env.push.enabled) return (firebaseApp = null);
   const account = loadServiceAccount();
-  const app = admin.initializeApp({ credential: admin.credential.cert(account) });
-  return app;
+  if (!account) return (firebaseApp = null);
+  firebaseApp = admin.apps[0] ?? admin.initializeApp({ credential: admin.credential.cert(account) });
+  logger.info({ projectId: account.projectId }, 'FCM push initialised');
+  return firebaseApp;
   // appPromise ??= (async () => {
   //   const account = loadServiceAccount();
   //   if (!account) {

@@ -13,6 +13,7 @@ import { SOCKET_EVENTS } from '../../shared/events';
 import { getAdapter } from '../../infrastructure/channels/registry';
 import { decrypt } from '../../shared/crypto';
 import { aiService } from '../ai/ai.service';
+import { notifyService } from '../notifications/notify.service';
 import type { ChannelAccountRef, NormalizedInbound } from './channel-adapter';
 
 export const listConversationsSchema = z.object({
@@ -173,6 +174,29 @@ export const inboxService = {
     emitToOrg(account.organizationId, SOCKET_EVENTS.INBOX_MESSAGE_NEW, payload);
     emitToConversation(conversation.id, SOCKET_EVENTS.INBOX_MESSAGE_NEW, payload);
     logger.debug({ conversationId: conversation.id }, 'Inbound message processed');
+
+    // A visitor starting a session creates a SYSTEM message; notify staff only
+    // when there is an actual customer message to read. This persists the bell
+    // notification, emits notifications:new, and fans out to FCM devices.
+    if (inbound.contentType !== 'SYSTEM') {
+      const senderName = identity.customer.displayName
+        || [identity.customer.firstName, identity.customer.lastName].filter(Boolean).join(' ')
+        || 'A customer';
+      await notifyService.notifyStaff(
+        account.organizationId,
+        {
+          type: 'inbox.message',
+          title: `New message from ${senderName}`,
+          body: inbound.text?.trim().slice(0, 180) || `[${inbound.contentType.toLowerCase()}]`,
+          data: {
+            conversationId: conversation.id,
+            channelType: account.channelType,
+            link: `/inbox?c=${conversation.id}`,
+          },
+        },
+        { assigneeMembershipId: conversation.assignedToId },
+      ).catch((err) => logger.warn({ err, conversationId: conversation.id }, 'Inbound notification failed'));
+    }
 
     // Async sentiment (no-op when AI is disabled; never blocks the webhook).
     if (inbound.text) {
