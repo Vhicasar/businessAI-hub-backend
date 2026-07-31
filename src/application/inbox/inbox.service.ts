@@ -176,13 +176,13 @@ export const inboxService = {
     logger.debug({ conversationId: conversation.id }, 'Inbound message processed');
 
     // A visitor starting a session creates a SYSTEM message; notify staff only
-    // when there is an actual customer message to read. This persists the bell
-    // notification, emits notifications:new, and fans out to FCM devices.
+    // when there is an actual customer message to read. Chat-message alerts are
+    // push-only and deliberately do not add noise to the notification tray.
     if (inbound.contentType !== 'SYSTEM') {
       const senderName = identity.customer.displayName
         || [identity.customer.firstName, identity.customer.lastName].filter(Boolean).join(' ')
         || 'A customer';
-      await notifyService.notifyStaff(
+      await notifyService.pushChatMessage(
         account.organizationId,
         {
           type: 'inbox.message',
@@ -195,7 +195,8 @@ export const inboxService = {
           },
         },
         { assigneeMembershipId: conversation.assignedToId },
-      ).catch((err) => logger.warn({ err, conversationId: conversation.id }, 'Inbound notification failed'));
+      ).catch((err) => { console.log("Message sending error"); logger.warn({ err, conversationId: conversation.id }, 'Inbound notification failed') });
+      console.log("Message sent");
     }
 
     // Async sentiment (no-op when AI is disabled; never blocks the webhook).
@@ -330,12 +331,12 @@ export const inboxService = {
           : {}),
         ...(dto.search
           ? {
-              OR: [
-                { customer: { firstName: { contains: dto.search, mode: 'insensitive' as const } } },
-                { customer: { lastName: { contains: dto.search, mode: 'insensitive' as const } } },
-                { lastMessageText: { contains: dto.search, mode: 'insensitive' as const } },
-              ],
-            }
+            OR: [
+              { customer: { firstName: { contains: dto.search, mode: 'insensitive' as const } } },
+              { customer: { lastName: { contains: dto.search, mode: 'insensitive' as const } } },
+              { lastMessageText: { contains: dto.search, mode: 'insensitive' as const } },
+            ],
+          }
           : {}),
       },
       select: conversationListSelect,

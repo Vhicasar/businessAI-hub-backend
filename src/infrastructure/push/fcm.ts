@@ -80,9 +80,14 @@ function getApp(): admin.app.App | null {
   if (!env.push.enabled) return (firebaseApp = null);
   const account = loadServiceAccount();
   if (!account) return (firebaseApp = null);
-  firebaseApp = admin.apps[0] ?? admin.initializeApp({ credential: admin.credential.cert(account) });
-  logger.info({ projectId: account.projectId }, 'FCM push initialised');
-  return firebaseApp;
+  try {
+    firebaseApp = admin.apps[0] ?? admin.initializeApp({ credential: admin.credential.cert(account) });
+    logger.info({ projectId: account.projectId }, 'FCM push initialised');
+    return firebaseApp;
+  } catch (err) {
+    logger.error({ err: (err as Error).message }, 'FCM push initialisation failed');
+    return (firebaseApp = null);
+  }
   // appPromise ??= (async () => {
   //   const account = loadServiceAccount();
   //   if (!account) {
@@ -126,7 +131,7 @@ const DEAD_TOKEN_CODES = new Set([
 
 export const fcm = {
   get enabled(): boolean {
-    return env.push.enabled;
+    return getApp() !== null;
   },
 
   /**
@@ -150,7 +155,10 @@ export const fcm = {
       const res = await messaging.sendEachForMulticast({
         tokens: unique,
         notification: { title: payload.title, body: payload.body },
-        data: payload.data ?? {},
+        // Duplicate the visible text in data so native web service workers can
+        // display the notification even when the browser does not expose the
+        // top-level notification object to the Push API event.
+        data: { ...(payload.data ?? {}), title: payload.title, body: payload.body ?? '' },
         android: {
           priority: 'high',
           notification: { sound, channelId: 'high_importance', defaultSound: false },
@@ -159,7 +167,8 @@ export const fcm = {
           payload: { aps: { sound: `${sound}.wav`, badge: 1 } },
         },
         webpush: {
-          notification: { title: payload.title, body: payload.body, icon: '/favicon.svg' },
+          headers: { Urgency: 'high' },
+          notification: { title: payload.title, body: payload.body, icon: '/brand-icon.svg' },
           fcmOptions: payload.data?.link ? { link: payload.data.link } : undefined,
         },
       });

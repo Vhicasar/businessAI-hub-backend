@@ -90,6 +90,7 @@ export const notifyService = {
       update: { userId, platform, updatedAt: new Date() },
       create: { userId, token, platform },
     });
+    logger.info({ userId, platform }, 'Push device registered');
     return { ok: true };
   },
 
@@ -144,7 +145,14 @@ export const notifyService = {
    * reported by FCM are pruned.
    */
   async pushToUsers(userIds: string[], input: NotifyInput): Promise<void> {
-    if (!fcm.enabled || userIds.length === 0) return;
+    if (userIds.length === 0) {
+      logger.warn({ type: input.type }, 'Push skipped: no eligible recipients');
+      return;
+    }
+    if (!fcm.enabled) {
+      logger.warn({ type: input.type, recipients: userIds.length }, 'Push skipped: Firebase Admin is not configured');
+      return;
+    }
 
     const [tokens, prefRows] = await Promise.all([
       prismaUnscoped.deviceToken.findMany({
@@ -156,7 +164,10 @@ export const notifyService = {
         select: { userId: true, type: true, channel: true, enabled: true },
       }),
     ]);
-    if (tokens.length === 0) return;
+    if (tokens.length === 0) {
+      logger.warn({ type: input.type, recipients: userIds.length }, 'Push skipped: recipients have no registered devices');
+      return;
+    }
 
     const byUser = new Map<string, PrefRow[]>();
     for (const r of prefRows) {
@@ -173,7 +184,10 @@ export const notifyService = {
         prefAllows(rows, platformKey(t.platform), 'PUSH')
       );
     });
-    if (eligible.length === 0) return;
+    if (eligible.length === 0) {
+      logger.warn({ type: input.type, tokens: tokens.length }, 'Push skipped: all registered devices are disabled by preferences');
+      return;
+    }
 
     const data: Record<string, string> = { type: input.type };
     for (const [k, v] of Object.entries(input.data ?? {})) data[k] = String(v);
@@ -181,6 +195,10 @@ export const notifyService = {
     const result = await fcm.sendToTokens(
       eligible.map((t) => t.token),
       { title: input.title, body: input.body, data },
+    );
+    logger.info(
+      { type: input.type, tokens: eligible.length, success: result.successCount, failed: result.failureCount },
+      'Push delivery completed',
     );
 
     if (result.invalidTokens.length) {
@@ -223,5 +241,43 @@ export const notifyService = {
       userIds = anyMembers.map((a) => a.userId);
     }
     await this.notifyUsers(orgId, userIds, input);
+  },
+
+  /**
+   * Push-only routing for new inbound chat messages. These alerts should not
+   * create rows in the notification tray:
+   * - unassigned: owners, managers, sales, customer support and marketing;
+   * - assigned: the assignee, every manager and every owner.
+   */
+  async pushChatMessage(
+    orgId: string,
+    input: NotifyInput,
+    opts: { assigneeMembershipId?: string | null } = {},
+  ): Promise<void> {
+    try {
+      const memberships = await prismaUnscoped.membership.findMany({
+        where: { organizationId: orgId, isActive: true, deletedAt: null },
+        select: { id: true, userId: true, isOwner: true, role: { select: { name: true } } },
+      });
+      const assigneeId = opts.assigneeMembershipId ?? null;
+      const unassignedRoles = new Set(['manager', 'sales', 'customer support', 'marketing']);
+    const userIds = memberships
+        .filter((membership) => {
+          const role = membership.role.name.trim().toLowerCase();
+          if (assigneeId) {
+            return membership.id === assigneeId || membership.isOwner || role === 'owner' || role === 'manager';
+          }
+          return membership.isOwner || role === 'owner' || unassignedRoles.has(role);
+        })
+      .map((membership) => membership.userId);
+    logger.info(
+      { orgId, assigned: Boolean(assigneeId), recipients: new Set(userIds).size },
+      'Chat push recipients resolved',
+    );
+    await this.pushToUsers([...new Set(userIds)], input);
+      console.log("Message sent 1");
+    } catch (error) {
+      console.log("Message sending error 1");
+    }
   },
 };
