@@ -1,6 +1,7 @@
 import { readFileSync } from 'fs';
 import { env } from '../../shared/config/env';
 import { logger } from '../../shared/logger';
+import admin from 'firebase-admin';
 
 /**
  * Firebase Cloud Messaging sender.
@@ -15,34 +16,69 @@ import { logger } from '../../shared/logger';
  */
 
 // Non-literal specifiers so tsc doesn't require the module to be present.
-const ADMIN_APP = 'firebase-admin/app';
+// const ADMIN_APP = 'firebase-admin/app';
 const ADMIN_MESSAGING = 'firebase-admin/messaging';
 
 let appPromise: Promise<unknown | null> | null = null;
 
-function loadServiceAccount(): Record<string, unknown> | null {
+// function loadServiceAccount(): Record<string, unknown> | null {
+//   try {
+//     let raw = env.push.serviceAccountJson;
+//     if (!raw && env.push.serviceAccountPath) raw = readFileSync(env.push.serviceAccountPath, 'utf8');
+//     if (!raw) return null;
+//     raw = raw.trim();
+
+//     // Common env-var gotcha: the JSON is base64-encoded to survive shells/CI.
+//     if (!raw.startsWith('{')) {
+//       try {
+//         raw = Buffer.from(raw, 'base64').toString('utf-8').trim();
+//       } catch {
+//         /* not base64 — fall through and let JSON.parse report */
+//       }
+//     }
+
+//     const account = JSON.parse(raw) as Record<string, unknown>;
+//     // The most common failure: the private key's newlines arrive escaped as
+//     // literal "\n" (env vars can't hold real newlines). Restore them.
+//     if (typeof account.private_key === 'string') {
+//       account.private_key = account.private_key.replace(/\\n/g, '\n');
+//     }
+//     return account;
+//   } catch (err) {
+//     logger.error(
+//       { err: (err as Error).message },
+//       'FCM service account could not be parsed (expected JSON or base64-encoded JSON). Push is disabled.',
+//     );
+//   }
+//   return null;
+// }
+
+function loadServiceAccount(): any {
   try {
-    let raw = env.push.serviceAccountJson;
-    if (!raw && env.push.serviceAccountPath) raw = readFileSync(env.push.serviceAccountPath, 'utf8');
-    if (!raw) return null;
-    raw = raw.trim();
+    // let raw;
+    // if (!raw && env.push.serviceAccountPath) raw = readFileSync(env.push.serviceAccountPath, 'utf8');
+    // if (!raw) return null;
+    // raw = raw.trim();
 
     // Common env-var gotcha: the JSON is base64-encoded to survive shells/CI.
-    if (!raw.startsWith('{')) {
-      try {
-        raw = Buffer.from(raw, 'base64').toString('utf8').trim();
-      } catch {
-        /* not base64 — fall through and let JSON.parse report */
-      }
-    }
+    // if (!raw.startsWith('{')) {
+    //   try {
+    const raw = JSON.parse(Buffer.from(env.push.serviceAccountJson, "base64").toString("utf-8").trim());
+    //   } catch {
+    //     /* not base64 — fall through and let JSON.parse report */
+    //   }
+    // }
 
-    const account = JSON.parse(raw) as Record<string, unknown>;
-    // The most common failure: the private key's newlines arrive escaped as
-    // literal "\n" (env vars can't hold real newlines). Restore them.
-    if (typeof account.private_key === 'string') {
-      account.private_key = account.private_key.replace(/\\n/g, '\n');
-    }
-    return account;
+    return raw;
+
+    // const account = JSON.parse(raw) as Record<string, unknown>;
+    // // The most common failure: the private key's newlines arrive escaped as
+    // // literal "\n" (env vars can't hold real newlines). Restore them.
+    // if (typeof account.private_key === 'string') {
+    //   account.private_key = account.private_key.replace(/\\n/g, '\n');
+    // }
+    // return account;
+
   } catch (err) {
     logger.error(
       { err: (err as Error).message },
@@ -52,22 +88,30 @@ function loadServiceAccount(): Record<string, unknown> | null {
   return null;
 }
 
-async function getApp(): Promise<unknown | null> {
+// Promise<unknown | null>
+
+function getApp() {
   if (!env.push.enabled) return null;
-  appPromise ??= (async () => {
-    const account = loadServiceAccount();
-    if (!account) {
-      logger.warn('Push is enabled but the FCM service account is missing/invalid — push will not send.');
-      return null;
-    }
-    const { initializeApp, getApps, cert } = await import(ADMIN_APP);
-    const existing = getApps();
-    if (existing.length) return existing[0];
-    const app = initializeApp({ credential: cert(account) });
-    logger.info({ projectId: account.project_id }, 'FCM (push) initialised');
-    return app;
-  })();
-  return appPromise;
+  const account = loadServiceAccount();
+  const app = admin.initializeApp({ credential: admin.credential.cert(account) });
+  return app;
+  // appPromise ??= (async () => {
+  //   const account = loadServiceAccount();
+  //   if (!account) {
+  //     logger.warn('Push is enabled but the FCM service account is missing/invalid — push will not send.');
+  //     return null;
+  //   }
+  //   // const { initializeApp, getApps, cert } = await import(ADMIN_APP);
+  //   // const existing = getApps();
+  //   // if (existing.length) return existing[0];
+
+  //   const app = admin.initializeApp({ credential: admin.credential.cert(account) });
+  //   // const app = initializeApp({ credential: cert(account) });
+    
+  //   // logger.info({ projectId: account.project_id }, 'FCM (push) initialised');
+  //   return app;
+  // })();
+  // return appPromise;
 }
 
 export interface PushPayload {
@@ -106,12 +150,13 @@ export const fcm = {
     const empty: PushResult = { successCount: 0, failureCount: 0, invalidTokens: [] };
     if (unique.length === 0) return empty;
 
-    const app = await getApp();
+    const app = getApp();
     if (!app) return empty;
 
     const sound = payload.sound || env.push.sound;
-    const { getMessaging } = await import(ADMIN_MESSAGING);
-    const messaging = getMessaging(app);
+    // const { getMessaging } = await import(ADMIN_MESSAGING);
+    // const messaging = getMessaging(app);
+    const messaging = app.messaging();
 
     try {
       const res = await messaging.sendEachForMulticast({
