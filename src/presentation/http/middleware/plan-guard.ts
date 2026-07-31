@@ -58,7 +58,11 @@ async function currentCount(kind: CountableLimit, orgId: string): Promise<number
         where: { organizationId: orgId, isActive: true, deletedAt: null },
       });
     case 'channels':
-      return prismaUnscoped.channelAccount.count({ where: { organizationId: orgId } });
+      // Disconnected accounts are retained as soft-deleted history. They no
+      // longer consume a plan slot and must not block a later reconnection.
+      return prismaUnscoped.channelAccount.count({
+        where: { organizationId: orgId, deletedAt: null },
+      });
     case 'contacts':
       return prismaUnscoped.customer.count({ where: { organizationId: orgId, deletedAt: null } });
     case 'products':
