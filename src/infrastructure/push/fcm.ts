@@ -147,6 +147,8 @@ export const fcm = {
     if (!app) return empty;
 
     const sound = payload.sound || env.push.sound;
+    const conversationId = payload.data?.conversationId;
+    const groupTag = conversationId ? `chat-${conversationId}` : payload.data?.type || 'notification';
     // const { getMessaging } = await import(ADMIN_MESSAGING);
     // const messaging = getMessaging(app);
     const messaging = app.messaging();
@@ -161,14 +163,22 @@ export const fcm = {
         data: { ...(payload.data ?? {}), title: payload.title, body: payload.body ?? '' },
         android: {
           priority: 'high',
-          notification: { sound, channelId: 'high_importance', defaultSound: false },
+          collapseKey: groupTag,
+          notification: { sound, channelId: 'high_importance', defaultSound: false, tag: groupTag },
         },
         apns: {
-          payload: { aps: { sound: `${sound}.wav`, badge: 1 } },
+          headers: { 'apns-collapse-id': groupTag },
+          payload: { aps: { sound: `${sound}.wav`, badge: 1, threadId: groupTag } },
         },
         webpush: {
           headers: { Urgency: 'high' },
-          notification: { title: payload.title, body: payload.body, icon: '/brand-icon.svg' },
+          notification: {
+            title: payload.title,
+            body: payload.body,
+            icon: '/brand-icon.svg',
+            tag: groupTag,
+            renotify: true,
+          },
           fcmOptions: payload.data?.link ? { link: payload.data.link } : undefined,
         },
       });

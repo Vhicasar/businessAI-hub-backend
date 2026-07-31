@@ -197,7 +197,16 @@ export const notifyService = {
       { title: input.title, body: input.body, data },
     );
     logger.info(
-      { type: input.type, tokens: eligible.length, success: result.successCount, failed: result.failureCount },
+      {
+        type: input.type,
+        tokens: eligible.length,
+        platforms: eligible.reduce<Record<string, number>>((counts, item) => {
+          counts[item.platform] = (counts[item.platform] ?? 0) + 1;
+          return counts;
+        }, {}),
+        success: result.successCount,
+        failed: result.failureCount,
+      },
       'Push delivery completed',
     );
 
