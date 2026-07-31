@@ -81,7 +81,7 @@ webchatRoutes.get(
           'Hi there 👋 How can we help you today?',
         showPoweredBy: !entitlements.features.has('white_label'),
         poweredBy: {
-          name: platformBranding.name || 'Vhicasar Hub AI',
+          name: 'Vhicasar Hub AI',
           logoUrl: null,
           url: env.WEB_APP_URL,
         },

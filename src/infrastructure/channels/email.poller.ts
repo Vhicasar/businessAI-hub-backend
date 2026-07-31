@@ -33,13 +33,13 @@ function isAutomatedEmail(parsed: Awaited<ReturnType<typeof simpleParser>>, from
   };
   const precedence = get('precedence');
   if (['bulk', 'list', 'junk', 'auto_reply'].includes(precedence)) return true;
-  if (h.has('list-unsubscribe') || h.has('list-id') || h.has('list-post')) return true;
+  if (h.has('list-unsubscribe') || h.has('list-id')) return true; // mailing lists / marketing
   const autoSubmitted = get('auto-submitted');
   if (autoSubmitted && autoSubmitted !== 'no') return true; // auto-generated / auto-replied
-  if (get('x-auto-response-suppress')) return true;
-  if (get('feedback-id') || get('x-campaign') || get('x-mailer-lid') || get('x-marketing')) return true;
-  // Common non-personal senders.
-  if (/(^|[._-])(no.?reply|do.?not.?reply|noreply|donotreply|mailer-daemon|postmaster|bounce|bounces|notifications?|newsletter|mailer|updates?|alerts?)@/.test(from)) {
+  if (get('x-auto-response-suppress') || get('feedback-id')) return true;
+  // Unambiguous non-personal senders only (keep this narrow so real customer
+  // mail is never dropped — that's what broke the inbox before).
+  if (/(^|[._+-])(no.?reply|do.?not.?reply|donotreply|mailer-daemon|postmaster|bounces?)@/.test(from)) {
     return true;
   }
   return false;
@@ -57,15 +57,22 @@ async function pollAccount(account: {
   if (!creds.imapHost || !creds.imapUser) return;
 
   const meta = (account.metadata as Record<string, unknown> | null) ?? {};
-  // Only ever handle mail that arrived AFTER the channel was configured — the
-  // account's createdAt is the floor (or an explicit metadata.syncSince).
-  const watermark = new Date(
-    typeof meta.syncSince === 'string' ? meta.syncSince : account.createdAt,
-  );
-  // High-watermark on the IMAP UID so each message is handled once and history
-  // is never replayed. Unset on the first poll → we baseline to the newest UID
-  // and process nothing older.
-  let lastUid = typeof meta.imapLastUid === 'number' ? meta.imapLastUid : null;
+  // Only ever handle mail that arrived AFTER the channel was configured. The
+  // watermark is a simple date: an account we've never polled baselines it now
+  // (recently-configured accounts use their createdAt so mail sent right after
+  // setup still comes in; long-existing accounts baseline to "now" so their
+  // inbox history is never replayed / auto-replied).
+  let watermark = typeof meta.syncSince === 'string' ? new Date(meta.syncSince) : null;
+  if (!watermark || Number.isNaN(watermark.getTime())) {
+    // Freshly-configured accounts start from setup time; long-existing accounts
+    // start from ~10 min ago (so mail sent while testing still arrives) without
+    // replaying deep inbox history.
+    const freshlyConfigured = Date.now() - account.createdAt.getTime() < 60 * 60 * 1000;
+    watermark = freshlyConfigured ? account.createdAt : new Date(Date.now() - 10 * 60 * 1000);
+    await saveSyncSince(account.id, meta, watermark);
+    logger.info({ accountId: account.id, watermark }, 'Email poller baselined — only mail from here on is processed');
+    // Fall through and process this same cycle using the just-set watermark.
+  }
 
   const client = new ImapFlow({
     host: creds.imapHost,
@@ -79,41 +86,27 @@ async function pollAccount(account: {
   try {
     const lock = await client.getMailboxLock('INBOX');
     try {
-      const uidNext = Number((client.mailbox && typeof client.mailbox === 'object' && 'uidNext' in client.mailbox ? client.mailbox.uidNext : 0) || 0);
+      // Same proven pattern as before (search unseen + download by UID), just
+      // bounded to mail received on/after the watermark day (server-side SINCE).
+      const found = await client.search({ seen: false, since: watermark });
+      const uids = Array.isArray(found) ? found : [];
+      if (uids.length === 0) return;
 
-      // First time we see this account: baseline the watermark to the newest UID
-      // so pre-existing mail (promotional or otherwise) is never processed.
-      if (lastUid == null) {
-        const baseline = Math.max(0, uidNext - 1);
-        await saveLastUid(account.id, meta, baseline);
-        logger.info({ accountId: account.id, baseline }, 'Email poller baselined — existing mail will not be auto-processed');
-        return;
-      }
-
-      // Only unseen messages newer than the watermark UID.
-      const unseen = await client.search({ seen: false, uid: `${lastUid + 1}:*` });
-      // `uid: n:*` always returns at least the highest message; drop anything <= watermark.
-      const fresh = (Array.isArray(unseen) ? unseen : []).filter((uid: number) => uid > lastUid!);
-      if (fresh.length === 0) return;
-
-      let maxUid = lastUid;
-      for (const uid of fresh.slice(0, 20)) {
-        maxUid = Math.max(maxUid, uid);
+      // Newest first, capped, so a backlog is drained over a few cycles.
+      for (const uid of uids.slice(-30).reverse()) {
         const raw = await client.download(String(uid), undefined, { uid: true });
         if (!raw?.content) continue;
         const parsed = await simpleParser(raw.content);
 
         const fromAddress = parsed.from?.value?.[0]?.address?.toLowerCase();
-        // Skip our own mail, anything predating configuration, and automated/bulk.
-        if (
-          !fromAddress ||
-          fromAddress === creds.imapUser.toLowerCase() ||
-          (parsed.date && parsed.date < watermark) ||
-          isAutomatedEmail(parsed, fromAddress)
-        ) {
+        // Our own mail, or automated/bulk → mark read and skip (never auto-reply).
+        if (!fromAddress || fromAddress === creds.imapUser.toLowerCase() || isAutomatedEmail(parsed, fromAddress)) {
           await client.messageFlagsAdd(String(uid), ['\\Seen'], { uid: true }).catch(() => undefined);
           continue;
         }
+        // Precise pre-watermark guard (SINCE is day-granular). Leave it unread —
+        // don't touch mail that predates configuration.
+        if (parsed.date && parsed.date < watermark) continue;
 
         const subject = parsed.subject?.trim();
         const bodyText = (parsed.text ?? '').trim().slice(0, 4000);
@@ -136,7 +129,6 @@ async function pollAccount(account: {
         );
         await client.messageFlagsAdd(String(uid), ['\\Seen'], { uid: true }).catch(() => undefined);
       }
-      if (maxUid > lastUid) await saveLastUid(account.id, meta, maxUid);
     } finally {
       lock.release();
     }
@@ -145,11 +137,11 @@ async function pollAccount(account: {
   }
 }
 
-/** Persist the IMAP UID high-watermark on the channel account (best-effort). */
-async function saveLastUid(accountId: string, meta: Record<string, unknown>, uid: number): Promise<void> {
+/** Persist the date watermark on the channel account (best-effort). */
+async function saveSyncSince(accountId: string, meta: Record<string, unknown>, date: Date): Promise<void> {
   await prismaUnscoped.channelAccount
-    .update({ where: { id: accountId }, data: { metadata: { ...meta, imapLastUid: uid } } })
-    .catch((e) => logger.warn({ err: e, accountId }, 'Failed to persist email UID watermark'));
+    .update({ where: { id: accountId }, data: { metadata: { ...meta, syncSince: date.toISOString() } } })
+    .catch((e) => logger.warn({ err: e, accountId }, 'Failed to persist email sync watermark'));
 }
 
 async function pollAll(): Promise<void> {
