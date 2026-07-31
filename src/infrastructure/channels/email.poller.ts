@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import type { Prisma } from '@prisma/client';
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import { prismaUnscoped } from '../database/prisma';
@@ -16,6 +17,11 @@ interface EmailCreds {
   imapPort?: string;
   imapUser?: string;
   imapPass?: string;
+}
+
+interface EmailSyncMetadata extends Record<string, unknown> {
+  syncSince?: string;
+  lastUid?: number;
 }
 
 /**
@@ -36,11 +42,43 @@ function isAutomatedEmail(parsed: Awaited<ReturnType<typeof simpleParser>>, from
   if (h.has('list-unsubscribe') || h.has('list-id')) return true; // mailing lists / marketing
   const autoSubmitted = get('auto-submitted');
   if (autoSubmitted && autoSubmitted !== 'no') return true; // auto-generated / auto-replied
-  if (get('x-auto-response-suppress') || get('feedback-id')) return true;
+  if (
+    get('x-auto-response-suppress')
+    || get('feedback-id')
+    || get('x-autoreply')
+    || get('x-autorespond')
+    || get('x-campaign')
+    || get('x-campaign-id')
+  ) return true;
   // Unambiguous non-personal senders only (keep this narrow so real customer
   // mail is never dropped — that's what broke the inbox before).
   if (/(^|[._+-])(no.?reply|do.?not.?reply|donotreply|mailer-daemon|postmaster|bounces?)@/.test(from)) {
     return true;
+  }
+  return false;
+}
+
+/**
+ * Require the integrated mailbox to be an actual recipient. This prevents a
+ * shared/archive mailbox from turning unrelated copied mail into customer
+ * conversations. Delivery headers cover BCC and common forwarding setups.
+ */
+function isAddressedToMailbox(
+  parsed: Awaited<ReturnType<typeof simpleParser>>,
+  mailbox: string,
+): boolean {
+  const target = mailbox.trim().toLowerCase();
+  const recipients = [parsed.to, parsed.cc, parsed.bcc]
+    .flatMap((field) => Array.isArray(field)
+      ? field.flatMap((entry) => entry.value)
+      : field?.value ?? [])
+    .map((entry) => entry.address?.trim().toLowerCase())
+    .filter(Boolean);
+  if (recipients.includes(target)) return true;
+
+  for (const name of ['delivered-to', 'x-original-to', 'envelope-to']) {
+    const value = parsed.headers.get(name);
+    if (value && String(value).toLowerCase().includes(target)) return true;
   }
   return false;
 }
@@ -56,7 +94,7 @@ async function pollAccount(account: {
   const creds = JSON.parse(decrypt(account.credentialsEnc)) as EmailCreds;
   if (!creds.imapHost || !creds.imapUser) return;
 
-  const meta = (account.metadata as Record<string, unknown> | null) ?? {};
+  const meta = ((account.metadata as EmailSyncMetadata | null) ?? {});
   // Only ever handle mail that arrived AFTER the channel was configured. The
   // watermark is a simple date: an account we've never polled baselines it now
   // (recently-configured accounts use their createdAt so mail sent right after
@@ -70,6 +108,7 @@ async function pollAccount(account: {
     const freshlyConfigured = Date.now() - account.createdAt.getTime() < 60 * 60 * 1000;
     watermark = freshlyConfigured ? account.createdAt : new Date(Date.now() - 10 * 60 * 1000);
     await saveSyncSince(account.id, meta, watermark);
+    meta.syncSince = watermark.toISOString();
     logger.info({ accountId: account.id, watermark }, 'Email poller baselined — only mail from here on is processed');
     // Fall through and process this same cycle using the just-set watermark.
   }
@@ -86,27 +125,61 @@ async function pollAccount(account: {
   try {
     const lock = await client.getMailboxLock('INBOX');
     try {
-      // Same proven pattern as before (search unseen + download by UID), just
-      // bounded to mail received on/after the watermark day (server-side SINCE).
-      const found = await client.search({ seen: false, since: watermark });
-      const uids = Array.isArray(found) ? found : [];
+      // Do not filter on the IMAP \Seen flag. Mail clients and server rules can
+      // mark a message read before this poller runs, which previously made that
+      // message invisible to Vhicasar forever. The persisted UID cursor and the
+      // Message unique constraint provide safe deduplication instead.
+      // Gmail exposes its inbox categories through X-GM-RAW. Restrict Gmail
+      // integrations to Primary at the server; generic IMAP providers are
+      // filtered below using standard recipient and automation headers.
+      const searchQuery = client.capabilities.has('X-GM-EXT-1')
+        ? { since: watermark, gmraw: 'category:primary' }
+        : { since: watermark };
+      const found = await client.search(searchQuery);
+      const lastUid = typeof meta.lastUid === 'number' && Number.isSafeInteger(meta.lastUid)
+        ? meta.lastUid
+        : 0;
+      const uids = (Array.isArray(found) ? found : [])
+        .filter((uid): uid is number => typeof uid === 'number' && uid > lastUid)
+        .sort((a, b) => a - b);
       if (uids.length === 0) return;
 
-      // Newest first, capped, so a backlog is drained over a few cycles.
-      for (const uid of uids.slice(-30).reverse()) {
+      // Oldest first so the cursor can advance without skipping an older mail
+      // when a backlog is larger than one batch.
+      let processedThroughUid = lastUid;
+      for (const uid of uids.slice(0, 30)) {
+        const envelope = await client.fetchOne(
+          String(uid),
+          { internalDate: true },
+          { uid: true },
+        );
+        const receivedAt = envelope && envelope.internalDate
+          ? new Date(envelope.internalDate)
+          : null;
+        if (receivedAt && !Number.isNaN(receivedAt.getTime()) && receivedAt < watermark) {
+          processedThroughUid = uid;
+          continue;
+        }
+
         const raw = await client.download(String(uid), undefined, { uid: true });
-        if (!raw?.content) continue;
+        if (!raw?.content) {
+          processedThroughUid = uid;
+          continue;
+        }
         const parsed = await simpleParser(raw.content);
 
         const fromAddress = parsed.from?.value?.[0]?.address?.toLowerCase();
-        // Our own mail, or automated/bulk → mark read and skip (never auto-reply).
-        if (!fromAddress || fromAddress === creds.imapUser.toLowerCase() || isAutomatedEmail(parsed, fromAddress)) {
-          await client.messageFlagsAdd(String(uid), ['\\Seen'], { uid: true }).catch(() => undefined);
+        // Our own mail, or automated/bulk → skip (never auto-reply). Do not
+        // mutate mailbox read/unread state; this integration should be passive.
+        if (
+          !fromAddress
+          || fromAddress === creds.imapUser.toLowerCase()
+          || !isAddressedToMailbox(parsed, creds.imapUser)
+          || isAutomatedEmail(parsed, fromAddress)
+        ) {
+          processedThroughUid = uid;
           continue;
         }
-        // Precise pre-watermark guard (SINCE is day-granular). Leave it unread —
-        // don't touch mail that predates configuration.
-        if (parsed.date && parsed.date < watermark) continue;
 
         const subject = parsed.subject?.trim();
         const bodyText = (parsed.text ?? '').trim().slice(0, 4000);
@@ -123,11 +196,17 @@ async function pollAccount(account: {
                 senderDisplayName: parsed.from?.value?.[0]?.name || fromAddress,
                 contentType: 'TEXT',
                 text,
-                sentAt: parsed.date ?? undefined,
+                sentAt: parsed.date ?? receivedAt ?? undefined,
               }
             )
         );
-        await client.messageFlagsAdd(String(uid), ['\\Seen'], { uid: true }).catch(() => undefined);
+        processedThroughUid = uid;
+      }
+      if (processedThroughUid > lastUid) {
+        await saveSyncMetadata(account.id, meta, {
+          lastUid: processedThroughUid,
+          lastPolledAt: new Date().toISOString(),
+        });
       }
     } finally {
       lock.release();
@@ -139,8 +218,21 @@ async function pollAccount(account: {
 
 /** Persist the date watermark on the channel account (best-effort). */
 async function saveSyncSince(accountId: string, meta: Record<string, unknown>, date: Date): Promise<void> {
+  await saveSyncMetadata(accountId, meta, { syncSince: date.toISOString() })
+    .catch((e) => logger.warn({ err: e, accountId }, 'Failed to persist email sync watermark'));
+}
+
+/** Persist mailbox cursor fields without discarding channel settings. */
+async function saveSyncMetadata(
+  accountId: string,
+  meta: Record<string, unknown>,
+  update: Record<string, unknown>,
+): Promise<void> {
   await prismaUnscoped.channelAccount
-    .update({ where: { id: accountId }, data: { metadata: { ...meta, syncSince: date.toISOString() } } })
+    .update({
+      where: { id: accountId },
+      data: { metadata: { ...meta, ...update } as Prisma.InputJsonObject },
+    })
     .catch((e) => logger.warn({ err: e, accountId }, 'Failed to persist email sync watermark'));
 }
 
