@@ -7,14 +7,15 @@ import { logger } from '../../../shared/logger';
 import { ForbiddenError, NotFoundError } from '../../../shared/errors';
 import { prismaUnscoped } from '../../../infrastructure/database/prisma';
 import { domainConfigSchema, domainConfigService } from '../../../application/sites/domain-config.service';
+import { getActivePaymentProvider } from '../../../infrastructure/payments';
+import { mailer } from '../../../infrastructure/mail/mailer';
 
 /**
  * Service API — for the Vhicasar Admin, not for tenants or end users.
  *
- * Read-only, and deliberately narrow: it answers "who has onboarded onto this
- * deployment", not "show me their data". No customer records, no messages, no
- * revenue detail beyond the plan they're on. If the admin ever needs more, that
- * should be a new, equally explicit endpoint rather than a widening of this one.
+ * Deliberately narrow: it exposes the organisation roster and explicit
+ * lifecycle controls, not tenant business data. No customer records, messages,
+ * or revenue detail beyond the current plan are exposed.
  *
  * ── Why this is the only place we go cross-tenant on purpose ──────────────
  * Every other route in this app is scoped to one organisation. This one lists
@@ -73,6 +74,11 @@ const listQuery = z.object({
   search: z.string().trim().max(120).optional(),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(100).default(25),
+  deleted: z.enum(['exclude', 'only']).default('exclude'),
+});
+
+const organizationStatusSchema = z.object({
+  status: z.enum(['ACTIVE', 'TRIAL', 'SUSPENDED']),
 });
 
 /**
@@ -87,7 +93,7 @@ serviceRoutes.get(
 
     const rows = await prismaUnscoped.organization.findMany({
       where: {
-        deletedAt: null,
+        deletedAt: dto.deleted === 'only' ? { not: null } : null,
         ...(dto.search
           ? {
               OR: [
@@ -99,7 +105,7 @@ serviceRoutes.get(
           : {}),
       },
       select: {
-        id: true, name: true, slug: true, businessType: true, status: true,
+        id: true, name: true, slug: true, businessType: true, status: true, deletedAt: true,
         email: true, phone: true, country: true, currency: true, timezone: true,
         createdAt: true,
         memberships: {
@@ -157,6 +163,7 @@ serviceRoutes.get(
         slug: o.slug,
         businessType: o.businessType,
         status: o.status,
+        deletedAt: o.deletedAt,
         email: o.email,
         phone: o.phone,
         country: o.country,
@@ -194,6 +201,123 @@ serviceRoutes.get(
     });
   }),
 );
+
+/** Suspend/reactivate an organisation without destroying its data. */
+serviceRoutes.patch(
+  '/organizations/:id/status',
+  validate({ body: organizationStatusSchema }),
+  wrap(async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await prismaUnscoped.organization.findFirst({
+      where: { id, deletedAt: null },
+      select: {
+        id: true, name: true,
+        memberships: {
+          where: { deletedAt: null, isActive: true },
+          select: { user: { select: { email: true } } },
+        },
+      },
+    });
+    if (!existing) throw new NotFoundError('Organization');
+
+    const organization = await prismaUnscoped.organization.update({
+      where: { id },
+      data: { status: req.body.status },
+      select: { id: true, name: true, status: true, updatedAt: true },
+    });
+    logger.info({ organizationId: id, status: organization.status }, 'service API: organization status changed');
+    const suspended = organization.status === 'SUSPENDED';
+    await Promise.all(existing.memberships.map(({ user }) => mailer.sendNotice(
+      user.email,
+      suspended ? `${existing.name} has been suspended` : `${existing.name} has been reactivated`,
+      suspended ? 'Organisation suspended' : 'Organisation reactivated',
+      suspended
+        ? `<p>Your organisation <b>${existing.name}</b> has been suspended by the platform administrator. Access is currently unavailable. Contact support if you believe this is an error.</p>`
+        : `<p>Your organisation <b>${existing.name}</b> has been reactivated. You can sign in and continue using Vhicasar Hub AI.</p>`,
+      suspended
+        ? `${existing.name} has been suspended. Access is unavailable until it is reactivated.`
+        : `${existing.name} has been reactivated. You can access Vhicasar Hub AI again.`,
+      { organizationId: id },
+    ))).catch((error) => logger.warn({ error, organizationId: id }, 'organization status email failed'));
+    res.json({ success: true, data: organization });
+  }),
+);
+
+/**
+ * Soft-delete an organisation. Memberships are disabled and billable
+ * subscriptions cancelled, while tenant data remains recoverable in storage.
+ */
+serviceRoutes.delete(
+  '/organizations/:id',
+  wrap(async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await prismaUnscoped.organization.findFirst({
+      where: { id, deletedAt: null },
+      select: {
+        id: true, name: true,
+        memberships: {
+          where: { deletedAt: null, isActive: true },
+          select: { user: { select: { email: true } } },
+        },
+      },
+    });
+    if (!existing) throw new NotFoundError('Organization');
+
+    const now = new Date();
+    // Prevent another external renewal before changing local subscription
+    // state. Gateway cancellation is best-effort, consistent with the normal
+    // customer-initiated cancellation flow.
+    const billable = await prismaUnscoped.subscription.findMany({
+      where: { organizationId: id, status: { in: ['TRIALING', 'ACTIVE', 'PAST_DUE'] } },
+      select: { provider: true, providerSubscriptionCode: true },
+    });
+    try {
+      const provider = getActivePaymentProvider();
+      await Promise.all(
+        billable
+          .filter((subscription) =>
+            subscription.provider === provider.name && subscription.providerSubscriptionCode)
+          .map((subscription) => provider.disableSubscription(subscription.providerSubscriptionCode!)),
+      );
+    } catch (error) {
+      logger.warn({ error, organizationId: id }, 'service API: gateway subscription cancellation failed');
+    }
+    await prismaUnscoped.$transaction([
+      prismaUnscoped.organization.update({
+        where: { id },
+        data: { status: 'CANCELLED', deletedAt: now },
+      }),
+      prismaUnscoped.membership.updateMany({
+        where: { organizationId: id, deletedAt: null },
+        data: { isActive: false, deletedAt: now },
+      }),
+      prismaUnscoped.subscription.updateMany({
+        where: { organizationId: id, status: { in: ['TRIALING', 'ACTIVE', 'PAST_DUE'] } },
+        data: { status: 'CANCELLED', cancelAtPeriodEnd: false, cancelledAt: now },
+      }),
+    ]);
+    logger.info({ organizationId: id, name: existing.name }, 'service API: organization soft-deleted');
+    await Promise.all(existing.memberships.map(({ user }) => mailer.sendNotice(
+      user.email,
+      `${existing.name} has been deleted`,
+      'Organisation deleted',
+      `<p>Your organisation <b>${existing.name}</b> has been deleted by the platform administrator. Access has been disabled. Contact support if you believe this is an error.</p>`,
+      `${existing.name} has been deleted and access has been disabled. Contact support if this was unexpected.`,
+      { organizationId: id },
+    ))).catch((error) => logger.warn({ error, organizationId: id }, 'organization deletion email failed'));
+    res.json({ success: true, data: { deleted: true, id } });
+  }),
+);
+
+/** Second-stage irreversible deletion of an already soft-deleted account. */
+serviceRoutes.delete('/organizations/:id/permanent', wrap(async (req, res) => {
+  const id = req.params.id as string;
+  const existing = await prismaUnscoped.organization.findFirst({ where: { id, deletedAt: { not: null } } });
+  if (!existing) throw new NotFoundError('Deleted organization');
+  await prismaUnscoped.organization.delete({ where: { id } });
+  logger.warn({ organizationId: id, name: existing.name }, 'service API: organization permanently deleted');
+  res.json({ success: true, data: { permanentlyDeleted: true, id } });
+}));
 
 /** One organisation, same shape as the list. */
 serviceRoutes.get(

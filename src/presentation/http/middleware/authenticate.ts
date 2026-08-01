@@ -43,6 +43,20 @@ export const authenticate: RequestHandler = async (req, _res, next) => {
     next(new UnauthorizedError('Account is not active', 'ACCOUNT_INACTIVE'));
     return;
   }
+  if (payload.org) {
+    const organization = await prismaUnscoped.organization.findUnique({
+      where: { id: payload.org },
+      select: { status: true, deletedAt: true },
+    });
+    if (!organization || organization.deletedAt || organization.status === 'CANCELLED') {
+      next(new UnauthorizedError('Organization is no longer active', 'ORGANIZATION_INACTIVE'));
+      return;
+    }
+    if (organization.status === 'SUSPENDED') {
+      next(new UnauthorizedError('Organization has been suspended. Contact support.', 'ORGANIZATION_SUSPENDED'));
+      return;
+    }
+  }
 
   req.auth = {
     userId: payload.sub,

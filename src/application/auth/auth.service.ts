@@ -110,11 +110,32 @@ async function buildSession(
       userId,
       isActive: true,
       deletedAt: null,
+      organization: { deletedAt: null, status: { in: ['ACTIVE', 'TRIAL'] } },
       ...(organizationId ? { organizationId } : {}),
     },
     orderBy: { createdAt: 'asc' },
     include: { organization: { select: { id: true, name: true, slug: true, businessType: true, logoFileId: true } } },
   });
+
+  if (!membership && !user.isSuperAdmin) {
+    const unavailable = await prismaUnscoped.membership.findFirst({
+      where: { userId, ...(organizationId ? { organizationId } : {}) },
+      orderBy: { createdAt: 'asc' },
+      select: { organization: { select: { name: true, status: true, deletedAt: true } } },
+    });
+    if (unavailable?.organization.deletedAt || unavailable?.organization.status === 'CANCELLED') {
+      throw new UnauthorizedError(
+        `${unavailable.organization.name} has been deleted by the platform administrator. Contact support if this was unexpected.`,
+        'ORGANIZATION_DELETED',
+      );
+    }
+    if (unavailable?.organization.status === 'SUSPENDED') {
+      throw new UnauthorizedError(
+        `${unavailable.organization.name} has been suspended by the platform administrator. Contact support for assistance.`,
+        'ORGANIZATION_SUSPENDED',
+      );
+    }
+  }
 
   const accessToken = tokenService.signAccessToken({
     sub: user.id,
