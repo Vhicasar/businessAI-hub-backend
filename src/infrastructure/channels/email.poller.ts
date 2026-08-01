@@ -22,6 +22,7 @@ interface EmailCreds {
 interface EmailSyncMetadata extends Record<string, unknown> {
   syncSince?: string;
   lastUid?: number;
+  uidValidity?: string;
 }
 
 /**
@@ -133,20 +134,33 @@ async function pollAccount(account: {
       // integrations to Primary at the server; generic IMAP providers are
       // filtered below using standard recipient and automation headers.
       const searchQuery = client.capabilities.has('X-GM-EXT-1')
-        ? { since: watermark, gmraw: 'category:primary' }
+        ? { since: watermark }
         : { since: watermark };
-      const found = await client.search(searchQuery);
+      // ImapFlow returns sequence numbers by default. Every fetch/download
+      // below is UID-based, so the search must explicitly return UIDs too.
+      // Mixing these two number spaces silently skipped valid incoming mail.
+      const found = await client.search(searchQuery, { uid: true });
+      const uidValidity = String(client.mailbox && client.mailbox.uidValidity ? client.mailbox.uidValidity : '');
+      const cursorStillValid = !meta.uidValidity || !uidValidity || meta.uidValidity === uidValidity;
       const lastUid = typeof meta.lastUid === 'number' && Number.isSafeInteger(meta.lastUid)
-        ? meta.lastUid
+        && cursorStillValid ? meta.lastUid
         : 0;
       const uids = (Array.isArray(found) ? found : [])
         .filter((uid): uid is number => typeof uid === 'number' && uid > lastUid)
         .sort((a, b) => a - b);
-      if (uids.length === 0) return;
+      if (uids.length === 0) {
+        if (meta.uidValidity !== uidValidity) {
+          await saveSyncMetadata(account.id, meta, { uidValidity, lastUid, lastPolledAt: new Date().toISOString() });
+        }
+        logger.debug({ accountId: account.id, watermark, lastUid }, 'Email poll completed — no new messages');
+        return;
+      }
 
       // Oldest first so the cursor can advance without skipping an older mail
       // when a backlog is larger than one batch.
       let processedThroughUid = lastUid;
+      let imported = 0;
+      let skipped = 0;
       for (const uid of uids.slice(0, 30)) {
         const envelope = await client.fetchOne(
           String(uid),
@@ -158,12 +172,14 @@ async function pollAccount(account: {
           : null;
         if (receivedAt && !Number.isNaN(receivedAt.getTime()) && receivedAt < watermark) {
           processedThroughUid = uid;
+          skipped += 1;
           continue;
         }
 
         const raw = await client.download(String(uid), undefined, { uid: true });
         if (!raw?.content) {
           processedThroughUid = uid;
+          skipped += 1;
           continue;
         }
         const parsed = await simpleParser(raw.content);
@@ -178,6 +194,7 @@ async function pollAccount(account: {
           || isAutomatedEmail(parsed, fromAddress)
         ) {
           processedThroughUid = uid;
+          skipped += 1;
           continue;
         }
 
@@ -200,14 +217,17 @@ async function pollAccount(account: {
               }
             )
         );
+        imported += 1;
         processedThroughUid = uid;
       }
       if (processedThroughUid > lastUid) {
         await saveSyncMetadata(account.id, meta, {
           lastUid: processedThroughUid,
+          uidValidity,
           lastPolledAt: new Date().toISOString(),
         });
       }
+      logger.info({ accountId: account.id, found: uids.length, imported, skipped, processedThroughUid }, 'Email inbound poll completed');
     } finally {
       lock.release();
     }
@@ -254,6 +274,11 @@ async function pollAll(): Promise<void> {
   } finally {
     running = false;
   }
+}
+
+/** Run one complete sync immediately (manual recovery / diagnostics). */
+export async function pollEmailInboundNow(): Promise<void> {
+  await pollAll();
 }
 
 export function startEmailInboundPoller(): void {
