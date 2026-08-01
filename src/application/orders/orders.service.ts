@@ -9,6 +9,8 @@ import { workflowService } from '../crm/workflow.service';
 import { orderNotifyService } from '../notifications/order-notify.service';
 import { exchangeRates } from '../../shared/exchange-rates';
 import type { CreateOrderDto, ListOrdersDto, RecordPaymentDto, TransitionDto } from './orders.dto';
+import { validateCoupon } from '../marketing/promotions.service';
+import { awardOrderPoints } from '../marketing/loyalty.service';
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
@@ -43,7 +45,7 @@ const listSelect = {
   currency: true,
   total: true,
   createdAt: true,
-  customer: { select: { id: true, firstName: true, lastName: true } },
+  customer: { select: { id: true, firstName: true, lastName: true, email: true, phone: true } },
   _count: { select: { items: true } },
 } as const;
 
@@ -191,6 +193,8 @@ export const ordersService = {
       );
       convertedVariantPrices.set(variant.id, converted.amount);
     }));
+    const couponBase = round2(dto.items.reduce((sum, item) => sum + (item.unitPrice ?? convertedVariantPrices.get(item.variantId) ?? 0) * item.quantity, 0));
+    const couponResult = dto.couponCode ? await validateCoupon(dto.couponCode, couponBase, dto.customerId) : null;
 
     const created = await prisma.$transaction(async (tx) => {
       // Reserve stock (row-by-row so error messages are precise).
@@ -237,7 +241,8 @@ export const ordersService = {
           total: round2(lineNet + lineTax),
         };
       });
-      const total = round2(subtotal + taxTotal + dto.shippingTotal);
+      const discountTotal = couponResult?.discount ?? 0;
+      const total = round2(Math.max(0, subtotal + taxTotal + dto.shippingTotal - discountTotal));
 
       const order = await tx.order.create({
         data: {
@@ -252,8 +257,9 @@ export const ordersService = {
           subtotal,
           taxTotal,
           shippingTotal: dto.shippingTotal,
-          discountTotal: 0,
+          discountTotal,
           total,
+          couponCode: couponResult?.coupon.code ?? null,
           notes: dto.notes ?? null,
           placedById: actorMembershipId,
           items: { create: itemRows },
@@ -261,6 +267,10 @@ export const ordersService = {
         },
         select: detailSelect,
       });
+      if (couponResult) {
+        await tx.couponRedemption.create({ data: { couponId: couponResult.coupon.id, orderId: order.id, customerId: dto.customerId, amount: discountTotal } });
+        await tx.coupon.update({ where: { id: couponResult.coupon.id }, data: { usedCount: { increment: 1 } } });
+      }
       return order;
     });
     await activityService.record({
@@ -487,6 +497,7 @@ export const ordersService = {
             lastOrderAt: new Date(),
           },
         });
+        await awardOrderPoints(tx, order.customerId, Number(order.total), order.id);
       }
       return updated;
     });

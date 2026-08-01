@@ -154,6 +154,7 @@ export const catalogService = {
               OR: [
                 { name: { contains: dto.search, mode: 'insensitive' as const } },
                 { variants: { some: { sku: { contains: dto.search, mode: 'insensitive' as const } } } },
+                { variants: { some: { barcode: { contains: dto.search, mode: 'insensitive' as const } } } },
               ],
             }
           : {}),

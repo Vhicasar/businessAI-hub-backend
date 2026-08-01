@@ -128,7 +128,7 @@ webchatRoutes.post(
           });
           if (identity) {
             await prisma.customer
-              .update({ where: { id: identity.customerId }, data: { email: req.body.email } })
+              .update({ where: { id: identity.customerId }, data: { email: req.body.email, isProvisional: false } })
               .catch(() => undefined); // duplicate email — keep identity link only
           }
         }

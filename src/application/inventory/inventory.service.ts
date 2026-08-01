@@ -171,6 +171,7 @@ export const inventoryService = {
             ? {
                 OR: [
                   { sku: { contains: dto.search, mode: 'insensitive' as const } },
+                  { barcode: { contains: dto.search, mode: 'insensitive' as const } },
                   { product: { name: { contains: dto.search, mode: 'insensitive' as const } } },
                 ],
               }
@@ -187,6 +188,7 @@ export const inventoryService = {
           select: {
             id: true,
             sku: true,
+            barcode: true,
             name: true,
             price: true,
             product: { select: { id: true, name: true } },

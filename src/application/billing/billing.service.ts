@@ -113,7 +113,7 @@ export const billingService = {
       usageService.get(USAGE_METRICS.AI_RESPONSE, period),
       prismaUnscoped.membership.count({ where: { organizationId: orgId, isActive: true, deletedAt: null } }),
       prismaUnscoped.channelAccount.count({ where: { organizationId: orgId, deletedAt: null } }),
-      prismaUnscoped.customer.count({ where: { organizationId: orgId, deletedAt: null } }),
+      prismaUnscoped.customer.count({ where: { organizationId: orgId, deletedAt: null, isProvisional: false } }),
       prismaUnscoped.product.count({ where: { organizationId: orgId } }),
       smsWalletService.usage(orgId, ent.periodStart, ent.periodEnd),
       usageService.get(USAGE_METRICS.MARKETING_RECIPIENT, period),

@@ -23,6 +23,7 @@ export const createOrderSchema = z.object({
     .default('MANUAL'),
   notes: z.string().trim().max(2000).nullable().optional(),
   shippingTotal: z.coerce.number().nonnegative().default(0),
+  couponCode: z.string().trim().max(40).optional(),
   items: z
     .array(
       z.object({

@@ -40,10 +40,25 @@ const customTemplateSchema = z.object({
   defaultDueInDays: z.coerce.number().int().min(0).max(365).optional(),
 });
 
+const receiptTemplateSchema = z.object({
+  id: z.string().trim().min(1).max(60),
+  name: z.string().trim().min(1).max(80),
+  description: z.string().trim().max(200).optional().default(''),
+  accent: z.string().trim().regex(/^#?[0-9a-fA-F]{6}$/, 'Use a hex colour like #f97316'),
+  layout: z.enum(['classic', 'compact', 'modern', 'elegant', 'bold']).default('classic'),
+  font: z.enum(['sans', 'serif', 'mono']).default('sans'),
+  footer: z.string().trim().max(600).optional(),
+  showCustomer: z.boolean().default(true),
+  showSku: z.boolean().default(true),
+  paperWidth: z.enum(['80mm', '58mm', 'a4']).default('80mm'),
+});
+
 export const invoiceSettingsSchema = z.object({
   defaultTemplateId: z.string().trim().min(1).max(60).default('classic'),
   business: businessSchema.default({}),
   customTemplates: z.array(customTemplateSchema).max(50).default([]),
+  defaultReceiptTemplateId: z.string().trim().min(1).max(60).default('receipt-classic'),
+  customReceiptTemplates: z.array(receiptTemplateSchema).max(50).default([]),
 });
 
 export type InvoiceSettingsDto = z.infer<typeof invoiceSettingsSchema>;
@@ -110,6 +125,8 @@ export const settingsService = {
         footer: stored?.business?.footer,
       },
       customTemplates: stored?.customTemplates ?? [],
+      defaultReceiptTemplateId: stored?.defaultReceiptTemplateId ?? 'receipt-classic',
+      customReceiptTemplates: stored?.customReceiptTemplates ?? [],
     };
   },
 

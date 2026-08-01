@@ -91,6 +91,7 @@ export const inboxService = {
           firstName: firstName || 'Unknown',
           lastName: rest.join(' ') || null,
           displayName,
+          isProvisional: account.channelType === 'WEB_CHAT' && /^(website visitor|visitor|guest|anonymous)$/i.test(displayName.trim()),
           lastContactAt: new Date(),
         },
       });

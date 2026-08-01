@@ -47,7 +47,7 @@ async function conversationTranscript(conversationId: string, limit = 50) {
       customer: {
         select: {
           id: true, firstName: true, lastName: true, lifetimeValue: true,
-          totalOrders: true, aiSummary: true, email: true, phone: true,
+          totalOrders: true, aiSummary: true, email: true, phone: true, customFields: true,
         },
       },
       channelAccount: { select: { channelType: true } },
@@ -137,7 +137,7 @@ function channelToOrderSource(channelType?: string): 'WHATSAPP' | 'INSTAGRAM' | 
   }
 }
 
-async function createDraftOrder(customerId: string, items: { name?: string; quantity?: number }[], channelType?: string) {
+async function createDraftOrder(customerId: string, items: { name?: string; quantity?: number }[], channelType?: string, couponCode?: string) {
   const lines: { variantId: string; quantity: number }[] = [];
   for (const it of items) {
     const name = (it.name ?? '').trim();
@@ -157,15 +157,16 @@ async function createDraftOrder(customerId: string, items: { name?: string; quan
   const recent = await prisma.order.findFirst({
     where: { customerId, status: 'PENDING', createdAt: { gte: new Date(Date.now() - 5 * 60_000) } },
     orderBy: { createdAt: 'desc' },
-    select: { number: true, total: true, currency: true, items: { select: { variantId: true, quantity: true } } },
+    select: { number: true, total: true, currency: true, couponCode: true, items: { select: { variantId: true, quantity: true } } },
   });
   const sameCart =
     recent &&
+    (recent.couponCode ?? '') === (couponCode?.trim().toUpperCase() ?? '') &&
     recent.items.length === lines.length &&
     lines.every((l) => recent.items.some((r) => r.variantId === l.variantId && Number(r.quantity) === l.quantity));
   if (sameCart) return recent;
 
-  return ordersService.create({ customerId, source: channelToOrderSource(channelType), items: lines, shippingTotal: 0 }, null);
+  return ordersService.create({ customerId, source: channelToOrderSource(channelType), items: lines, shippingTotal: 0, couponCode: couponCode?.trim().toUpperCase() || undefined }, null);
 }
 
 export const aiService = {
@@ -430,6 +431,24 @@ export const aiService = {
       })
       .join('\n');
 
+    // Only show offers that are valid now. Coupon limits and customer-specific
+    // eligibility are still enforced atomically by ordersService at creation.
+    const now = new Date();
+    const [coupons, promotions] = await Promise.all([
+      prisma.coupon.findMany({
+        where: { isActive: true, AND: [{ OR: [{ startsAt: null }, { startsAt: { lte: now } }] }, { OR: [{ expiresAt: null }, { expiresAt: { gte: now } }] }] },
+        select: { code: true, description: true, discountType: true, discountValue: true, minOrderAmount: true }, take: 12,
+      }),
+      prisma.promotion.findMany({
+        where: { status: 'ACTIVE', startsAt: { lte: now }, endsAt: { gte: now } },
+        select: { name: true, description: true, discountType: true, discountValue: true, appliesTo: true }, take: 12,
+      }),
+    ]);
+    const offersCtx = [
+      ...coupons.map((c) => `- Code ${c.code}: ${c.description || `${Number(c.discountValue)} ${c.discountType === 'PERCENTAGE' ? '% off' : 'off'}`}${c.minOrderAmount ? ` (minimum ${Number(c.minOrderAmount)})` : ''}`),
+      ...promotions.map((p) => `- ${p.name}: ${p.description || `${Number(p.discountValue)} ${p.discountType === 'PERCENTAGE' ? '% off' : 'off'}`} · appliesTo=${JSON.stringify(p.appliesTo ?? { scope: 'ALL' })}`),
+    ].join('\n');
+
     // Appointment availability, so the assistant can offer real slots and book
     // on ANY channel (spec #12) — not just the web-chat widget. Kept to a handful
     // of upcoming slots with their exact ISO start so booking is unambiguous.
@@ -480,8 +499,11 @@ export const aiService = {
             'under 70 words and match the customer\'s language.\n' +
             `The customer's known name is: ${knownName || 'unknown'}. If unknown, warmly greet them ` +
             'and ask their preferred name (still help with their question in the same message). When ' +
-            'the customer shares their name, email, or phone, you MUST return it in "save" so we ' +
-            'store it to their profile. Once you know their name, address them by it naturally.\n' +
+            'the customer shares their name, email, phone, address, company, birthday, preferences, ' +
+            'or another useful profile detail, you MUST return it in "save" so we store it. Put ' +
+            'non-contact fields in save.details as short string/number/boolean values. Split a full ' +
+            'name naturally. Never infer details the customer did not actually provide. Once you know ' +
+            'their name, address them by it naturally.\n' +
             'If the KNOWLEDGE below is empty or does not cover the question, still reply ' +
             'warmly and conversationally (greet, ask their name, ask what they are looking for) — ' +
             'do NOT tell the customer you lack information or business details. Only when they ask a ' +
@@ -492,7 +514,12 @@ export const aiService = {
             'do NOT include "order" in this message; (2) ONLY in a LATER message, after the customer ' +
             'explicitly confirms (e.g. "yes", "confirm", "go ahead") the order you just quoted, ' +
             'include "order.items" as [{"name","quantity"}] using exact PRODUCTS names. Never quote ' +
-            'and place in the same message. If unsure whether they confirmed, ask again and omit "order".\n' +
+            'and place in the same message. Before asking for final confirmation, ask once whether they ' +
+            'have a promo/coupon/voucher code, unless they already supplied one. If they give a code, ' +
+            'match it case-insensitively against OFFERS and include it as order.couponCode only when ' +
+            'placing the later confirmed order. Mention relevant active promotions from OFFERS without ' +
+            'inventing eligibility. If a supplied code is absent from OFFERS, explain it cannot be ' +
+            'verified and ask them to check it. If unsure whether they confirmed, ask again and omit "order".\n' +
             'APPOINTMENTS: when the customer wants to book/schedule an appointment, viewing, or ' +
             'consultation, offer the available times from APPOINTMENTS below in the customer\'s words ' +
             '(their local, friendly time) and ask which works — do NOT include "booking" yet. ONLY in a ' +
@@ -501,12 +528,13 @@ export const aiService = {
             'email/phone if known, and confirm in "reply". Never offer times not listed. If APPOINTMENTS ' +
             'says booking is unavailable, do not promise a booking — offer to connect them to the team.\n' +
             'Respond with JSON only. Shape: {"handoff": <bool>, "reply": "<text>", ' +
-            '"save"?: {"name"?, "email"?, "phone"?}, "order"?: {"items": [{"name", "quantity"}]}, ' +
+            '"save"?: {"name"?, "email"?, "phone"?, "details"?: {"field": "value"}}, "order"?: {"items": [{"name", "quantity"}], "couponCode"?}, ' +
             '"ticket"?: {"subject": "<short>", "priority": "LOW|MEDIUM|HIGH|URGENT"}, ' +
             '"booking"?: {"start": "<ISO from a listed slot>", "typeId"?, "notes"?}}. ' +
             'ALWAYS include a friendly "reply", even when handoff is true.\n\n' +
             `KNOWLEDGE:\n${knowledge || '(none retrieved for this message)'}\n\n` +
             `PRODUCTS:\n${productsCtx || '(no products available)'}\n\n` +
+            `OFFERS:\n${offersCtx || '(no active offers)'}\n\n` +
             `APPOINTMENTS:\n${apptCtx}`,
         },
         {
@@ -520,8 +548,8 @@ export const aiService = {
     const parsed = extractJson<{
       handoff?: boolean;
       reply?: string;
-      save?: { name?: string; email?: string; phone?: string };
-      order?: { items?: { name?: string; quantity?: number }[] };
+      save?: { name?: string; email?: string; phone?: string; details?: Record<string, string | number | boolean> };
+      order?: { items?: { name?: string; quantity?: number }[]; couponCode?: string };
       ticket?: { subject?: string; priority?: string };
       booking?: { start?: string; typeId?: string; notes?: string };
     }>(raw);
@@ -549,7 +577,7 @@ export const aiService = {
     // Place a draft order when the customer has confirmed their picks.
     if (parsed.order?.items?.length) {
       try {
-        const order = await createDraftOrder(conversation.customer.id, parsed.order.items, conversation.channelAccount.channelType);
+        const order = await createDraftOrder(conversation.customer.id, parsed.order.items, conversation.channelAccount.channelType, parsed.order.couponCode);
         reply +=
           `\n\n✅ Draft order ${order.number} created — ${order.currency} ` +
           `${Number(order.total).toLocaleString()} total. Our team will confirm it shortly.`;
@@ -639,14 +667,24 @@ export const aiService = {
 
     // Persist any customer details the visitor shared during the chat.
     if (parsed.save) {
-      const data: { firstName?: string; displayName?: string; email?: string; phone?: string } = {};
+      const data: { firstName?: string; lastName?: string | null; displayName?: string; email?: string; phone?: string; customFields?: Record<string, unknown>; isProvisional?: boolean } = {};
       const name = parsed.save.name?.trim();
       if (name) {
-        data.firstName = name;
+        const [firstName, ...last] = name.split(/\s+/);
+        data.firstName = firstName;
+        data.lastName = last.join(' ') || null;
         data.displayName = name;
       }
       if (parsed.save.email?.trim()) data.email = parsed.save.email.trim().toLowerCase();
       if (parsed.save.phone?.trim()) data.phone = parsed.save.phone.trim();
+      if (parsed.save.details && typeof parsed.save.details === 'object') {
+        const existing = (conversation.customer.customFields as Record<string, unknown> | null) ?? {};
+        const safe = Object.fromEntries(Object.entries(parsed.save.details).filter(([key, value]) => /^[a-zA-Z][a-zA-Z0-9 _-]{0,39}$/.test(key) && ['string', 'number', 'boolean'].includes(typeof value)).slice(0, 20));
+        if (Object.keys(safe).length) data.customFields = { ...existing, ...safe };
+      }
+      // A provisional website visitor becomes a real customer only after the
+      // customer explicitly supplies at least one useful profile detail.
+      if (name || parsed.save.email?.trim() || parsed.save.phone?.trim() || data.customFields) data.isProvisional = false;
       if (Object.keys(data).length > 0) {
         await prisma.customer
           .update({ where: { id: conversation.customer.id }, data })

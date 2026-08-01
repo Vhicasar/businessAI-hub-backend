@@ -139,7 +139,7 @@ export const campaignService = {
 
   async reachableCustomers(channel: ChannelType) {
     // Marketing consent is mandatory — never message customers who opted out.
-    const base = { deletedAt: null, isBlocked: false, marketingOptIn: true };
+    const base = { deletedAt: null, isProvisional: false, isBlocked: false, marketingOptIn: true };
     if (channel === 'EMAIL') {
       return prisma.customer.findMany({
         where: { ...base, email: { not: null } },

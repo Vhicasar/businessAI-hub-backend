@@ -50,7 +50,7 @@ const SEARCHERS: Searcher[] = [
     type: 'customer', perms: ['customers.read'],
     async run(q, take) {
       const rows = await prisma.customer.findMany({
-        where: { deletedAt: null, OR: [{ firstName: ci(q) }, { lastName: ci(q) }, { email: ci(q) }, { phone: ci(q) }] },
+        where: { deletedAt: null, isProvisional: false, OR: [{ firstName: ci(q) }, { lastName: ci(q) }, { email: ci(q) }, { phone: ci(q) }] },
         select: { id: true, firstName: true, lastName: true, email: true }, take, orderBy: { updatedAt: 'desc' },
       });
       return rows.map((r) => ({ type: 'customer' as const, id: r.id, title: name(r.firstName, r.lastName), subtitle: r.email }));

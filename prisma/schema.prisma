@@ -849,6 +849,7 @@ model Customer {
   lastContactAt  DateTime?
   marketingOptIn Boolean   @default(true)
   isBlocked      Boolean   @default(false)
+  isProvisional  Boolean   @default(false) // anonymous web-chat identity; promoted when contact details are saved
   customFields   Json?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
@@ -879,6 +880,7 @@ model Customer {
   @@unique([organizationId, email])
   @@unique([organizationId, phone])
   @@index([organizationId, createdAt])
+  @@index([organizationId, isProvisional])
   @@index([companyId])
 }
 

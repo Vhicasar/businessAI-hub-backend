@@ -650,7 +650,7 @@ export async function exportEntity(entity: Entity): Promise<{ filename: string; 
     // Exports mirror the import fields, so an export can be edited and re-imported.
     case 'customers': {
       const rows = await prisma.customer.findMany({
-        where: { deletedAt: null },
+        where: { deletedAt: null, isProvisional: false },
         select: {
           id: true, firstName: true, lastName: true, email: true, phone: true, language: true,
           marketingOptIn: true, isBlocked: true, customFields: true,
