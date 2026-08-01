@@ -213,6 +213,7 @@ async function pollAccount(account: {
                 senderDisplayName: parsed.from?.value?.[0]?.name || fromAddress,
                 contentType: 'TEXT',
                 text,
+                subject: subject || undefined,
                 sentAt: parsed.date ?? receivedAt ?? undefined,
               }
             )

@@ -85,16 +85,25 @@ export const inboxService = {
     if (!identity) {
       const displayName = inbound.senderDisplayName ?? `Customer ${inbound.senderExternalId}`;
       const [firstName, ...rest] = displayName.split(' ');
-      const customer = await prisma.customer.create({
-        data: {
-          organizationId: account.organizationId,
-          firstName: firstName || 'Unknown',
-          lastName: rest.join(' ') || null,
-          displayName,
-          isProvisional: account.channelType === 'WEB_CHAT' && /^(website visitor|visitor|guest|anonymous)$/i.test(displayName.trim()),
-          lastContactAt: new Date(),
-        },
-      });
+      const senderEmail = account.channelType === 'EMAIL' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(inbound.senderExternalId)
+        ? inbound.senderExternalId.trim().toLowerCase()
+        : null;
+      // An email address is a stable customer identity. Reuse a CRM customer
+      // that already has it instead of creating a duplicate contact.
+      let customer = senderEmail
+        ? await prisma.customer.findFirst({ where: { email: senderEmail, deletedAt: null } })
+        : null;
+      customer ??= await prisma.customer.create({
+          data: {
+            organizationId: account.organizationId,
+            firstName: firstName || 'Unknown',
+            lastName: rest.join(' ') || null,
+            displayName,
+            email: senderEmail,
+            isProvisional: account.channelType === 'WEB_CHAT' && /^(website visitor|visitor|guest|anonymous)$/i.test(displayName.trim()),
+            lastContactAt: new Date(),
+          },
+        });
       identity = await prisma.customerIdentity.create({
         data: {
           organizationId: account.organizationId,
@@ -106,6 +115,20 @@ export const inboxService = {
         },
         include: { customer: true },
       });
+    }
+
+    // Backfill contacts created by older versions where the sender address was
+    // kept only in CustomerIdentity.externalId.
+    if (
+      account.channelType === 'EMAIL'
+      && !identity.customer.email
+      && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(inbound.senderExternalId)
+    ) {
+      const email = inbound.senderExternalId.trim().toLowerCase();
+      await prisma.customer.update({ where: { id: identity.customerId }, data: { email } }).catch((err) =>
+        logger.warn({ err, customerId: identity!.customerId, email }, 'Could not backfill email customer address')
+      );
+      identity.customer.email = email;
     }
 
     let conversation = await prisma.conversation.findFirst({
@@ -122,6 +145,7 @@ export const inboxService = {
         channelAccountId: account.id,
         customerId: identity.customerId,
         status: 'OPEN',
+        subject: inbound.subject?.trim() || null,
       },
     });
 
@@ -152,6 +176,7 @@ export const inboxService = {
           status: conversation.status === 'RESOLVED' ? 'OPEN' : conversation.status,
           lastMessageAt: message.createdAt,
           lastMessageText: inbound.text?.slice(0, 200) ?? `[${inbound.contentType.toLowerCase()}]`,
+          ...(inbound.subject?.trim() ? { subject: inbound.subject.trim() } : {}),
           unreadCount: { increment: 1 },
         },
       }),
@@ -291,8 +316,16 @@ export const inboxService = {
 
     try {
       const adapter = getAdapter(conversation.channelAccount.channelType);
+      const originalSubject = conversation.subject?.trim();
+      const replySubject = originalSubject
+        ? (/^re\s*:/i.test(originalSubject) ? originalSubject : `Re: ${originalSubject}`)
+        : undefined;
       const result = await adapter.sendMessage(
-        { recipientExternalId: identity.externalId, text },
+        {
+          recipientExternalId: identity.externalId,
+          text,
+          ...(conversation.channelAccount.channelType === 'EMAIL' && replySubject ? { subject: replySubject } : {}),
+        },
         toAccountRef(conversation.channelAccount)
       );
       await prisma.message.update({

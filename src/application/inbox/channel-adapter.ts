@@ -9,6 +9,8 @@ export interface NormalizedInbound {
   senderDisplayName?: string;
   contentType: MessageContentType;
   text?: string;
+  /** Original thread subject for subject-based channels such as email. */
+  subject?: string;
   /** Direct media URL when the provider exposes one. */
   mediaUrl?: string;
   sentAt?: Date;
