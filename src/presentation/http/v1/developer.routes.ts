@@ -5,6 +5,7 @@ import { requirePermission } from '../middleware/require-permission';
 import { validate } from '../middleware/validate';
 import { apiKeysService, API_SCOPES } from '../../../application/api-keys/api-keys.service';
 import { webhooksService, WEBHOOK_EVENTS } from '../../../application/api-keys/webhooks.service';
+import { webhookDelivery } from '../../../application/api-keys/webhook-delivery.service';
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<void>): RequestHandler =>
@@ -94,5 +95,34 @@ developerRoutes.delete(
   requirePermission('webhooks.delete'),
   wrap(async (req, res) => {
     res.json({ success: true, data: await webhooksService.remove(req.params.id as string) });
+  })
+);
+
+/** Delivery log — what we sent, what came back, what is still retrying. */
+developerRoutes.get(
+  '/webhooks/deliveries',
+  requirePermission('webhooks.read'),
+  validate({
+    query: z.object({
+      event: z.string().trim().max(60).optional(),
+      status: z.enum(['PENDING', 'DELIVERED', 'FAILED']).optional(),
+      cursor: z.string().optional(),
+      limit: z.coerce.number().int().min(1).max(100).default(30),
+    }),
+  }),
+  wrap(async (req, res) => {
+    const q = req.query as unknown as { event?: string; status?: string; cursor?: string; limit: number };
+    const data = await webhookDelivery.list(req.auth!.organizationId as string, q);
+    res.json({ success: true, data });
+  })
+);
+
+/** Re-send a past delivery (new delivery id, same payload). */
+developerRoutes.post(
+  '/webhooks/deliveries/:id/replay',
+  requirePermission('webhooks.update'),
+  wrap(async (req, res) => {
+    await webhookDelivery.replay(req.auth!.organizationId as string, req.params.id as string);
+    res.json({ success: true, data: { message: 'Delivery replayed' } });
   })
 );

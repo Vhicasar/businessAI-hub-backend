@@ -13,6 +13,16 @@ import { startPaymentConfigSync } from './application/billing/payment-config-syn
 import { startEmailRetrySweep } from './application/auth/email-retry.service';
 import { startWorkspaceConfigSync } from './application/settings/workspace-config-sync';
 import { startAppointmentReminderSweep } from './application/appointments/appointments.service';
+import { startEventDispatcher } from './application/events/event-dispatcher';
+import { registerCoreSubscribers } from './application/events/subscribers';
+import {
+  startNoncePurge,
+  startPayoutReconciliation,
+  startRewardExpiry,
+  startSettlementRuns,
+} from './application/payments/payout-sweeps';
+import { startWebhookRetrySweep } from './application/api-keys/webhook-delivery.service';
+import { startPromotionNotifier } from './application/marketing/promotion-engine.service';
 import { reconcileSystemRolePermissions } from './application/roles/reconcile-permissions';
 import { closeQueues, queueEnabled } from './infrastructure/queue/queue';
 import { createApp } from './app';
@@ -44,6 +54,14 @@ async function bootstrap(): Promise<void> {
   startPlanSync(); // keep the plan catalog in sync with Vhicasar Admin
   startEmailRetrySweep(); // durably re-send verification emails that failed delivery
   startAppointmentReminderSweep(); // email appointment reminders as they come due
+  registerCoreSubscribers(); // wire domain-event handlers
+  startEventDispatcher(); // drain the DomainEvent outbox to the event bus
+  startPayoutReconciliation(); // resolve in-flight bank payouts if a webhook is missed
+  startNoncePurge(); // drop spent device-signature challenges
+  startWebhookRetrySweep(); // retry outbound webhook deliveries with backoff
+  startRewardExpiry(); // expire reward points past their window
+  startSettlementRuns(); // release settlements as their schedule comes due (§10)
+  startPromotionNotifier(); // push scheduled promotion notifications
   logger.info(
     queueEnabled()
       ? '📮 Queue mode: async — workflow & campaign jobs handed to the worker (run `npm run worker`)'

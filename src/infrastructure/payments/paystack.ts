@@ -4,6 +4,13 @@ import { logger } from '../../shared/logger';
 import { AppError } from '../../shared/errors';
 import { getPaymentConfig, type ResolvedPaymentConfig } from './config';
 import type {
+  BankOption,
+  CreateRecipientInput,
+  CreateRecipientResult,
+  PayoutCapableProvider,
+  TransferInput,
+  TransferResult,
+  TransferState,
   PaymentProvider,
   InitializeTxnInput,
   InitializeTxnResult,
@@ -39,7 +46,16 @@ interface PaystackEnvelope<T> {
   data: T;
 }
 
-export class PaystackClient implements PaymentProvider {
+/** Paystack transfer status → our normalized state. */
+function mapTransferStatus(status: string): TransferState {
+  const s = (status || '').toLowerCase();
+  if (s === 'success') return 'PAID';
+  if (s === 'failed' || s === 'abandoned') return 'FAILED';
+  if (s === 'reversed') return 'REVERSED';
+  return 'PENDING'; // pending | otp | received | processing
+}
+
+export class PaystackClient implements PaymentProvider, PayoutCapableProvider {
   readonly name = 'paystack' as const;
 
   /**
@@ -195,6 +211,67 @@ export class PaystackClient implements PaymentProvider {
     const a = Buffer.from(expected);
     const b = Buffer.from(signature);
     return a.length === b.length && timingSafeEqual(a, b);
+  }
+
+
+  // ---- Payouts (Transfers API) ----
+
+  async listBanks(country = 'nigeria'): Promise<BankOption[]> {
+    const data = await this.request<Array<{ name: string; code: string }>>(
+      `/bank?country=${encodeURIComponent(country.toLowerCase())}&perPage=100`
+    );
+    return data.map((b) => ({ name: b.name, code: b.code }));
+  }
+
+  async resolveAccount(accountNumber: string, bankCode: string): Promise<{ accountName: string } | null> {
+    try {
+      const data = await this.request<{ account_name: string }>(
+        `/bank/resolve?account_number=${encodeURIComponent(accountNumber)}&bank_code=${encodeURIComponent(bankCode)}`
+      );
+      return data?.account_name ? { accountName: data.account_name } : null;
+    } catch {
+      // A rejected lookup means "we can't confirm this account", not an outage.
+      return null;
+    }
+  }
+
+  async createRecipient(input: CreateRecipientInput): Promise<CreateRecipientResult> {
+    const data = await this.request<{ recipient_code: string; details?: { account_name?: string } }>(
+      '/transferrecipient',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          type: input.type === 'MOBILE_MONEY' ? 'mobile_money' : 'nuban',
+          name: input.accountName,
+          account_number: input.accountNumber,
+          bank_code: input.bankCode,
+          currency: input.currency.toUpperCase(),
+        }),
+      }
+    );
+    return { recipientRef: data.recipient_code, resolvedName: data.details?.account_name ?? null };
+  }
+
+  async initiateTransfer(input: TransferInput): Promise<TransferResult> {
+    const data = await this.request<{ transfer_code: string; status: string; reference?: string }>('/transfer', {
+      method: 'POST',
+      body: JSON.stringify({
+        source: 'balance',
+        amount: input.amount,
+        recipient: input.recipientRef,
+        reference: input.reference,
+        reason: input.reason ?? 'Vhicasar Pay payout',
+        currency: input.currency.toUpperCase(),
+      }),
+    });
+    return { providerRef: data.transfer_code, status: mapTransferStatus(data.status) };
+  }
+
+  async verifyTransfer(reference: string): Promise<TransferResult> {
+    const data = await this.request<{ transfer_code: string; status: string }>(
+      `/transfer/verify/${encodeURIComponent(reference)}`
+    );
+    return { providerRef: data.transfer_code, status: mapTransferStatus(data.status) };
   }
 
   parseWebhookEvent(body: unknown): NormalizedWebhookEvent {

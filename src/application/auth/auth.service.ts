@@ -25,6 +25,7 @@ import { resolveLocale } from '../../shared/currency';
 import { tokenService } from './token.service';
 import { filesService } from '../files/files.service';
 import type { CreateOrganizationDto, LoginDto, MfaVerifyDto, RegisterDto } from './auth.dto';
+import type { Prisma } from '@prisma/client';
 
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCK_MINUTES = 15;
@@ -93,7 +94,17 @@ async function buildSession(
   userId: string,
   meta: RequestMeta,
   organizationId?: string,
-  presetRefreshToken?: string
+  presetRefreshToken?: string,
+  /**
+   * Treat `organizationId` as a preference rather than a requirement.
+   *
+   * A remembered business can stop being reachable between sessions — the user
+   * is removed from it, or it is closed. On refresh that must not strand them
+   * with no organization at all; falling back to one they still belong to is
+   * the only useful outcome. A *switch* keeps the strict behaviour, because
+   * asking for a business you cannot access is an error worth reporting.
+   */
+  organizationIsPreference = false
 ): Promise<SessionResult> {
   const user = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
 
@@ -105,17 +116,31 @@ async function buildSession(
   //
   // `userId` is the security boundary here: we only ever return memberships
   // belonging to the user we already authenticated.
-  const membership = await prismaUnscoped.membership.findFirst({
-    where: {
-      userId,
-      isActive: true,
-      deletedAt: null,
-      organization: { deletedAt: null, status: { in: ['ACTIVE', 'TRIAL'] } },
-      ...(organizationId ? { organizationId } : {}),
-    },
+  const membershipWhere: Prisma.MembershipWhereInput = {
+    userId,
+    isActive: true,
+    deletedAt: null,
+    organization: { deletedAt: null, status: { in: ['ACTIVE', 'TRIAL'] } },
+  };
+  const membershipInclude = {
+    organization: { select: { id: true, name: true, slug: true, businessType: true, logoFileId: true } },
+  };
+
+  let membership = await prismaUnscoped.membership.findFirst({
+    where: { ...membershipWhere, ...(organizationId ? { organizationId } : {}) },
     orderBy: { createdAt: 'asc' },
-    include: { organization: { select: { id: true, name: true, slug: true, businessType: true, logoFileId: true } } },
+    include: membershipInclude,
   });
+
+  // The remembered business is gone or no longer ours — fall back rather than
+  // hand back a session with no organization.
+  if (!membership && organizationId && organizationIsPreference) {
+    membership = await prismaUnscoped.membership.findFirst({
+      where: membershipWhere,
+      orderBy: { createdAt: 'asc' },
+      include: membershipInclude,
+    });
+  }
 
   if (!membership && !user.isSuperAdmin) {
     const unavailable = await prismaUnscoped.membership.findFirst({
@@ -144,8 +169,11 @@ async function buildSession(
     role: membership?.roleId ?? null,
     sa: user.isSuperAdmin,
   });
+  // Stamp the business onto the new session so the very first refresh already
+  // knows where to return to, rather than re-deriving the default membership.
   const refreshToken =
-    presetRefreshToken ?? (await tokenService.issueRefreshToken(user.id, null, meta)).raw;
+    presetRefreshToken ??
+    (await tokenService.issueRefreshToken(user.id, null, meta, membership?.organizationId ?? null)).raw;
 
   return {
     accessToken,
@@ -535,13 +563,18 @@ export const authService = {
 
   // ----------------------------------------------------------------- refresh
   async refresh(rawToken: string, meta: RequestMeta): Promise<SessionResult> {
-    const { userId, newRaw } = await tokenService.rotateRefreshToken(rawToken, meta);
+    const { userId, newRaw, organizationId } = await tokenService.rotateRefreshToken(rawToken, meta);
     const user = await prisma.user.findUnique({ where: { id: userId }, select: { emailVerifiedAt: true } });
     if (!user?.emailVerifiedAt) {
       await tokenService.revokeAllForUser(userId);
       throw new UnauthorizedError('Verify your email address before signing in.', 'EMAIL_NOT_VERIFIED');
     }
-    return buildSession(userId, meta, undefined, newRaw);
+    // Pass the remembered business so a page reload or app restart lands where
+    // the user left off. Without it buildSession falls back to the *oldest*
+    // membership, which is how a reload used to bounce them to their default.
+    // Marked as a preference: if that business is no longer reachable, the user
+    // still gets a working session in one they do belong to.
+    return buildSession(userId, meta, organizationId ?? undefined, newRaw, true);
   },
 
   // ------------------------------------------------------------------ logout
@@ -837,6 +870,10 @@ export const authService = {
     if (!membership) throw new ForbiddenError('You do not have access to that business');
 
     await audit('auth.organization_switched', userId, organizationId, meta);
+
+    // buildSession mints a fresh refresh token stamped with this organization,
+    // and the controller sets it as the cookie — so the next refresh comes back
+    // here rather than to the user's default membership.
     return buildSession(userId, meta, organizationId);
   },
 };

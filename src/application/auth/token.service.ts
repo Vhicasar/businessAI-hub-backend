@@ -77,7 +77,9 @@ export const tokenService = {
   async issueRefreshToken(
     userId: string,
     familyId: string | null,
-    meta: { userAgent?: string; ipAddress?: string }
+    meta: { userAgent?: string; ipAddress?: string },
+    /** Business this session is in, so a reload returns to it rather than the default. */
+    organizationId?: string | null
   ): Promise<{ raw: string; familyId: string }> {
     const raw = generateOpaqueToken();
     const family = familyId ?? randomUUID();
@@ -87,6 +89,7 @@ export const tokenService = {
         userId,
         tokenHash: sha256(raw),
         familyId: family,
+        organizationId: organizationId ?? null,
         userAgent: meta.userAgent?.slice(0, 255),
         ipAddress: meta.ipAddress?.slice(0, 64),
         expiresAt,
@@ -102,7 +105,7 @@ export const tokenService = {
   async rotateRefreshToken(
     raw: string,
     meta: { userAgent?: string; ipAddress?: string }
-  ): Promise<{ userId: string; newRaw: string }> {
+  ): Promise<{ userId: string; newRaw: string; organizationId: string | null }> {
     const record = await prisma.refreshToken.findUnique({ where: { tokenHash: sha256(raw) } });
     if (!record) throw new UnauthorizedError('Invalid refresh token', 'REFRESH_INVALID');
 
@@ -118,12 +121,19 @@ export const tokenService = {
       throw new UnauthorizedError('Refresh token expired', 'REFRESH_EXPIRED');
     }
 
-    const { raw: newRaw } = await this.issueRefreshToken(record.userId, record.familyId, meta);
+    // Carry the business forward: rotation must not quietly move the session
+    // back to the user's default org.
+    const { raw: newRaw } = await this.issueRefreshToken(
+      record.userId,
+      record.familyId,
+      meta,
+      record.organizationId
+    );
     await prisma.refreshToken.update({
       where: { id: record.id },
       data: { revokedAt: new Date(), replacedBy: sha256(newRaw).slice(0, 16) },
     });
-    return { userId: record.userId, newRaw };
+    return { userId: record.userId, newRaw, organizationId: record.organizationId };
   },
 
   async revokeFamilyByToken(raw: string): Promise<void> {

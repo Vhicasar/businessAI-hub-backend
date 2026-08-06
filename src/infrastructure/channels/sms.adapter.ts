@@ -39,6 +39,7 @@ export class SmsAdapter implements ChannelAdapter {
       throw new AppError('CHANNEL_MISCONFIGURED', 500, 'Twilio SMS credentials are incomplete');
     }
     const params = new URLSearchParams({ To: payload.recipientExternalId, Body: payload.text });
+    if (payload.mediaUrls?.[0]) params.set('MediaUrl', payload.mediaUrls[0]);
     if (messagingServiceSid) params.set('MessagingServiceSid', messagingServiceSid);
     else params.set('From', fromNumber!);
     const response = await fetch(

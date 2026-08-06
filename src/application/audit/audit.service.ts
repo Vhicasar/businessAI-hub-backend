@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { Prisma } from '@prisma/client';
-import { prisma } from '../../infrastructure/database/prisma';
+import { prisma, prismaUnscoped } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { logger } from '../../shared/logger';
 
@@ -47,6 +47,34 @@ export const auditService = {
       });
     } catch (err) {
       logger.error({ err, action: input.action }, 'audit.record failed');
+    }
+  },
+
+  /**
+   * Audit an action taken by a *customer*, not a workspace user.
+   *
+   * Super App requests deliberately carry no organization context (a Vhicasar
+   * ID spans tenants), so this writes unscoped with organizationId null rather
+   * than going through the tenant-scoped client, which would reject the write.
+   */
+  async recordConsumer(input: AuditInput & { vhicasarId: string; ip?: string; userAgent?: string }): Promise<void> {
+    try {
+      await prismaUnscoped.auditLog.create({
+        data: {
+          organizationId: null,
+          actorUserId: null,
+          actorType: 'USER',
+          action: input.action,
+          entityType: input.entityType ?? 'VhicasarId',
+          entityId: input.entityId ?? input.vhicasarId,
+          before: (input.before ?? undefined) as Prisma.InputJsonValue | undefined,
+          after: (input.after ?? undefined) as Prisma.InputJsonValue | undefined,
+          ipAddress: input.ip ?? null,
+          userAgent: input.userAgent ?? null,
+        },
+      });
+    } catch (err) {
+      logger.error({ err, action: input.action }, 'audit.recordConsumer failed');
     }
   },
 

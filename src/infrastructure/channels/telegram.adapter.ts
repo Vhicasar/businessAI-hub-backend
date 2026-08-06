@@ -86,15 +86,22 @@ export class TelegramAdapter implements ChannelAdapter {
     const token = account.credentials.botToken;
     if (!token) throw new AppError('CHANNEL_MISCONFIGURED', 500, 'Telegram bot token missing');
 
-    const res = await fetch(this.api(token, 'sendMessage'), {
+    const mediaUrls = (payload.mediaUrls ?? []).slice(0, 3);
+    const method = mediaUrls.length > 1 ? 'sendMediaGroup' : mediaUrls.length === 1 ? 'sendPhoto' : 'sendMessage';
+    const body = mediaUrls.length > 1
+      ? { chat_id: payload.recipientExternalId, media: mediaUrls.map((media, i) => ({ type: 'photo', media, ...(i === 0 ? { caption: payload.text } : {}) })) }
+      : mediaUrls.length === 1
+        ? { chat_id: payload.recipientExternalId, photo: mediaUrls[0], caption: payload.text }
+        : { chat_id: payload.recipientExternalId, text: payload.text };
+    const res = await fetch(this.api(token, method), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: payload.recipientExternalId, text: payload.text }),
+      body: JSON.stringify(body),
     });
     const json = (await res.json()) as {
       ok: boolean;
       description?: string;
-      result?: { message_id: number };
+      result?: { message_id: number } | { message_id: number }[];
     };
     if (!json.ok || !json.result) {
       throw new AppError(
@@ -103,7 +110,9 @@ export class TelegramAdapter implements ChannelAdapter {
         `Telegram send failed: ${json.description ?? res.status}`
       );
     }
-    return { providerMessageId: String(json.result.message_id) };
+    const result = Array.isArray(json.result) ? json.result[0] : json.result;
+    if (!result) throw new AppError('CHANNEL_SEND_FAILED', 502, 'Telegram returned no message');
+    return { providerMessageId: String(result.message_id) };
   }
 
   async onAccountConnected(account: ChannelAccountRef, webhookUrl: string): Promise<string | null> {

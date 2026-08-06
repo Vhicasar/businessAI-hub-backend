@@ -1,4 +1,5 @@
 import { env } from '../../shared/config/env';
+import { v2Paths, v2Schemas, v2Tags } from './swagger-v2';
 
 const sessionSchema = {
   type: 'object',
@@ -56,14 +57,16 @@ export const openApiDocument = {
   tags: [
     { name: 'Auth', description: 'Authentication, sessions, 2FA' },
     { name: 'Health', description: 'Liveness and readiness' },
+    ...v2Tags,
   ],
   components: {
     securitySchemes: {
       bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
     },
-    schemas: { Session: sessionSchema, Error: errorResponse },
+    schemas: { Session: sessionSchema, Error: errorResponse, ...v2Schemas },
   },
   paths: {
+    ...v2Paths,
     '/v1/health': {
       get: { tags: ['Health'], summary: 'Liveness probe', responses: { 200: { description: 'OK' } } },
     },

@@ -22,6 +22,7 @@ export const PERMISSION_MODULES = {
   invoices: ['read', 'create', 'update', 'void', 'send'],
   payments: ['read', 'record', 'refund'],
   payment_links: ['read', 'create', 'cancel', 'share'],
+  vhicasar_pay: ['read', 'session_create', 'session_cancel', 'settle', 'chargeback', 'payout', 'payout_account'],
   marketing: ['read', 'create', 'update', 'delete', 'send'],
   segments: ['read', 'create', 'update', 'delete'],
   automations: ['read', 'create', 'update', 'delete'],

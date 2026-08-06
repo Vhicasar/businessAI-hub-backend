@@ -1,0 +1,21 @@
+/**
+ * Canonical API error codes (API Bible §14). Use these constants when throwing
+ * AppError so codes stay consistent across every service and are safe to expose
+ * to clients (no internal detail leaks through them).
+ */
+export const ERROR_CODES = {
+  AUTHENTICATION_FAILED: 'AUTHENTICATION_FAILED',
+  AUTHORIZATION_DENIED: 'AUTHORIZATION_DENIED',
+  VALIDATION_ERROR: 'VALIDATION_ERROR',
+  RESOURCE_NOT_FOUND: 'NOT_FOUND',
+  DUPLICATE_REQUEST: 'DUPLICATE_REQUEST',
+  CONFLICT: 'CONFLICT',
+  PAYMENT_DECLINED: 'PAYMENT_DECLINED',
+  PAYMENT_SESSION_EXPIRED: 'PAYMENT_SESSION_EXPIRED',
+  INSUFFICIENT_FUNDS: 'INSUFFICIENT_FUNDS',
+  FRAUD_DETECTED: 'FRAUD_DETECTED',
+  RATE_LIMIT_EXCEEDED: 'RATE_LIMITED',
+  INTERNAL_SERVER_ERROR: 'INTERNAL_ERROR',
+} as const;
+
+export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];

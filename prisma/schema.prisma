@@ -540,17 +540,28 @@ model Organization {
   updatedAt    DateTime     @updatedAt
   deletedAt    DateTime?
 
-  branches      Branch[]
-  departments   Department[]
-  teams         Team[]
-  memberships   Membership[]
-  roles         Role[]
-  invitations   Invitation[]
-  subscriptions Subscription[]
-  apiKeys       ApiKey[]
-  usageCounters UsageCounter[]
-  smsWallet     SmsWallet?
-  addOnPurchases AddOnPurchase[]
+  branches        Branch[]
+  departments     Department[]
+  teams           Team[]
+  memberships     Membership[]
+  roles           Role[]
+  invitations     Invitation[]
+  subscriptions   Subscription[]
+  apiKeys         ApiKey[]
+  usageCounters   UsageCounter[]
+  smsWallet       SmsWallet?
+  addOnPurchases  AddOnPurchase[]
+  customerLinks   CustomerLink[] // Vhicasar ID ↔ Customer associations
+  wallets         Wallet[] // Vhicasar Pay merchant/fees wallets
+  paymentSessions PaymentSession[]
+  settlements     Settlement[]
+  chargebacks     Chargeback[]
+  PayoutAccount   PayoutAccount[]
+  businessProfile BusinessProfile?
+  businessQrs     BusinessQr[]
+
+  settlementAccounts SettlementAccount[]
+  settlementRules    SettlementRule[]
 
   @@index([status])
 }
@@ -731,16 +742,21 @@ model RolePermission {
 }
 
 model RefreshToken {
-  id         String    @id @default(cuid())
-  userId     String
-  tokenHash  String    @unique
-  familyId   String // rotation family for reuse detection
-  userAgent  String?
-  ipAddress  String?
-  expiresAt  DateTime
-  revokedAt  DateTime?
-  replacedBy String?
-  createdAt  DateTime  @default(now())
+  id             String    @id @default(cuid())
+  userId         String
+  tokenHash      String    @unique
+  familyId       String // rotation family for reuse detection
+  /// Business this session was last in. A rotation family is one device's
+  /// session, so remembering it here is what lets a page reload — or reopening
+  /// the app — land back in the business the user actually chose, rather than
+  /// their oldest membership.
+  organizationId String?
+  userAgent      String?
+  ipAddress      String?
+  expiresAt      DateTime
+  revokedAt      DateTime?
+  replacedBy     String?
+  createdAt      DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id])
 
@@ -858,6 +874,7 @@ model Customer {
   company             Company?             @relation(fields: [companyId], references: [id])
   addresses           CustomerAddress[]
   identities          CustomerIdentity[]
+  link                CustomerLink? // link to the global Vhicasar ID identity
   conversations       Conversation[]
   orders              Order[]
   carts               Cart[]
@@ -1030,21 +1047,21 @@ model MessageAttachment {
 }
 
 model Call {
-  id                String        @id @default(cuid())
-  organizationId    String
-  conversationId    String?
-  customerId        String?
-  agentUserId       String?
-  direction         CallDirection
-  status            CallStatus
-  isVideo           Boolean       @default(false)
-  startedAt         DateTime?
-  endedAt           DateTime?
-  durationSeconds   Int?
-  recordingFileId   String?
-  transcription     String?       @db.Text
-  aiSummary         String?       @db.Text
-  createdAt         DateTime      @default(now())
+  id              String        @id @default(cuid())
+  organizationId  String
+  conversationId  String?
+  customerId      String?
+  agentUserId     String?
+  direction       CallDirection
+  status          CallStatus
+  isVideo         Boolean       @default(false)
+  startedAt       DateTime?
+  endedAt         DateTime?
+  durationSeconds Int?
+  recordingFileId String?
+  transcription   String?       @db.Text
+  aiSummary       String?       @db.Text
+  createdAt       DateTime      @default(now())
 
   conversation Conversation? @relation(fields: [conversationId], references: [id])
 
@@ -1155,26 +1172,26 @@ model PipelineStage {
 }
 
 model Deal {
-  id             String     @id @default(cuid())
-  organizationId String
-  title          String
-  pipelineId     String
-  stageId        String
-  customerId     String?
-  companyId      String?
-  leadId         String?
-  ownerId        String? // Membership id
-  status         DealStatus @default(OPEN)
-  value          Decimal    @default(0) @db.Decimal(14, 2)
-  currency       String     @default("USD") @db.Char(3)
-  expectedCloseAt DateTime?
-  closedAt       DateTime?
-  lostReason     String?
+  id               String     @id @default(cuid())
+  organizationId   String
+  title            String
+  pipelineId       String
+  stageId          String
+  customerId       String?
+  companyId        String?
+  leadId           String?
+  ownerId          String? // Membership id
+  status           DealStatus @default(OPEN)
+  value            Decimal    @default(0) @db.Decimal(14, 2)
+  currency         String     @default("USD") @db.Char(3)
+  expectedCloseAt  DateTime?
+  closedAt         DateTime?
+  lostReason       String?
   aiWinProbability Int?
-  customFields   Json?
-  createdAt      DateTime   @default(now())
-  updatedAt      DateTime   @updatedAt
-  deletedAt      DateTime?
+  customFields     Json?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+  deletedAt        DateTime?
 
   pipeline   Pipeline      @relation(fields: [pipelineId], references: [id])
   stage      PipelineStage @relation(fields: [stageId], references: [id])
@@ -1230,10 +1247,10 @@ model Task {
 }
 
 model Meeting {
-  id             String    @id @default(cuid())
+  id             String      @id @default(cuid())
   organizationId String
   title          String
-  description    String?   @db.Text
+  description    String?     @db.Text
   location       String?
   meetingUrl     String?
   startAt        DateTime
@@ -1242,10 +1259,10 @@ model Meeting {
   entityType     EntityType?
   entityId       String?
   attendees      Json? // [{type: 'user'|'customer', id, name, email, response}]
-  aiSummary      String?   @db.Text
-  transcription  String?   @db.Text
+  aiSummary      String?     @db.Text
+  transcription  String?     @db.Text
   /// CONFIRMED | CANCELLED | COMPLETED — appointment lifecycle (#12).
-  status         String    @default("CONFIRMED")
+  status         String      @default("CONFIRMED")
   /// Customer this appointment is for (booking flows); scalar, matches entityId style.
   customerId     String?
   /// Appointment type id from the org's appointment config.
@@ -1253,11 +1270,11 @@ model Meeting {
   /// Where the booking came from: CHAT | MANUAL | WEB.
   source         String?
   /// Unguessable token for the public manage/cancel link in confirmations.
-  bookingToken   String?   @unique
+  bookingToken   String?     @unique
   /// Set once a reminder has been emailed, so the sweep never double-sends.
   reminderSentAt DateTime?
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
   deletedAt      DateTime?
 
   @@index([organizationId, startAt])
@@ -1529,12 +1546,12 @@ model PriceListItem {
 }
 
 model ProductBundle {
-  id             String    @id @default(cuid())
+  id             String   @id @default(cuid())
   organizationId String
   productId      String // the bundle is itself a sellable product
   name           String
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
   product Product      @relation(fields: [productId], references: [id])
   items   BundleItem[]
@@ -1557,22 +1574,22 @@ model BundleItem {
 }
 
 model Coupon {
-  id              String       @id @default(cuid())
-  organizationId  String
-  code            String
-  description     String?
-  discountType    DiscountType
-  discountValue   Decimal      @db.Decimal(14, 2)
-  minOrderAmount  Decimal?     @db.Decimal(14, 2)
-  maxDiscount     Decimal?     @db.Decimal(14, 2)
-  usageLimit      Int?
+  id                    String       @id @default(cuid())
+  organizationId        String
+  code                  String
+  description           String?
+  discountType          DiscountType
+  discountValue         Decimal      @db.Decimal(14, 2)
+  minOrderAmount        Decimal?     @db.Decimal(14, 2)
+  maxDiscount           Decimal?     @db.Decimal(14, 2)
+  usageLimit            Int?
   usageLimitPerCustomer Int?
-  usedCount       Int          @default(0)
-  startsAt        DateTime?
-  expiresAt       DateTime?
-  isActive        Boolean      @default(true)
-  createdAt       DateTime     @default(now())
-  updatedAt       DateTime     @updatedAt
+  usedCount             Int          @default(0)
+  startsAt              DateTime?
+  expiresAt             DateTime?
+  isActive              Boolean      @default(true)
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
 
   redemptions CouponRedemption[]
 
@@ -1596,20 +1613,45 @@ model CouponRedemption {
 }
 
 model Promotion {
-  id             String          @id @default(cuid())
-  organizationId String
-  name           String
-  description    String?         @db.Text
-  discountType   DiscountType
-  discountValue  Decimal         @db.Decimal(14, 2)
-  status         PromotionStatus @default(SCHEDULED)
-  appliesTo      Json? // {scope:'ALL'|'CATEGORIES'|'PRODUCTS', ids:[]}
-  startsAt       DateTime
-  endsAt         DateTime
-  createdAt      DateTime        @default(now())
-  updatedAt      DateTime        @updatedAt
+  id              String          @id @default(cuid())
+  organizationId  String
+  name            String
+  description     String?         @db.Text
+  discountType    DiscountType
+  discountValue   Decimal         @db.Decimal(14, 2)
+  status          PromotionStatus @default(SCHEDULED)
+  appliesTo       Json? // {scope:'ALL'|'CATEGORIES'|'PRODUCTS', ids:[]}
+  /// DISCOUNT | CASHBACK | BOGO | HAPPY_HOUR | FLASH_SALE | MEMBER | BIRTHDAY |
+  /// SEASONAL | PRODUCT | SERVICE | BRANCH
+  kind            String          @default("DISCOUNT")
+  branchId        String?
+  /// Spend ceiling for the campaign; null = unlimited.
+  budget          Decimal?        @db.Decimal(14, 2)
+  budgetSpent     Decimal         @default(0) @db.Decimal(14, 2)
+  /// {segmentIds:[], tiers:[], tags:[], newCustomersOnly:bool}
+  audience        Json?
+  minSpend        Decimal?        @db.Decimal(14, 2)
+  /// Total redemptions allowed across all customers.
+  maxRedemptions  Int?
+  /// Redemptions allowed per customer.
+  maxPerCustomer  Int             @default(1)
+  redemptionCount Int             @default(0)
+  /// Happy-hour / flash windows: {days:[1..7], from:"17:00", to:"19:00"}
+  schedule        Json?
+  /// When to push-notify subscribers.
+  notifyAt        DateTime?
+  notifiedAt      DateTime?
+  imageUrl        String?
+  terms           String?         @db.Text
+  startsAt        DateTime
+  endsAt          DateTime
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  redemptions PromotionRedemption[]
 
   @@index([organizationId, status])
+  @@index([organizationId, startsAt, endsAt])
 }
 
 // ============================================================
@@ -1713,10 +1755,10 @@ model StockTransfer {
 }
 
 model StockTransferItem {
-  id         String  @id @default(cuid())
-  transferId String
-  variantId  String
-  quantity   Decimal @db.Decimal(12, 3)
+  id          String   @id @default(cuid())
+  transferId  String
+  variantId   String
+  quantity    Decimal  @db.Decimal(12, 3)
   receivedQty Decimal? @db.Decimal(12, 3)
 
   transfer StockTransfer  @relation(fields: [transferId], references: [id])
@@ -1774,14 +1816,14 @@ model PurchaseOrder {
 }
 
 model PurchaseOrderItem {
-  id              String   @id @default(cuid())
+  id              String  @id @default(cuid())
   purchaseOrderId String
   variantId       String
-  quantity        Decimal  @db.Decimal(12, 3)
-  receivedQty     Decimal  @default(0) @db.Decimal(12, 3)
-  unitCost        Decimal  @db.Decimal(14, 2)
-  taxRate         Decimal  @default(0) @db.Decimal(5, 2)
-  total           Decimal  @db.Decimal(14, 2)
+  quantity        Decimal @db.Decimal(12, 3)
+  receivedQty     Decimal @default(0) @db.Decimal(12, 3)
+  unitCost        Decimal @db.Decimal(14, 2)
+  taxRate         Decimal @default(0) @db.Decimal(5, 2)
+  total           Decimal @db.Decimal(14, 2)
 
   purchaseOrder PurchaseOrder  @relation(fields: [purchaseOrderId], references: [id])
   variant       ProductVariant @relation(fields: [variantId], references: [id])
@@ -1794,17 +1836,17 @@ model PurchaseOrderItem {
 // ============================================================
 
 model Cart {
-  id             String     @id @default(cuid())
+  id             String      @id @default(cuid())
   organizationId String
   customerId     String?
   sessionId      String? // anonymous web/chat sessions
   source         OrderSource @default(WEB)
-  status         CartStatus @default(ACTIVE)
-  currency       String     @default("USD") @db.Char(3)
+  status         CartStatus  @default(ACTIVE)
+  currency       String      @default("USD") @db.Char(3)
   couponCode     String?
   expiresAt      DateTime?
-  createdAt      DateTime   @default(now())
-  updatedAt      DateTime   @updatedAt
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
 
   customer Customer?  @relation(fields: [customerId], references: [id])
   items    CartItem[]
@@ -1828,43 +1870,43 @@ model CartItem {
 }
 
 model Order {
-  id                String      @id @default(cuid())
+  id                String        @id @default(cuid())
   organizationId    String
   number            String
   customerId        String
-  status            OrderStatus @default(PENDING)
-  source            OrderSource @default(MANUAL)
+  status            OrderStatus   @default(PENDING)
+  source            OrderSource   @default(MANUAL)
   conversationId    String? // social-commerce origin
   warehouseId       String?
   shippingAddressId String?
-  currency          String      @default("USD") @db.Char(3)
-  subtotal          Decimal     @default(0) @db.Decimal(14, 2)
-  taxTotal          Decimal     @default(0) @db.Decimal(14, 2)
-  shippingTotal     Decimal     @default(0) @db.Decimal(14, 2)
-  discountTotal     Decimal     @default(0) @db.Decimal(14, 2)
-  total             Decimal     @default(0) @db.Decimal(14, 2)
+  currency          String        @default("USD") @db.Char(3)
+  subtotal          Decimal       @default(0) @db.Decimal(14, 2)
+  taxTotal          Decimal       @default(0) @db.Decimal(14, 2)
+  shippingTotal     Decimal       @default(0) @db.Decimal(14, 2)
+  discountTotal     Decimal       @default(0) @db.Decimal(14, 2)
+  total             Decimal       @default(0) @db.Decimal(14, 2)
   paymentStatus     PaymentStatus @default(PENDING)
   couponCode        String?
-  notes             String?     @db.Text
+  notes             String?       @db.Text
   placedById        String? // agent Membership id when created on behalf
-  aiCreated         Boolean     @default(false)
+  aiCreated         Boolean       @default(false)
   cancelledAt       DateTime?
   cancelReason      String?
   deliveredAt       DateTime?
-  createdAt         DateTime    @default(now())
-  updatedAt         DateTime    @updatedAt
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
 
-  customer        Customer           @relation(fields: [customerId], references: [id])
-  conversation    Conversation?      @relation(fields: [conversationId], references: [id])
-  warehouse       Warehouse?         @relation(fields: [warehouseId], references: [id])
-  shippingAddress CustomerAddress?   @relation("ShippingAddress", fields: [shippingAddressId], references: [id])
-  items           OrderItem[]
-  shipments       Shipment[]
-  invoices        Invoice[]
-  payments        Payment[]
-  returnRequests  ReturnRequest[]
+  customer          Customer             @relation(fields: [customerId], references: [id])
+  conversation      Conversation?        @relation(fields: [conversationId], references: [id])
+  warehouse         Warehouse?           @relation(fields: [warehouseId], references: [id])
+  shippingAddress   CustomerAddress?     @relation("ShippingAddress", fields: [shippingAddressId], references: [id])
+  items             OrderItem[]
+  shipments         Shipment[]
+  invoices          Invoice[]
+  payments          Payment[]
+  returnRequests    ReturnRequest[]
   couponRedemptions CouponRedemption[]
-  statusHistory   OrderStatusHistory[]
+  statusHistory     OrderStatusHistory[]
 
   @@unique([organizationId, number])
   @@index([organizationId, status, createdAt])
@@ -1873,21 +1915,21 @@ model Order {
 }
 
 model OrderItem {
-  id          String  @id @default(cuid())
-  orderId     String
-  variantId   String
-  name        String // snapshot
-  sku         String // snapshot
-  quantity    Decimal @db.Decimal(12, 3)
-  unitPrice   Decimal @db.Decimal(14, 2)
-  taxRate     Decimal @default(0) @db.Decimal(5, 2)
-  discount    Decimal @default(0) @db.Decimal(14, 2)
-  total       Decimal @db.Decimal(14, 2)
+  id           String  @id @default(cuid())
+  orderId      String
+  variantId    String
+  name         String // snapshot
+  sku          String // snapshot
+  quantity     Decimal @db.Decimal(12, 3)
+  unitPrice    Decimal @db.Decimal(14, 2)
+  taxRate      Decimal @default(0) @db.Decimal(5, 2)
+  discount     Decimal @default(0) @db.Decimal(14, 2)
+  total        Decimal @db.Decimal(14, 2)
   fulfilledQty Decimal @default(0) @db.Decimal(12, 3)
   returnedQty  Decimal @default(0) @db.Decimal(12, 3)
 
-  order   Order          @relation(fields: [orderId], references: [id])
-  variant ProductVariant @relation(fields: [variantId], references: [id])
+  order       Order          @relation(fields: [orderId], references: [id])
+  variant     ProductVariant @relation(fields: [variantId], references: [id])
   returnItems ReturnItem[]
 
   @@index([orderId])
@@ -1895,13 +1937,13 @@ model OrderItem {
 }
 
 model OrderStatusHistory {
-  id          String      @id @default(cuid())
+  id          String       @id @default(cuid())
   orderId     String
   fromStatus  OrderStatus?
   toStatus    OrderStatus
   actorUserId String?
   note        String?
-  createdAt   DateTime    @default(now())
+  createdAt   DateTime     @default(now())
 
   order Order @relation(fields: [orderId], references: [id])
 
@@ -2061,10 +2103,11 @@ model Payment {
   createdAt      DateTime          @default(now())
   updatedAt      DateTime          @updatedAt
 
-  customer Customer? @relation(fields: [customerId], references: [id])
-  order    Order?    @relation(fields: [orderId], references: [id])
-  invoice  Invoice?  @relation(fields: [invoiceId], references: [id])
-  refunds  Refund[]
+  customer    Customer?    @relation(fields: [customerId], references: [id])
+  order       Order?       @relation(fields: [orderId], references: [id])
+  invoice     Invoice?     @relation(fields: [invoiceId], references: [id])
+  refunds     Refund[]
+  chargebacks Chargeback[]
 
   @@index([organizationId, status, createdAt])
   @@index([customerId])
@@ -2089,6 +2132,10 @@ enum PaymentLinkResource {
   QUOTATION
   SUBSCRIPTION
   DEPOSIT
+  POS
+  MEMBERSHIP
+  RENT
+  SERVICE
   CUSTOM
 }
 
@@ -2128,16 +2175,16 @@ model PaymentLink {
 // ============================================================
 
 model Segment {
-  id             String   @id @default(cuid())
+  id             String    @id @default(cuid())
   organizationId String
   name           String
   description    String?
   definition     Json // rule tree e.g. {all:[{field:'lifetimeValue',op:'gte',value:100}]}
-  isDynamic      Boolean  @default(true)
-  memberCount    Int      @default(0)
+  isDynamic      Boolean   @default(true)
+  memberCount    Int       @default(0)
   computedAt     DateTime?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
   deletedAt      DateTime?
 
   campaigns Campaign[]
@@ -2212,7 +2259,8 @@ model LoyaltyProgram {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  accounts LoyaltyAccount[]
+  accounts    LoyaltyAccount[]
+  LoyaltyRule LoyaltyRule[]
 }
 
 model LoyaltyAccount {
@@ -2231,14 +2279,14 @@ model LoyaltyAccount {
 }
 
 model LoyaltyTransaction {
-  id        String                 @id @default(cuid())
-  accountId String
-  type      LoyaltyTransactionType
-  points    Int // signed
+  id            String                 @id @default(cuid())
+  accountId     String
+  type          LoyaltyTransactionType
+  points        Int // signed
   referenceType String?
   referenceId   String?
-  note      String?
-  createdAt DateTime               @default(now())
+  note          String?
+  createdAt     DateTime               @default(now())
 
   account LoyaltyAccount @relation(fields: [accountId], references: [id])
 
@@ -2267,15 +2315,15 @@ model Referral {
 // ============================================================
 
 model SlaPolicy {
-  id                   String   @id @default(cuid())
+  id                   String         @id @default(cuid())
   organizationId       String
   name                 String
   priority             TicketPriority
   firstResponseMinutes Int
   resolutionMinutes    Int
-  businessHoursOnly    Boolean  @default(true)
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
+  businessHoursOnly    Boolean        @default(true)
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
 
   tickets Ticket[]
 
@@ -2283,31 +2331,31 @@ model SlaPolicy {
 }
 
 model Ticket {
-  id                String         @id @default(cuid())
-  organizationId    String
-  number            String
-  subject           String
-  description       String?        @db.Text
-  status            TicketStatus   @default(OPEN)
-  priority          TicketPriority @default(MEDIUM)
-  customerId        String
-  conversationId    String?
-  assigneeId        String? // Membership id
-  departmentId      String?
-  slaPolicyId       String?
+  id                 String         @id @default(cuid())
+  organizationId     String
+  number             String
+  subject            String
+  description        String?        @db.Text
+  status             TicketStatus   @default(OPEN)
+  priority           TicketPriority @default(MEDIUM)
+  customerId         String
+  conversationId     String?
+  assigneeId         String? // Membership id
+  departmentId       String?
+  slaPolicyId        String?
   firstResponseDueAt DateTime?
-  resolutionDueAt   DateTime?
-  firstRespondedAt  DateTime?
-  resolvedAt        DateTime?
-  closedAt          DateTime?
-  escalatedAt       DateTime?
-  satisfactionScore Int? // 1-5 CSAT
-  npsScore          Int? // 0-10 "would you recommend"
-  cesScore          Int? // 1-7 customer effort score
-  aiSentiment       String?
-  createdAt         DateTime       @default(now())
-  updatedAt         DateTime       @updatedAt
-  deletedAt         DateTime?
+  resolutionDueAt    DateTime?
+  firstRespondedAt   DateTime?
+  resolvedAt         DateTime?
+  closedAt           DateTime?
+  escalatedAt        DateTime?
+  satisfactionScore  Int? // 1-5 CSAT
+  npsScore           Int? // 0-10 "would you recommend"
+  cesScore           Int? // 1-7 customer effort score
+  aiSentiment        String?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+  deletedAt          DateTime?
 
   customer     Customer      @relation(fields: [customerId], references: [id])
   conversation Conversation? @relation(fields: [conversationId], references: [id])
@@ -2423,12 +2471,12 @@ model Property {
   updatedAt      DateTime        @updatedAt
   deletedAt      DateTime?
 
-  owner        Customer?            @relation("PropertyOwner", fields: [ownerId], references: [id])
-  media        PropertyMedia[]
-  leases       Lease[]
-  bookings     PropertyBooking[]
-  maintenance  MaintenanceRequest[]
-  commissions  Commission[]
+  owner       Customer?            @relation("PropertyOwner", fields: [ownerId], references: [id])
+  media       PropertyMedia[]
+  leases      Lease[]
+  bookings    PropertyBooking[]
+  maintenance MaintenanceRequest[]
+  commissions Commission[]
 
   @@unique([organizationId, reference])
   @@index([organizationId, status, type])
@@ -2451,23 +2499,23 @@ model PropertyMedia {
 }
 
 model Lease {
-  id              String      @id @default(cuid())
-  organizationId  String
-  number          String
-  propertyId      String
-  tenantId        String // Customer
-  status          LeaseStatus @default(DRAFT)
-  rentAmount      Decimal     @db.Decimal(14, 2)
-  currency        String      @default("USD") @db.Char(3)
-  billingPeriod   String      @default("MONTHLY")
-  depositAmount   Decimal?    @db.Decimal(14, 2)
-  startDate       DateTime
-  endDate         DateTime
-  terminatedAt    DateTime?
-  contractFileId  String?
-  notes           String?     @db.Text
-  createdAt       DateTime    @default(now())
-  updatedAt       DateTime    @updatedAt
+  id             String      @id @default(cuid())
+  organizationId String
+  number         String
+  propertyId     String
+  tenantId       String // Customer
+  status         LeaseStatus @default(DRAFT)
+  rentAmount     Decimal     @db.Decimal(14, 2)
+  currency       String      @default("USD") @db.Char(3)
+  billingPeriod  String      @default("MONTHLY")
+  depositAmount  Decimal?    @db.Decimal(14, 2)
+  startDate      DateTime
+  endDate        DateTime
+  terminatedAt   DateTime?
+  contractFileId String?
+  notes          String?     @db.Text
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
 
   property Property  @relation(fields: [propertyId], references: [id])
   tenant   Customer  @relation("LeaseTenant", fields: [tenantId], references: [id])
@@ -2480,18 +2528,18 @@ model Lease {
 }
 
 model PropertyBooking {
-  id          String        @id @default(cuid())
+  id             String        @id @default(cuid())
   organizationId String
-  propertyId  String
-  customerId  String
-  agentId     String? // Membership id
-  kind        String        @default("VIEWING") // VIEWING | INSPECTION
-  status      BookingStatus @default(REQUESTED)
-  scheduledAt DateTime
-  durationMin Int           @default(30)
-  notes       String?       @db.Text
-  createdAt   DateTime      @default(now())
-  updatedAt   DateTime      @updatedAt
+  propertyId     String
+  customerId     String
+  agentId        String? // Membership id
+  kind           String        @default("VIEWING") // VIEWING | INSPECTION
+  status         BookingStatus @default(REQUESTED)
+  scheduledAt    DateTime
+  durationMin    Int           @default(30)
+  notes          String?       @db.Text
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
 
   property Property @relation(fields: [propertyId], references: [id])
   customer Customer @relation(fields: [customerId], references: [id])
@@ -3167,34 +3215,34 @@ model LeaveRequest {
 // ============================================================
 
 model Plan {
-  id            String       @id @default(cuid())
-  name          String       @unique
-  slug          String       @unique
-  description   String?
+  id                String   @id @default(cuid())
+  name              String   @unique
+  slug              String   @unique
+  description       String?
   /// The plan's base price, in `currency`. Used when `prices` has nothing for
   /// the customer's currency — i.e. today's behaviour, unchanged.
-  priceMonthly  Decimal      @db.Decimal(14, 2)
-  priceYearly   Decimal      @db.Decimal(14, 2)
-  currency      String       @default("USD") @db.Char(3)
+  priceMonthly      Decimal  @db.Decimal(14, 2)
+  priceYearly       Decimal  @db.Decimal(14, 2)
+  currency          String   @default("USD") @db.Char(3)
   /// Per-currency price book, synced from the admin:
   /// { "NGN": { "monthly": 8500, "yearly": 81600 }, "USD": { ... } }
   /// A currency absent here is never charged — we don't convert (see
   /// shared/billing-currency.ts).
-  prices        Json?
-  maxUsers      Int?
-  maxBranches   Int?
-  maxProducts   Int?
-  maxChannels   Int?
-  maxContacts   Int?
+  prices            Json?
+  maxUsers          Int?
+  maxBranches       Int?
+  maxProducts       Int?
+  maxChannels       Int?
+  maxContacts       Int?
   /// Maximum opted-in recipients a single marketing campaign may target.
   maxMarketingReach Int?
-  aiCreditsMonthly Int?
-  features      Json // feature keys enabled on this plan
-  isPublic      Boolean      @default(true) // shown on pricing UI (false = custom/contact-sales)
-  isActive      Boolean      @default(true)
-  position      Int          @default(0)
-  createdAt     DateTime     @default(now())
-  updatedAt     DateTime     @updatedAt
+  aiCreditsMonthly  Int?
+  features          Json // feature keys enabled on this plan
+  isPublic          Boolean  @default(true) // shown on pricing UI (false = custom/contact-sales)
+  isActive          Boolean  @default(true)
+  position          Int      @default(0)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
 
   subscriptions Subscription[]
 }
@@ -3222,25 +3270,25 @@ model ProviderPlan {
 }
 
 model Subscription {
-  id             String             @id @default(cuid())
-  organizationId String
-  planId         String
-  status         SubscriptionStatus @default(TRIALING)
-  interval       PlanInterval       @default(MONTHLY)
-  trialEndsAt    DateTime?
-  currentPeriodStart DateTime
-  currentPeriodEnd   DateTime
-  cancelAtPeriodEnd  Boolean        @default(false)
-  cancelledAt    DateTime?
+  id                       String             @id @default(cuid())
+  organizationId           String
+  planId                   String
+  status                   SubscriptionStatus @default(TRIALING)
+  interval                 PlanInterval       @default(MONTHLY)
+  trialEndsAt              DateTime?
+  currentPeriodStart       DateTime
+  currentPeriodEnd         DateTime
+  cancelAtPeriodEnd        Boolean            @default(false)
+  cancelledAt              DateTime?
   // Payment-provider linkage (e.g. Paystack customer / subscription codes).
   provider                 String?
   providerCustomerCode     String?
   providerSubscriptionCode String?
-  createdAt      DateTime           @default(now())
-  updatedAt      DateTime           @updatedAt
+  createdAt                DateTime           @default(now())
+  updatedAt                DateTime           @updatedAt
 
-  organization Organization    @relation(fields: [organizationId], references: [id])
-  plan         Plan            @relation(fields: [planId], references: [id])
+  organization   Organization    @relation(fields: [organizationId], references: [id])
+  plan           Plan            @relation(fields: [planId], references: [id])
   billingRecords BillingRecord[]
 
   @@index([organizationId, status])
@@ -3269,20 +3317,20 @@ model UsageCounter {
 /// catalog. The entitlement snapshot keeps an existing purchase stable even
 /// if the catalog is edited later.
 model AddOnPurchase {
-  id             String   @id @default(cuid())
+  id             String    @id @default(cuid())
   organizationId String
   addOnId        String
   title          String
   billingType    String
-  amount         Decimal  @db.Decimal(14, 2)
-  currency       String   @db.Char(3)
+  amount         Decimal   @db.Decimal(14, 2)
+  currency       String    @db.Char(3)
   entitlements   Json
   provider       String?
-  providerRef    String?  @unique
-  purchasedAt    DateTime @default(now())
+  providerRef    String?   @unique
+  purchasedAt    DateTime  @default(now())
   expiresAt      DateTime?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
   organization Organization @relation(fields: [organizationId], references: [id])
 
@@ -3292,16 +3340,16 @@ model AddOnPurchase {
 
 /// Prepaid SMS balance. Amounts are monetary and always use `currency`.
 model SmsWallet {
-  id                  String   @id @default(cuid())
-  organizationId      String   @unique
-  balance             Decimal  @default(0) @db.Decimal(14, 4)
-  currency            String   @default("NGN") @db.Char(3)
-  lowBalanceThreshold Decimal  @default(500) @db.Decimal(14, 4)
+  id                  String    @id @default(cuid())
+  organizationId      String    @unique
+  balance             Decimal   @default(0) @db.Decimal(14, 4)
+  currency            String    @default("NGN") @db.Char(3)
+  lowBalanceThreshold Decimal   @default(500) @db.Decimal(14, 4)
   lastLowBalanceAt    DateTime?
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @updatedAt
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
 
-  organization Organization @relation(fields: [organizationId], references: [id])
+  organization Organization           @relation(fields: [organizationId], references: [id])
   transactions SmsWalletTransaction[]
 }
 
@@ -3310,7 +3358,7 @@ model SmsWalletTransaction {
   organizationId String
   walletId       String
   type           SmsWalletTransactionType
-  channelType    ChannelType @default(SMS)
+  channelType    ChannelType              @default(SMS)
   amount         Decimal                  @db.Decimal(14, 4)
   balanceAfter   Decimal                  @db.Decimal(14, 4)
   currency       String                   @db.Char(3)
@@ -3330,24 +3378,24 @@ model SmsWalletTransaction {
 }
 
 model BillingRecord {
-  id             String        @id @default(cuid())
-  subscriptionId String
-  amount         Decimal       @db.Decimal(14, 2)
-  currency       String        @default("USD") @db.Char(3)
-  sourceAmount   Decimal?      @db.Decimal(14, 2)
-  sourceCurrency String?       @db.Char(3)
-  exchangeRate   Decimal?      @db.Decimal(24, 12)
+  id                     String        @id @default(cuid())
+  subscriptionId         String
+  amount                 Decimal       @db.Decimal(14, 2)
+  currency               String        @default("USD") @db.Char(3)
+  sourceAmount           Decimal?      @db.Decimal(14, 2)
+  sourceCurrency         String?       @db.Char(3)
+  exchangeRate           Decimal?      @db.Decimal(24, 12)
   exchangeRateSnapshotId String?
-  status         PaymentStatus @default(PENDING)
-  periodStart    DateTime
-  periodEnd      DateTime
-  provider       String?
-  providerRef    String?
-  paidAt         DateTime?
-  invoicePdfFileId String?
-  createdAt      DateTime      @default(now())
+  status                 PaymentStatus @default(PENDING)
+  periodStart            DateTime
+  periodEnd              DateTime
+  provider               String?
+  providerRef            String?
+  paidAt                 DateTime?
+  invoicePdfFileId       String?
+  createdAt              DateTime      @default(now())
 
-  subscription Subscription @relation(fields: [subscriptionId], references: [id])
+  subscription         Subscription          @relation(fields: [subscriptionId], references: [id])
   exchangeRateSnapshot ExchangeRateSnapshot? @relation(fields: [exchangeRateSnapshotId], references: [id])
 
   @@index([subscriptionId])
@@ -3356,15 +3404,15 @@ model BillingRecord {
 /// Immutable provider observations used to reproduce converted display and
 /// charged amounts. Rates express one unit of `baseCurrency` in `quoteCurrency`.
 model ExchangeRateSnapshot {
-  id                String   @id @default(cuid())
-  baseCurrency      String   @db.Char(3)
-  quoteCurrency     String   @db.Char(3)
-  rate              Decimal  @db.Decimal(24, 12)
+  id                String    @id @default(cuid())
+  baseCurrency      String    @db.Char(3)
+  quoteCurrency     String    @db.Char(3)
+  rate              Decimal   @db.Decimal(24, 12)
   provider          String
   providerUpdatedAt DateTime?
-  fetchedAt         DateTime @default(now())
+  fetchedAt         DateTime  @default(now())
   expiresAt         DateTime
-  createdAt         DateTime @default(now())
+  createdAt         DateTime  @default(now())
 
   billingRecords BillingRecord[]
 
@@ -3428,14 +3476,14 @@ model WebhookEndpoint {
 }
 
 model IntegrationCredential {
-  id             String    @id @default(cuid())
+  id             String   @id @default(cuid())
   organizationId String
   provider       String // "stripe" | "twilio" | "google_maps" | custom adapter keys
-  credentialsEnc String    @db.Text
-  isActive       Boolean   @default(true)
+  credentialsEnc String   @db.Text
+  isActive       Boolean  @default(true)
   metadata       Json?
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
   @@unique([organizationId, provider])
 }
@@ -3469,15 +3517,15 @@ model File {
 }
 
 model Notification {
-  id        String   @id @default(cuid())
+  id             String    @id @default(cuid())
   organizationId String?
-  userId    String
-  type      String // event key e.g. "inbox.assigned"
-  title     String
-  body      String?  @db.Text
-  data      Json? // deep-link payload
-  readAt    DateTime?
-  createdAt DateTime @default(now())
+  userId         String
+  type           String // event key e.g. "inbox.assigned"
+  title          String
+  body           String?   @db.Text
+  data           Json? // deep-link payload
+  readAt         DateTime?
+  createdAt      DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id])
 
@@ -3578,23 +3626,23 @@ enum SiteStatus {
 }
 
 model Site {
-  id             String     @id @default(cuid())
-  organizationId String     @unique
-  name           String
+  id                      String     @id @default(cuid())
+  organizationId          String     @unique
+  name                    String
   /// Platform subdomain: <subdomain>.sites.host. Unique across the platform.
-  subdomain      String?    @unique
+  subdomain               String?    @unique
   /// Optional customer-owned hostname, e.g. www.example.com.
-  customDomain   String?    @unique
+  customDomain            String?    @unique
   domainVerificationToken String?
-  domainVerifiedAt DateTime?
-  status         SiteStatus @default(DRAFT)
+  domainVerifiedAt        DateTime?
+  status                  SiteStatus @default(DRAFT)
   /// { primaryColor, accentColor, font }
-  theme          Json?
+  theme                   Json?
   /// { title, description }
-  seo            Json?
-  publishedAt    DateTime?
-  createdAt      DateTime   @default(now())
-  updatedAt      DateTime   @updatedAt
+  seo                     Json?
+  publishedAt             DateTime?
+  createdAt               DateTime   @default(now())
+  updatedAt               DateTime   @updatedAt
 
   pages SitePage[]
 }
@@ -3635,16 +3683,16 @@ model SiteVersion {
 /// Platform-wide subdomain hosting destinations managed by Vhicasar Admin.
 /// Hostinger is seeded as the default provider; only one configuration is active.
 model DomainDeploymentConfig {
-  id            String   @id @default(cuid())
-  name          String
-  provider      String   @default("HOSTINGER")
-  baseDomain    String   @unique
-  cnameTarget   String
+  id                 String   @id @default(cuid())
+  name               String
+  provider           String   @default("HOSTINGER")
+  baseDomain         String   @unique
+  cnameTarget        String
   verificationTarget String?
-  isActive      Boolean  @default(false)
-  isDefault     Boolean  @default(false)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  isActive           Boolean  @default(false)
+  isDefault          Boolean  @default(false)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
 }
 
 // ── Marketing visual editor (Canva-style designs) ──────────────────────────
@@ -3662,4 +3710,1611 @@ model Design {
   updatedAt      DateTime @updatedAt
 
   @@index([organizationId])
+}
+
+// ============================================================
+// PLATFORM CORE — VHICASAR ID (cross-tenant consumer identity)
+// v2.0 Phase 1. See docs/v2/BUILD-PLAN.md. Database Bible §4/§5/§21.
+// ============================================================
+
+enum VhicasarIdStatus {
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum KycLevel {
+  NONE
+  BASIC
+  VERIFIED
+}
+
+enum CustomerLinkStatus {
+  ACTIVE
+  BLOCKED
+  UNLINKED
+}
+
+enum DeviceTrustLevel {
+  UNTRUSTED
+  RECOGNIZED
+  TRUSTED
+}
+
+enum DomainEventStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+}
+
+/// Global, cross-tenant consumer identity for the Customer Super App.
+/// NOT organization-scoped. One person = one VhicasarId, associated with many
+/// organizations' Customer records via CustomerLink, so identity is never
+/// duplicated across tenants (Database Bible §21).
+model VhicasarId {
+  id              String           @id @default(cuid())
+  /// Human-facing public identifier, e.g. "VH-7QK2-9F3P". Shareable.
+  publicId        String           @unique
+  phone           String           @unique
+  email           String?          @unique
+  firstName       String?
+  lastName        String?
+  displayName     String?
+  avatarUrl       String?
+  status          VhicasarIdStatus @default(ACTIVE)
+  kycLevel        KycLevel         @default(NONE)
+  /// Adaptive hash for Super App login (never plaintext).
+  passwordHash    String?
+  /// Hash of the transaction PIN used to confirm Vhicasar Pay payments.
+  pinHash         String?
+  phoneVerifiedAt DateTime?
+  emailVerifiedAt DateTime?
+  lastLoginAt     DateTime?
+  country         String?          @db.Char(2)
+  locale          String           @default("en")
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  deletedAt       DateTime?
+
+  links               CustomerLink[]
+  devices             Device[]
+  wallets             Wallet[]
+  refreshTokens       AppRefreshToken[]
+  payoutAccounts      PayoutAccount[]
+  kycSubmissions      KycSubmission[]
+  transactionSecurity TransactionSecurity?
+  location            CustomerLocation?
+
+  @@index([phone])
+  @@index([email])
+  @@index([status])
+}
+
+/// Relationship table linking a global VhicasarId to a per-organization
+/// Customer record. Tenant isolation preserved: org data stays on Customer,
+/// shared identity stays on VhicasarId (Database Bible §21).
+model CustomerLink {
+  id               String             @id @default(cuid())
+  vhicasarId       String
+  organizationId   String
+  customerId       String             @unique
+  status           CustomerLinkStatus @default(ACTIVE)
+  /// How the link was established: SUPER_APP | POS | INVITE | IMPORT | MERGE | QR | REFERRAL | SEARCH
+  source           String             @default("SUPER_APP")
+  /// Customer-controlled presentation state for the Super App business list.
+  isPinned         Boolean            @default(false)
+  isHidden         Boolean            @default(false)
+  isFavourite      Boolean            @default(false)
+  /// Drives the "recent businesses" list and the default active business.
+  lastAccessedAt   DateTime?
+  /// Denormalised counters so the business card renders without N queries.
+  unreadPromotions Int                @default(0)
+  linkedAt         DateTime           @default(now())
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  identity     VhicasarId   @relation(fields: [vhicasarId], references: [id])
+  organization Organization @relation(fields: [organizationId], references: [id])
+  customer     Customer     @relation(fields: [customerId], references: [id])
+
+  @@unique([vhicasarId, organizationId])
+  @@index([organizationId])
+  @@index([vhicasarId])
+}
+
+/// Registered device for a VhicasarId — the basis of device trust, biometric
+/// payment confirmation, and replay protection for Vhicasar Pay (Flutter Bible
+/// §14/§16, System Bible §7 device trust).
+model Device {
+  id                 String           @id @default(cuid())
+  vhicasarId         String
+  /// Stable hardware/install identifier reported by the app.
+  deviceId           String
+  platform           String // android | ios | web
+  model              String?
+  osVersion          String?
+  appVersion         String?
+  /// Public key (base64) the device signs payment confirmations with; the
+  /// private key never leaves the device secure enclave / keystore.
+  publicKey          String?          @db.Text
+  pushToken          String?
+  trustLevel         DeviceTrustLevel @default(UNTRUSTED)
+  isBiometricEnabled Boolean          @default(false)
+  lastSeenAt         DateTime?
+  lastIp             String?
+  revokedAt          DateTime?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  identity VhicasarId @relation(fields: [vhicasarId], references: [id])
+
+  @@unique([vhicasarId, deviceId])
+  @@index([vhicasarId])
+}
+
+/// Transactional outbox for the platform Event Bus (System Bible II §9 / III).
+/// Modules append events in the same DB transaction as their state change; a
+/// dispatcher publishes them and marks them PUBLISHED. Event-driven decoupling
+/// without a broker in the monolith; the extraction point when services split.
+model DomainEvent {
+  id             String            @id @default(cuid())
+  organizationId String?
+  /// Event name, e.g. "PaymentCompleted", "CustomerCreated".
+  name           String
+  aggregateType  String
+  aggregateId    String
+  payload        Json
+  correlationId  String?
+  status         DomainEventStatus @default(PENDING)
+  occurredAt     DateTime          @default(now())
+  publishedAt    DateTime?
+  attempts       Int               @default(0)
+  lastError      String?
+
+  @@index([status, occurredAt])
+  @@index([organizationId, name])
+  @@index([aggregateType, aggregateId])
+}
+
+// ============================================================
+// VHICASAR PAY — wallet (double-entry ledger) + payment sessions
+// v2.0 Phase 2. Database Bible §9. Amounts use Decimal (consistent with
+// Payment.amount). Money integrity: sessions immutable after completion,
+// QR sessions auto-expire, settlement items never deleted, full audit.
+// ============================================================
+
+enum WalletOwnerType {
+  VHICASAR_ID // consumer wallet
+  ORGANIZATION // merchant / fees wallet
+  PLATFORM // system clearing / suspense accounts
+}
+
+enum WalletPurpose {
+  USER
+  MERCHANT
+  FEES
+  GATEWAY_CLEARING // external top-ups/withdrawals land here
+  SETTLEMENT_PAYABLE // merchant funds awaiting payout
+  REWARDS_POOL // platform liability for universal reward redemptions
+}
+
+enum WalletStatus {
+  ACTIVE
+  FROZEN
+  CLOSED
+}
+
+enum WalletTxType {
+  TOPUP
+  WITHDRAWAL
+  TRANSFER
+  PAYMENT
+  REFUND
+  SETTLEMENT
+  FEE
+  ADJUSTMENT
+  REVERSAL
+}
+
+enum WalletTxStatus {
+  PENDING
+  POSTED
+  REVERSED
+  FAILED
+}
+
+enum EntryDirection {
+  DEBIT // decreases wallet balance
+  CREDIT // increases wallet balance
+}
+
+enum PaymentSessionStatus {
+  CREATED
+  AUTHORIZED
+  COMPLETED
+  EXPIRED
+  CANCELLED
+  FAILED
+}
+
+enum PaymentAttemptStatus {
+  STARTED
+  SUCCEEDED
+  FAILED
+  BLOCKED
+}
+
+enum PayMethod {
+  WALLET
+  CARD
+  BANK_TRANSFER
+}
+
+enum SettlementStatus {
+  PENDING
+  /// Waiting on a human decision (approval threshold, dual approval, review).
+  AWAITING_APPROVAL
+  /// Held by the engine — risk, velocity, or an unverified destination.
+  ON_HOLD
+  PROCESSING
+  PAID
+  FAILED
+  CANCELLED
+}
+
+enum ChargebackStatus {
+  OPENED
+  WON
+  LOST
+  REVERSED
+}
+
+/// A ledger account. Consumer wallets belong to a VhicasarId; merchant/fees
+/// wallets to an Organization; clearing/suspense accounts are PLATFORM.
+/// `balance` is a cached running total; the WalletEntry rows are the source of
+/// truth and always reconcile to it.
+model Wallet {
+  id              String          @id @default(cuid())
+  ownerType       WalletOwnerType
+  vhicasarId      String?
+  organizationId  String?
+  /// Well-known key for PLATFORM accounts, e.g. "GATEWAY_CLEARING:NGN".
+  platformKey     String?
+  purpose         WalletPurpose
+  currency        String          @db.Char(3)
+  /// Spendable, withdrawable balance.
+  balance         Decimal         @default(0) @db.Decimal(20, 4)
+  /// Reserved by the customer for in-platform spend only — never withdrawable
+  /// or transferable, but still the customer's money (§22).
+  lockedBalance   Decimal         @default(0) @db.Decimal(20, 4)
+  /// Earned via reward campaigns; spendable, may expire, not withdrawable.
+  rewardBalance   Decimal         @default(0) @db.Decimal(20, 4)
+  /// Cashback earned from promotions; behaves like reward funds.
+  cashbackBalance Decimal         @default(0) @db.Decimal(20, 4)
+  status          WalletStatus    @default(ACTIVE)
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  identity     VhicasarId?   @relation(fields: [vhicasarId], references: [id])
+  organization Organization? @relation(fields: [organizationId], references: [id])
+  entries      WalletEntry[]
+
+  @@unique([vhicasarId, currency]) // one consumer wallet per currency
+  @@unique([organizationId, purpose, currency]) // one org wallet per purpose+currency
+  @@unique([platformKey])
+  @@index([ownerType, purpose])
+}
+
+/// A balanced posting (journal). Its entries always sum debits == credits.
+model WalletTransaction {
+  id                  String         @id @default(cuid())
+  type                WalletTxType
+  status              WalletTxStatus @default(POSTED)
+  currency            String         @db.Char(3)
+  /// Principal amount of the posting (convenience; entries are authoritative).
+  amount              Decimal        @db.Decimal(20, 4)
+  organizationId      String? // context org, when applicable
+  initiatorVhicasarId String?
+  reference           String?
+  idempotencyKey      String?        @unique
+  paymentSessionId    String?
+  description         String?
+  metadata            Json?
+  createdAt           DateTime       @default(now())
+  postedAt            DateTime?
+  reversedById        String? // WalletTransaction that reversed this one
+
+  entries WalletEntry[]
+
+  @@index([organizationId, createdAt])
+  @@index([initiatorVhicasarId, createdAt])
+  @@index([type, status])
+}
+
+/// One leg of a double-entry posting. Immutable. `balanceAfter` is the wallet's
+/// running balance immediately after this entry, enabling fast statements and
+/// tamper-evident reconciliation.
+model WalletEntry {
+  id            String         @id @default(cuid())
+  transactionId String
+  walletId      String
+  direction     EntryDirection
+  /// Which sub-balance moved. Keeps locked/reward money auditable separately
+  /// from ordinary spendable funds (§12, §22).
+  bucket        WalletBucket   @default(AVAILABLE)
+  amount        Decimal        @db.Decimal(20, 4)
+  balanceAfter  Decimal        @db.Decimal(20, 4)
+  currency      String         @db.Char(3)
+  createdAt     DateTime       @default(now())
+
+  transaction WalletTransaction @relation(fields: [transactionId], references: [id])
+  wallet      Wallet            @relation(fields: [walletId], references: [id])
+
+  @@index([walletId, createdAt])
+  @@index([transactionId])
+}
+
+/// Server-issued, one-time, expiring, signed payment session (Vhicasar Pay).
+/// The merchant creates it; the customer scans the dynamic QR and confirms.
+/// Immutable once COMPLETED (enforced in the service). Never trust client
+/// amounts — the amount here is authoritative (API/Flutter Bibles).
+model PaymentSession {
+  id                    String               @id @default(cuid())
+  organizationId        String
+  branchId              String?
+  registerId            String?
+  amount                Decimal              @db.Decimal(14, 2)
+  currency              String               @db.Char(3)
+  status                PaymentSessionStatus @default(CREATED)
+  method                PayMethod            @default(WALLET)
+  description           String?
+  reference             String?
+  /// Opaque token embedded in the dynamic QR (also the lookup key).
+  sessionToken          String               @unique
+  nonce                 String
+  /// HMAC over token+amount+currency+expiresAt — detects QR tampering.
+  signature             String
+  expiresAt             DateTime
+  /// Filled when a customer scans/authorizes the session.
+  customerVhicasarId    String?
+  deviceId              String?
+  paymentId             String? // resulting Payment row
+  walletTransactionId   String?
+  idempotencyKey        String?              @unique
+  createdByMembershipId String?
+  riskScore             Int?
+  metadata              Json?
+  createdAt             DateTime             @default(now())
+  authorizedAt          DateTime?
+  completedAt           DateTime?
+
+  organization Organization     @relation(fields: [organizationId], references: [id])
+  attempts     PaymentAttempt[]
+
+  @@index([organizationId, status, createdAt])
+  @@index([customerVhicasarId])
+  @@index([status, expiresAt])
+}
+
+model PaymentAttempt {
+  id            String               @id @default(cuid())
+  sessionId     String
+  vhicasarId    String?
+  deviceId      String?
+  status        PaymentAttemptStatus @default(STARTED)
+  riskScore     Int?
+  failureReason String?
+  ipAddress     String?
+  createdAt     DateTime             @default(now())
+
+  session PaymentSession @relation(fields: [sessionId], references: [id])
+
+  @@index([sessionId])
+  @@index([vhicasarId, createdAt])
+}
+
+/// Merchant payout. Settlement items are never deleted (Database Bible §9).
+model Settlement {
+  id                   String           @id @default(cuid())
+  organizationId       String
+  branchId             String?
+  /// Destination chosen by the engine at calculation time.
+  settlementAccountId  String?
+  currency             String           @db.Char(3)
+  grossAmount          Decimal          @db.Decimal(14, 2)
+  feeAmount            Decimal          @default(0) @db.Decimal(14, 2)
+  taxAmount            Decimal          @default(0) @db.Decimal(14, 2)
+  /// Held back against chargebacks; released once reserveReleaseAt passes.
+  reserveAmount        Decimal          @default(0) @db.Decimal(14, 2)
+  netAmount            Decimal          @db.Decimal(14, 2)
+  status               SettlementStatus @default(PENDING)
+  payoutRef            String?
+  periodStart          DateTime?
+  periodEnd            DateTime?
+  /// Earliest the engine may execute this, after delay rules are applied.
+  scheduledFor         DateTime?
+  reserveReleaseAt     DateTime?
+  /// Set when the rule (or the amount) demands a human decision.
+  requiresApproval     Boolean          @default(false)
+  approvedByUserId     String?
+  approvedAt           DateTime?
+  /// Second signature, where dual approval applies.
+  secondApproverUserId String?
+  secondApprovedAt     DateTime?
+  attempts             Int              @default(0)
+  failureReason        String?
+  /// 0-100. Above the platform threshold the engine holds for review.
+  riskScore            Int?
+  createdAt            DateTime         @default(now())
+  paidAt               DateTime?
+
+  organization      Organization       @relation(fields: [organizationId], references: [id])
+  settlementAccount SettlementAccount? @relation(fields: [settlementAccountId], references: [id])
+  items             SettlementItem[]
+  payout            Payout?
+
+  @@index([organizationId, status, createdAt])
+  @@index([status, scheduledFor])
+}
+
+model SettlementItem {
+  id                  String   @id @default(cuid())
+  settlementId        String
+  paymentId           String?
+  walletTransactionId String?
+  amount              Decimal  @db.Decimal(14, 2)
+  createdAt           DateTime @default(now())
+
+  settlement Settlement @relation(fields: [settlementId], references: [id])
+
+  @@index([settlementId])
+}
+
+model Chargeback {
+  id             String           @id @default(cuid())
+  organizationId String
+  paymentId      String
+  amount         Decimal          @db.Decimal(14, 2)
+  currency       String           @db.Char(3)
+  reason         String?
+  status         ChargebackStatus @default(OPENED)
+  createdAt      DateTime         @default(now())
+  resolvedAt     DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  payment      Payment      @relation(fields: [paymentId], references: [id])
+
+  @@index([organizationId, status])
+  @@index([paymentId])
+}
+
+// ============================================================
+// FRAUD / TRUST ENGINE — v2.0 Phase 3. System Bible III (Fraud Service).
+// Risk scoring, device/cashier/merchant trust, manual review queue.
+// ============================================================
+
+enum RiskDecision {
+  ALLOW
+  REVIEW
+  BLOCK
+}
+
+enum FraudAlertSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum FraudAlertStatus {
+  OPEN
+  REVIEWING
+  CONFIRMED
+  DISMISSED
+}
+
+enum TrustSubjectType {
+  DEVICE
+  CASHIER
+  MERCHANT
+  CUSTOMER
+}
+
+/// One risk evaluation of a payment/transfer. Immutable audit of why a decision
+/// was made (signal codes in `reasons`).
+model RiskAssessment {
+  id             String       @id @default(cuid())
+  subjectType    String // PAYMENT_SESSION | TRANSFER | TOPUP
+  subjectId      String
+  vhicasarId     String?
+  organizationId String?
+  deviceId       String?
+  score          Int // 0 (safe) .. 100 (risky)
+  decision       RiskDecision
+  reasons        Json // [{ code, points, detail }]
+  createdAt      DateTime     @default(now())
+
+  @@index([subjectType, subjectId])
+  @@index([organizationId, createdAt])
+  @@index([vhicasarId, createdAt])
+}
+
+/// Manual-review queue entry raised when a decision is REVIEW/BLOCK.
+model FraudAlert {
+  id                     String             @id @default(cuid())
+  organizationId         String?
+  vhicasarId             String?
+  subjectType            String
+  subjectId              String
+  severity               FraudAlertSeverity @default(MEDIUM)
+  status                 FraudAlertStatus   @default(OPEN)
+  score                  Int
+  reasons                Json
+  assignedToMembershipId String?
+  resolution             String?
+  resolvedAt             DateTime?
+  createdAt              DateTime           @default(now())
+
+  @@index([organizationId, status, createdAt])
+  @@index([status, createdAt])
+  @@index([vhicasarId])
+}
+
+/// Rolling trust score for a device, cashier, merchant or customer. Nudged up
+/// by clean activity and down by fraud outcomes; feeds the risk engine.
+model TrustScore {
+  id          String           @id @default(cuid())
+  subjectType TrustSubjectType
+  subjectId   String
+  score       Int              @default(50) // 0 (untrusted) .. 100 (trusted)
+  lastEventAt DateTime?
+  updatedAt   DateTime         @updatedAt
+
+  @@unique([subjectType, subjectId])
+}
+
+// ============================================================
+// POINT OF SALE — v2.0 Phase 4. Database Bible §8 / System Bible III (POS).
+// Registers, shifts, cash drawer movements, receipts. Sales are taken via
+// Vhicasar Pay sessions (QR/wallet) or recorded as cash against the shift.
+// ============================================================
+
+enum RegisterStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum ShiftStatus {
+  OPEN
+  CLOSED
+}
+
+enum CashMovementType {
+  OPENING_FLOAT
+  SALE // cash taken in for a sale
+  PAYIN // miscellaneous cash added
+  PAYOUT // cash removed (expense)
+  REFUND // cash returned to a customer
+  DROP // cash moved to the safe
+}
+
+/// A POS terminal / till.
+model Register {
+  id             String         @id @default(cuid())
+  organizationId String
+  branchId       String?
+  name           String
+  code           String
+  status         RegisterStatus @default(ACTIVE)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  deletedAt      DateTime?
+
+  shifts PosShift[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId])
+}
+
+/// A cashier session on a register. Expected vs counted cash yields variance.
+model PosShift {
+  id                   String      @id @default(cuid())
+  organizationId       String
+  registerId           String
+  openedByMembershipId String?
+  closedByMembershipId String?
+  status               ShiftStatus @default(OPEN)
+  currency             String      @db.Char(3)
+  openingFloat         Decimal     @default(0) @db.Decimal(14, 2)
+  countedCash          Decimal?    @db.Decimal(14, 2)
+  expectedCash         Decimal?    @db.Decimal(14, 2)
+  variance             Decimal?    @db.Decimal(14, 2)
+  notes                String?
+  openedAt             DateTime    @default(now())
+  closedAt             DateTime?
+
+  register  Register       @relation(fields: [registerId], references: [id])
+  movements CashMovement[]
+  receipts  Receipt[]
+
+  @@index([organizationId, status])
+  @@index([registerId, status])
+}
+
+model CashMovement {
+  id                    String           @id @default(cuid())
+  organizationId        String
+  shiftId               String
+  type                  CashMovementType
+  amount                Decimal          @db.Decimal(14, 2)
+  reason                String?
+  createdByMembershipId String?
+  createdAt             DateTime         @default(now())
+
+  shift PosShift @relation(fields: [shiftId], references: [id])
+
+  @@index([shiftId, createdAt])
+}
+
+/// Issued receipt for a POS sale. Sequential per organisation.
+model Receipt {
+  id                 String   @id @default(cuid())
+  organizationId     String
+  number             Int
+  shiftId            String?
+  registerId         String?
+  orderId            String?
+  paymentId          String?
+  paymentSessionId   String?
+  method             String // WALLET | CASH | CARD …
+  total              Decimal  @db.Decimal(14, 2)
+  currency           String   @db.Char(3)
+  customerVhicasarId String?
+  issuedAt           DateTime @default(now())
+
+  shift PosShift? @relation(fields: [shiftId], references: [id])
+
+  @@unique([organizationId, number])
+  @@index([organizationId, issuedAt])
+}
+
+// ============================================================
+// CROSS-CUTTING — v2.0 Phase 6. API Bible §10 (idempotency).
+// ============================================================
+
+/// Stores the outcome of an idempotent request so a retry with the same
+/// Idempotency-Key replays the original response instead of repeating the work.
+model IdempotencyKey {
+  id           String   @id @default(cuid())
+  scope        String // "org:<id>" | "app:<vhicasarId>" | "anon"
+  key          String
+  method       String
+  path         String
+  status       String   @default("IN_PROGRESS") // IN_PROGRESS | COMPLETED
+  responseCode Int?
+  responseBody Json?
+  createdAt    DateTime @default(now())
+
+  @@unique([scope, key])
+  @@index([createdAt])
+}
+
+// ============================================================
+// SUPER APP SESSIONS, PAYOUTS, KYC, REPLAY PROTECTION
+// v2.0 completion pass. Bibles: API §3, DB §9/§24, Flutter §13/§16.
+// ============================================================
+
+enum PayoutAccountType {
+  BANK_ACCOUNT
+  MOBILE_MONEY
+}
+
+enum PayoutAccountStatus {
+  UNVERIFIED
+  VERIFIED
+  REJECTED
+}
+
+enum PayoutStatus {
+  PENDING
+  PROCESSING
+  PAID
+  FAILED
+  REVERSED
+}
+
+enum KycStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// Rotating refresh tokens for the Customer Super App. Mirrors the business
+/// RefreshToken design: opaque + hashed at rest, rotation families so a
+/// replayed token burns the whole family (API Bible §18 replay prevention).
+model AppRefreshToken {
+  id         String    @id @default(cuid())
+  vhicasarId String
+  tokenHash  String    @unique
+  familyId   String
+  deviceId   String?
+  userAgent  String?
+  ipAddress  String?
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  replacedBy String?
+  createdAt  DateTime  @default(now())
+
+  identity VhicasarId @relation(fields: [vhicasarId], references: [id])
+
+  @@index([vhicasarId])
+  @@index([familyId])
+}
+
+/// Bank / mobile-money destination for real money leaving the platform —
+/// consumer cash-out and merchant settlement payout. Account numbers are
+/// encrypted at rest (Database Bible §24); only a masked tail is displayed.
+model PayoutAccount {
+  id               String              @id @default(cuid())
+  /// Exactly one owner: a consumer identity OR an organization.
+  vhicasarId       String?
+  organizationId   String?
+  type             PayoutAccountType   @default(BANK_ACCOUNT)
+  status           PayoutAccountStatus @default(UNVERIFIED)
+  accountName      String
+  /// AES-256-GCM ciphertext (shared/crypto.ts encrypt()).
+  accountNumberEnc String
+  /// Last 4 digits, safe to display.
+  accountLast4     String              @db.Char(4)
+  bankCode         String?
+  bankName         String?
+  currency         String              @db.Char(3)
+  country          String?             @db.Char(2)
+  /// Gateway-side recipient id (e.g. Paystack transfer recipient code).
+  providerRef      String?
+  provider         String?
+  isDefault        Boolean             @default(false)
+  verifiedAt       DateTime?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+  deletedAt        DateTime?
+
+  identity     VhicasarId?   @relation(fields: [vhicasarId], references: [id])
+  organization Organization? @relation(fields: [organizationId], references: [id])
+  payouts      Payout[]
+
+  @@index([vhicasarId])
+  @@index([organizationId])
+}
+
+/// A real disbursement of funds out of the platform to a PayoutAccount.
+/// Never deleted — financial record (Database Bible §9/§21).
+model Payout {
+  id                  String       @id @default(cuid())
+  /// Consumer cash-out sets vhicasarId; merchant settlement sets organizationId.
+  vhicasarId          String?
+  organizationId      String?
+  payoutAccountId     String
+  settlementId        String?      @unique
+  currency            String       @db.Char(3)
+  amount              Decimal      @db.Decimal(20, 4)
+  feeAmount           Decimal      @default(0) @db.Decimal(20, 4)
+  netAmount           Decimal      @db.Decimal(20, 4)
+  status              PayoutStatus @default(PENDING)
+  provider            String?
+  providerRef         String?
+  failureReason       String?
+  /// Ledger transaction that reserved the funds.
+  walletTransactionId String?
+  idempotencyKey      String?      @unique
+  requestedAt         DateTime     @default(now())
+  processedAt         DateTime?
+  metadata            Json?
+
+  payoutAccount PayoutAccount @relation(fields: [payoutAccountId], references: [id])
+  settlement    Settlement?   @relation(fields: [settlementId], references: [id])
+
+  @@index([vhicasarId, status])
+  @@index([organizationId, status])
+  @@index([providerRef])
+}
+
+/// KYC verification for a Vhicasar ID. Gates wallet/payout limits — a consumer
+/// cannot cash out above the unverified ceiling until APPROVED.
+model KycSubmission {
+  id                String    @id @default(cuid())
+  vhicasarId        String
+  level             KycLevel  @default(BASIC)
+  status            KycStatus @default(PENDING)
+  /// ID document type: NIN | BVN | PASSPORT | DRIVERS_LICENSE | VOTER_ID
+  documentType      String
+  /// Encrypted document number (personal identifier — Database Bible §24).
+  documentNumberEnc String
+  documentFileId    String?
+  selfieFileId      String?
+  fullName          String?
+  dateOfBirth       DateTime?
+  address           String?
+  /// Set by the reviewing platform admin.
+  reviewedBy        String?
+  reviewNotes       String?
+  submittedAt       DateTime  @default(now())
+  reviewedAt        DateTime?
+
+  identity VhicasarId @relation(fields: [vhicasarId], references: [id])
+
+  @@index([vhicasarId, status])
+  @@index([status, submittedAt])
+}
+
+/// Single-use nonce consumed when confirming a payment with a device
+/// signature. Guarantees a captured signature can never be replayed
+/// (Flutter Bible §16 replay protection).
+model PaymentNonce {
+  id         String    @id @default(cuid())
+  vhicasarId String
+  deviceId   String
+  nonce      String
+  sessionId  String?
+  expiresAt  DateTime
+  usedAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@unique([vhicasarId, nonce])
+  @@index([expiresAt])
+}
+
+enum WebhookDeliveryStatus {
+  PENDING
+  DELIVERED
+  FAILED
+}
+
+/// Per-attempt delivery log for outbound webhooks (API Bible §13 — deliveries
+/// must be signed, timestamped, retried, idempotent and inspectable).
+model WebhookDelivery {
+  id             String                @id @default(cuid())
+  organizationId String
+  endpointId     String
+  event          String
+  /// Stable id sent as X-Vhicasar-Delivery so receivers can de-duplicate.
+  deliveryId     String                @unique
+  payload        Json
+  status         WebhookDeliveryStatus @default(PENDING)
+  attempts       Int                   @default(0)
+  responseStatus Int?
+  error          String?
+  nextAttemptAt  DateTime?
+  createdAt      DateTime              @default(now())
+  deliveredAt    DateTime?
+
+  @@index([organizationId, createdAt])
+  @@index([status, nextAttemptAt])
+  @@index([endpointId])
+}
+
+enum RewardLedgerType {
+  EARN
+  REDEEM
+  EXPIRE
+  ADJUSTMENT
+  REVERSAL
+}
+
+enum RewardTier {
+  BRONZE
+  SILVER
+  GOLD
+  PLATINUM
+}
+
+/// Universal (cross-business) rewards balance for a Vhicasar ID.
+///
+/// Distinct from the per-org LoyaltyAccount: these points are earned at ANY
+/// participating business through Vhicasar Pay and are spendable at ANY other,
+/// which is the "universal rewards" differentiator. Not org-scoped.
+model RewardAccount {
+  id         String     @id @default(cuid())
+  vhicasarId String     @unique
+  balance    Int        @default(0)
+  lifetime   Int        @default(0)
+  tier       RewardTier @default(BRONZE)
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+
+  entries RewardLedger[]
+
+  @@index([tier])
+}
+
+/// Immutable per-movement reward ledger. Never updated after write, so a
+/// balance can always be reconstructed from its entries.
+model RewardLedger {
+  id             String           @id @default(cuid())
+  accountId      String
+  vhicasarId     String
+  type           RewardLedgerType
+  points         Int // positive for EARN, negative for REDEEM/EXPIRE
+  balanceAfter   Int
+  /// Business the points were earned at / spent with (null for platform grants).
+  organizationId String?
+  paymentId      String?
+  description    String?
+  /// Set for EARN rows so expiry sweeps can find them.
+  expiresAt      DateTime?
+  createdAt      DateTime         @default(now())
+
+  account RewardAccount @relation(fields: [accountId], references: [id])
+
+  @@index([vhicasarId, createdAt])
+  @@index([accountId, createdAt])
+  @@index([type, expiresAt])
+}
+
+// ============================================================
+// CUSTOMER ECOSYSTEM — discovery, QR joining, loyalty rules,
+// promotions, reward campaigns, locked wallet funds.
+// See docs/v2/CUSTOMER-ECOSYSTEM.md.
+// ============================================================
+
+enum BusinessQrKind {
+  PERMANENT
+  BRANCH
+  EVENT
+  REFERRAL
+  CAMPAIGN
+  EMPLOYEE
+  TABLE
+  PROPERTY
+  PRODUCT
+}
+
+enum LoyaltyTrigger {
+  POS_SALE
+  ORDER
+  BOOKING
+  INVOICE_PAYMENT
+  WALLET_PAYMENT
+  CARD_PAYMENT
+  BANK_TRANSFER
+  CASH_SALE
+  CAMPAIGN
+  REFERRAL
+  MANUAL
+  BIRTHDAY
+  ANNIVERSARY
+  SIGNUP
+}
+
+enum RewardCampaignStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  ENDED
+  SUSPENDED
+}
+
+enum RewardGrantStatus {
+  PENDING_REVIEW
+  GRANTED
+  REJECTED
+  EXPIRED
+  REVERSED
+}
+
+enum WalletBucket {
+  AVAILABLE
+  LOCKED
+  REWARD
+  CASHBACK
+}
+
+/// Public-facing profile a customer sees before joining a business (§2).
+/// Separate from Organization so marketing content can change without touching
+/// the tenant's operational record.
+model BusinessProfile {
+  id                 String   @id @default(cuid())
+  organizationId     String   @unique
+  /// Short public handle used in invite links: vhicasar.com/b/<handle>
+  handle             String?  @unique
+  tagline            String?
+  description        String?  @db.Text
+  coverImageUrl      String?
+  category           String?
+  /// Free-form tags used by search ranking.
+  tags               String[]
+  /// {mon:{open:"08:00",close:"18:00",closed:false}, …}
+  openingHours       Json?
+  latitude           Decimal? @db.Decimal(10, 7)
+  longitude          Decimal? @db.Decimal(10, 7)
+  /// Rolling average of customer ratings, 0–5.
+  rating             Decimal  @default(0) @db.Decimal(3, 2)
+  ratingCount        Int      @default(0)
+  /// Whether the business appears in customer-facing search at all.
+  isDiscoverable     Boolean  @default(true)
+  /// Customers may leave without asking the business.
+  allowSelfLeave     Boolean  @default(true)
+  /// Accept locked wallet funds as payment (§22 business config).
+  acceptsLockedFunds Boolean  @default(true)
+  services           String[]
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([category])
+  @@index([isDiscoverable])
+}
+
+/// A scannable code that associates a customer with a business (§3).
+/// Signed and optionally expiring so a screenshot can't be reused forever.
+model BusinessQr {
+  id                 String         @id @default(cuid())
+  organizationId     String
+  branchId           String?
+  kind               BusinessQrKind @default(PERMANENT)
+  /// Opaque code embedded in the QR payload.
+  code               String         @unique
+  /// HMAC over code+org+kind+expiry — detects tampering.
+  signature          String
+  label              String?
+  /// Referral/campaign attribution carried onto the resulting CustomerLink.
+  campaignId         String?
+  referrerCustomerId String?
+  /// Null = never expires (PERMANENT/BRANCH codes).
+  expiresAt          DateTime?
+  maxScans           Int?
+  scanCount          Int            @default(0)
+  /// Scans that became a CustomerLink — the numerator of the conversion rate.
+  joinCount          Int            @default(0)
+  /// Employee / table / property / product the code belongs to, when the kind
+  /// implies one. Kept as a free identifier so no new FK per kind is needed.
+  subjectId          String?
+  subjectLabel       String?
+  isActive           Boolean        @default(true)
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  organization Organization  @relation(fields: [organizationId], references: [id])
+  scans        QrScanEvent[]
+
+  @@index([organizationId, kind])
+  @@index([code])
+}
+
+/// A single earning or redemption rule in a business's loyalty programme (§5).
+/// Loyalty is an independent engine: Vhicasar Pay is only one of many triggers.
+model LoyaltyRule {
+  id              String         @id @default(cuid())
+  programId       String
+  organizationId  String
+  name            String
+  trigger         LoyaltyTrigger
+  isActive        Boolean        @default(true)
+  /// Points awarded per 1 currency unit of qualifying spend.
+  pointsPerAmount Decimal?       @db.Decimal(10, 4)
+  /// Flat points awarded regardless of amount (birthday, signup, referral).
+  flatPoints      Int?
+  /// Multiplier stacked on top of the programme's base rate.
+  multiplier      Decimal?       @db.Decimal(6, 2)
+  minSpend        Decimal?       @db.Decimal(14, 2)
+  /// Ceiling on points a customer can earn from this rule per day.
+  maxPointsPerDay Int?
+  /// {scope:'ALL'|'CATEGORIES'|'PRODUCTS'|'SERVICES', ids:[]}
+  eligibility     Json?
+  /// Restrict to a tier, e.g. only GOLD members earn double.
+  tier            String?
+  branchId        String?
+  startsAt        DateTime?
+  endsAt          DateTime?
+  priority        Int            @default(0)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  program LoyaltyProgram @relation(fields: [programId], references: [id])
+
+  @@index([organizationId, trigger, isActive])
+  @@index([programId])
+}
+
+/// One customer's use of a promotion — enforces per-customer and total limits.
+model PromotionRedemption {
+  id             String   @id @default(cuid())
+  organizationId String
+  promotionId    String
+  customerId     String
+  vhicasarId     String?
+  orderId        String?
+  paymentId      String?
+  /// Money the customer actually saved / got back.
+  benefitAmount  Decimal  @db.Decimal(14, 2)
+  currency       String   @db.Char(3)
+  redeemedAt     DateTime @default(now())
+
+  promotion Promotion @relation(fields: [promotionId], references: [id])
+
+  @@index([organizationId, promotionId])
+  @@index([promotionId, customerId])
+  @@index([customerId])
+}
+
+/// Platform-funded campaign paying customers to pay with the Vhicasar app
+/// (§11). Managed by Super Admin, spans organisations.
+model RewardCampaign {
+  id                      String               @id @default(cuid())
+  name                    String
+  description             String?              @db.Text
+  status                  RewardCampaignStatus @default(DRAFT)
+  /// Flat amount OR percentage of spend — at least one must be set.
+  rewardAmount            Decimal?             @db.Decimal(14, 2)
+  rewardPercent           Decimal?             @db.Decimal(6, 3)
+  maxRewardPerTxn         Decimal?             @db.Decimal(14, 2)
+  minSpend                Decimal              @default(0) @db.Decimal(14, 2)
+  maxRewardsPerDay        Int?
+  maxRewardsPerMonth      Int?
+  /// Total platform spend allowed; the campaign auto-pauses when exhausted.
+  budget                  Decimal?             @db.Decimal(16, 2)
+  budgetSpent             Decimal              @default(0) @db.Decimal(16, 2)
+  currency                String               @db.Char(3)
+  /// Empty array = every organisation / category / country qualifies.
+  eligibleOrganizationIds String[]
+  eligibleCategories      String[]
+  eligibleCountries       String[]
+  /// Which wallet bucket the reward lands in.
+  targetBucket            WalletBucket         @default(REWARD)
+  /// Days until a granted reward expires; null = never.
+  rewardExpiryDays        Int?
+  /// Where the money comes from: PLATFORM | MERCHANT | SHARED
+  fundingSource           String               @default("PLATFORM")
+  startsAt                DateTime
+  endsAt                  DateTime?
+  createdBy               String?
+  createdAt               DateTime             @default(now())
+  updatedAt               DateTime             @updatedAt
+
+  grants RewardGrant[]
+
+  @@index([status, startsAt])
+}
+
+/// A single reward paid to a customer under a campaign. Immutable financial
+/// record — never deleted, reversed by a compensating grant instead.
+model RewardGrant {
+  id                  String            @id @default(cuid())
+  campaignId          String
+  vhicasarId          String
+  organizationId      String?
+  paymentId           String?
+  /// Qualifying spend that produced this reward.
+  spendAmount         Decimal           @db.Decimal(14, 2)
+  rewardAmount        Decimal           @db.Decimal(14, 2)
+  currency            String            @db.Char(3)
+  status              RewardGrantStatus @default(GRANTED)
+  /// Populated when the fraud engine holds the reward for review.
+  riskScore           Int?
+  reviewNotes         String?
+  walletTransactionId String?
+  idempotencyKey      String            @unique
+  expiresAt           DateTime?
+  createdAt           DateTime          @default(now())
+  settledAt           DateTime?
+
+  campaign RewardCampaign @relation(fields: [campaignId], references: [id])
+
+  @@index([vhicasarId, createdAt])
+  @@index([campaignId, status])
+  @@index([organizationId])
+}
+
+/// Per-customer, per-business preferences that aren't part of the link itself
+/// (notification opt-ins, default payment bucket…).
+model CustomerBusinessPreference {
+  id               String   @id @default(cuid())
+  vhicasarId       String
+  organizationId   String
+  notifyPromotions Boolean  @default(true)
+  notifyOrders     Boolean  @default(true)
+  notifyLoyalty    Boolean  @default(true)
+  /// Preferred order of wallet buckets at checkout for this business.
+  paymentPriority  String[]
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([vhicasarId, organizationId])
+  @@index([organizationId])
+}
+
+/// Immutable record of a customer joining or leaving a business (§18
+/// CustomerBusinessHistory) — needed for audit and re-join analytics.
+model CustomerBusinessHistory {
+  id             String   @id @default(cuid())
+  vhicasarId     String
+  organizationId String
+  /// JOINED | LEFT | BLOCKED | REJOINED | MERGED
+  action         String
+  source         String?
+  qrCode         String?
+  actorType      String   @default("CUSTOMER")
+  metadata       Json?
+  createdAt      DateTime @default(now())
+
+  @@index([vhicasarId, createdAt])
+  @@index([organizationId, createdAt])
+}
+
+/// Client-side crash and error reports (§13).
+///
+/// Captured from the mobile apps so a render failure or route error is visible
+/// to the platform team instead of only to the customer who hit it.
+model ClientError {
+  id             String   @id @default(cuid())
+  /// WIDGET | UNHANDLED | NAVIGATION | API | PAYMENT | STATE
+  kind           String
+  message        String   @db.Text
+  stack          String?  @db.Text
+  screen         String?
+  vhicasarId     String?
+  organizationId String?
+  endpoint       String?
+  correlationId  String?
+  device         Json?
+  appFlavor      String?
+  extra          Json?
+  occurredAt     DateTime @default(now())
+  createdAt      DateTime @default(now())
+
+  @@index([kind, occurredAt])
+  @@index([vhicasarId])
+  @@index([organizationId, occurredAt])
+}
+
+// ============================================================
+// CUSTOMER ACTIVITY CENTER (§15)
+// The Super App as the customer's operating dashboard across every
+// business they deal with. See docs/v2/ACTIVITY-CENTER.md.
+// ============================================================
+
+enum CustomerNotificationCategory {
+  ORDER
+  PAYMENT
+  PROMOTION
+  BOOKING
+  REWARD
+  SUPPORT
+  DOCUMENT
+  SYSTEM
+}
+
+enum CustomerDocumentKind {
+  INVOICE
+  RECEIPT
+  QUOTATION
+  CONTRACT
+  PROPERTY_AGREEMENT
+  BOOKING_CONFIRMATION
+  WARRANTY
+  MEMBERSHIP_CERTIFICATE
+  INSPECTION_REPORT
+  OTHER
+}
+
+/// A notification addressed to a *customer* rather than a business user.
+///
+/// The existing `Notification` model is keyed to `User` (staff). Consumers live
+/// on `VhicasarId` and see notifications from many organisations at once, so
+/// they need their own feed — grouped by business and category (§15).
+model CustomerNotification {
+  id             String                       @id @default(cuid())
+  vhicasarId     String
+  /// Null for platform-level messages (reward expiry, security).
+  organizationId String?
+  category       CustomerNotificationCategory
+  title          String
+  body           String?                      @db.Text
+  /// Deep-link payload: { deeplink, recordId, … } — always resolves to the
+  /// right screen inside the right business.
+  data           Json?
+  readAt         DateTime?
+  createdAt      DateTime                     @default(now())
+
+  @@index([vhicasarId, readAt, createdAt])
+  @@index([vhicasarId, organizationId])
+  @@index([vhicasarId, category])
+}
+
+/// A document a business issued to a customer (§15 "My Documents").
+///
+/// Points at the business's existing `File` rather than copying bytes, so the
+/// vault never duplicates storage and a revoked file disappears everywhere.
+model CustomerDocument {
+  id             String               @id @default(cuid())
+  vhicasarId     String
+  organizationId String
+  kind           CustomerDocumentKind
+  title          String
+  /// Underlying stored file, when the business produced one.
+  fileId         String?
+  /// Source record, so "open the invoice this receipt belongs to" works.
+  sourceType     String?
+  sourceId       String?
+  amount         Decimal?             @db.Decimal(14, 2)
+  currency       String?              @db.Char(3)
+  /// Whether the customer may share it onward.
+  isShareable    Boolean              @default(true)
+  issuedAt       DateTime             @default(now())
+  createdAt      DateTime             @default(now())
+
+  @@index([vhicasarId, issuedAt])
+  @@index([vhicasarId, kind])
+  @@index([organizationId])
+}
+
+/// Per-customer personalisation for the Activity Center (§15).
+/// One row per Vhicasar ID; settings follow the account across devices.
+model CustomerPreference {
+  id                      String   @id @default(cuid())
+  vhicasarId              String   @unique
+  /// Ordered widget keys — the customer's dashboard layout.
+  dashboardWidgets        String[]
+  /// Widgets kept at the top regardless of order.
+  pinnedWidgets           String[]
+  favouriteCategories     String[]
+  /// Business the app opens to when nothing else is selected.
+  defaultOrganizationId   String?
+  /// Bucket order used at checkout unless overridden per payment.
+  paymentPriority         String[]
+  theme                   String   @default("system")
+  locale                  String   @default("en")
+  currency                String   @default("NGN") @db.Char(3)
+  /// Category → bool. Absent means "notify me".
+  notificationPreferences Json?
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+}
+
+// ============================================================================
+// Platform Experience, Localization, Security & Settlement Upgrade
+// ============================================================================
+
+/// How a customer proves a sensitive action is really them (§1).
+enum TransactionAuthMode {
+  PIN_ONLY
+  BIOMETRIC_ONLY
+  PIN_AND_BIOMETRIC
+  /// Step up only when risk warrants it — the recommended default.
+  ADAPTIVE
+}
+
+/// Transaction-security settings for one Vhicasar ID (§1).
+///
+/// Kept off VhicasarId so the hot identity row stays small and so lockout
+/// counters can be written on every failed attempt without touching identity.
+model TransactionSecurity {
+  id                 String              @id @default(cuid())
+  vhicasarId         String              @unique
+  /// Argon2 hash of the PIN. Never plaintext, never reversible.
+  pinHash            String?
+  /// Length the customer chose, so the keypad can size itself without the hash.
+  pinLength          Int?
+  authMode           TransactionAuthMode @default(ADAPTIVE)
+  isBiometricEnabled Boolean             @default(false)
+  /// Consecutive failures since the last success.
+  failedAttempts     Int                 @default(0)
+  /// Set when failedAttempts crosses the policy threshold.
+  lockedUntil        DateTime?
+  /// Payments at or above this need a PIN even in ADAPTIVE mode.
+  highValueThreshold Decimal?            @db.Decimal(14, 2)
+  /// Devices the customer has confirmed; an unknown device always steps up.
+  trustedDeviceIds   String[]
+  pinUpdatedAt       DateTime?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  identity VhicasarId @relation(fields: [vhicasarId], references: [id])
+}
+
+/// A single-use, identity-verified token that authorises setting a new PIN
+/// after the customer forgot theirs (§1). Short-lived and consumed on use.
+model PinResetToken {
+  id         String    @id @default(cuid())
+  vhicasarId String
+  /// SHA-256 of the raw token — the raw value only ever leaves in the OTP.
+  tokenHash  String    @unique
+  /// How identity was proven: PHONE_OTP, EMAIL_OTP, KYC.
+  method     String
+  expiresAt  DateTime
+  usedAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([vhicasarId, expiresAt])
+}
+
+/// Where a customer currently is, and what that implies for money and language
+/// (§2, §5). Consent-gated: precision is only as high as the customer allowed.
+model CustomerLocation {
+  id           String   @id @default(cuid())
+  vhicasarId   String   @unique
+  country      String?  @db.Char(2)
+  region       String?
+  city         String?
+  timeZone     String?
+  /// Currency implied by the detected country.
+  currency     String?  @db.Char(3)
+  locale       String?
+  /// Which signal won: GPS, SIM, DEVICE_LOCALE, IP, PROFILE, BUSINESS_DEFAULT.
+  source       String
+  /// What the customer agreed to share: NONE, COARSE, PRECISE.
+  consentLevel String   @default("NONE")
+  latitude     Decimal? @db.Decimal(9, 6)
+  longitude    Decimal? @db.Decimal(9, 6)
+  detectedAt   DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  identity VhicasarId @relation(fields: [vhicasarId], references: [id])
+}
+
+/// One scan of a business QR, whether or not it became a join (§6).
+model QrScanEvent {
+  id             String   @id @default(cuid())
+  businessQrId   String
+  organizationId String
+  /// Set when the scan turned into a CustomerLink.
+  vhicasarId     String?
+  didJoin        Boolean  @default(false)
+  /// Coarse only — city/country, never a precise position.
+  country        String?  @db.Char(2)
+  city           String?
+  userAgent      String?
+  createdAt      DateTime @default(now())
+
+  businessQr BusinessQr @relation(fields: [businessQrId], references: [id])
+
+  @@index([businessQrId, createdAt])
+  @@index([organizationId, createdAt])
+}
+
+enum SettlementAccountType {
+  BANK_ACCOUNT
+  VIRTUAL_ACCOUNT
+  DIGITAL_WALLET
+}
+
+enum SettlementAccountStatus {
+  PENDING_VERIFICATION
+  VERIFIED
+  REJECTED
+  SUSPENDED
+  BLACKLISTED
+}
+
+/// Where an organization's money is settled to (§8).
+///
+/// Separate from PayoutAccount, which is a *gateway recipient* for one-off
+/// disbursements. A settlement account is the standing destination the
+/// settlement engine pays into, and it carries its own verification state.
+model SettlementAccount {
+  id                 String                  @id @default(cuid())
+  organizationId     String
+  /// Null = organization-wide. Set = this branch settles separately.
+  branchId           String?
+  /// Optional finer split, e.g. a business unit within a branch.
+  businessUnit       String?
+  type               SettlementAccountType   @default(BANK_ACCOUNT)
+  status             SettlementAccountStatus @default(PENDING_VERIFICATION)
+  bankName           String?
+  bankCode           String?
+  /// AES-256-GCM ciphertext — the full number is never stored in the clear.
+  accountNumberEnc   String
+  /// Deterministic hash of country+bankCode+accountNumber, so duplicates and
+  /// blacklist hits are detected without decrypting anything.
+  accountFingerprint String
+  accountLast4       String                  @db.Char(4)
+  accountName        String
+  country            String                  @db.Char(2)
+  currency           String                  @db.Char(3)
+  /// Lower runs first when several accounts could receive a settlement.
+  priority           Int                     @default(100)
+  isDefault          Boolean                 @default(false)
+  /// What the bank said the account name is — compared against accountName.
+  verifiedName       String?
+  verifiedAt         DateTime?
+  verificationRef    String?
+  rejectionReason    String?
+  createdByUserId    String?
+  createdAt          DateTime                @default(now())
+  updatedAt          DateTime                @updatedAt
+  deletedAt          DateTime?
+
+  organization Organization              @relation(fields: [organizationId], references: [id])
+  settlements  Settlement[]
+  changes      SettlementAccountChange[]
+
+  @@unique([organizationId, accountFingerprint])
+  @@index([organizationId, status])
+  @@index([accountFingerprint])
+}
+
+/// Every change to a settlement destination, for the security review §11 asks
+/// for. Written before the change takes effect, never deleted.
+model SettlementAccountChange {
+  id                  String    @id @default(cuid())
+  settlementAccountId String
+  organizationId      String
+  /// CREATED, UPDATED, VERIFIED, REJECTED, SUSPENDED, DELETED, SET_DEFAULT.
+  action              String
+  before              Json?
+  after               Json?
+  actorUserId         String?
+  ip                  String?
+  deviceId            String?
+  /// True once a second approver signed off, where dual approval applies.
+  approvedByUserId    String?
+  approvedAt          DateTime?
+  createdAt           DateTime  @default(now())
+
+  settlementAccount SettlementAccount @relation(fields: [settlementAccountId], references: [id])
+
+  @@index([organizationId, createdAt])
+  @@index([settlementAccountId, createdAt])
+}
+
+enum SettlementSchedule {
+  INSTANT
+  HOURLY
+  DAILY
+  WEEKLY
+  MANUAL
+}
+
+/// How one organization's settlements are calculated and released (§10, §11).
+model SettlementRule {
+  id                   String             @id @default(cuid())
+  organizationId       String
+  branchId             String?
+  currency             String?            @db.Char(3)
+  schedule             SettlementSchedule @default(DAILY)
+  /// Local hour of day a DAILY/WEEKLY run fires.
+  runAtHour            Int                @default(2)
+  /// 0=Sunday. Only meaningful for WEEKLY.
+  runOnWeekday         Int?
+  /// Platform fee taken from gross, in percent.
+  feePercent           Decimal            @default(0) @db.Decimal(6, 3)
+  feeFlat              Decimal            @default(0) @db.Decimal(14, 2)
+  taxPercent           Decimal            @default(0) @db.Decimal(6, 3)
+  /// Percentage held back against chargebacks, released after reserveDays.
+  reservePercent       Decimal            @default(0) @db.Decimal(6, 3)
+  reserveDays          Int                @default(0)
+  /// Nothing is released below this, to avoid dust transfers.
+  minimumAmount        Decimal            @default(0) @db.Decimal(14, 2)
+  /// Settlements at or above this need a human approval.
+  approvalThreshold    Decimal?           @db.Decimal(14, 2)
+  requiresDualApproval Boolean            @default(false)
+  /// Hold every settlement this many hours after the payment cleared.
+  delayHours           Int                @default(0)
+  isActive             Boolean            @default(true)
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@unique([organizationId, branchId, currency])
+  @@index([organizationId, isActive])
+}
+
+/// A tone-tagged reply the assistant offered to a staff member (§7).
+/// Logged so nothing is ever sent without a record of what was suggested.
+model AiReplySuggestion {
+  id                String    @id @default(cuid())
+  organizationId    String
+  conversationId    String
+  /// PROFESSIONAL, FRIENDLY, UPSELL, FOLLOW_UP, APPOINTMENT, COMPLAINT, URGENT.
+  tone              String
+  content           String    @db.Text
+  /// Set when a staff member actually sent this one (possibly edited).
+  usedAt            DateTime?
+  wasEdited         Boolean   @default(false)
+  requestedByUserId String?
+  createdAt         DateTime  @default(now())
+
+  @@index([organizationId, conversationId, createdAt])
 }

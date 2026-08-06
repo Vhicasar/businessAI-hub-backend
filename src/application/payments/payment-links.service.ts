@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import { randomBytes } from 'crypto';
 import { z } from 'zod';
 import QRCode from 'qrcode';
@@ -420,6 +421,58 @@ export const paymentLinksService = {
   },
 
   /** Reflect a link payment onto its linked invoice/order (unscoped). */
+  /**
+   * Settle a link paid from a Vhicasar wallet rather than a card gateway.
+   * Mirrors `verify()` so the downstream order/invoice reacts identically —
+   * only the payment method and reference differ.
+   */
+  async settleFromWallet(
+    linkId: string,
+    paidAmount: Prisma.Decimal,
+    walletTransactionId: string,
+    vhicasarId: string,
+  ): Promise<void> {
+    const link = await prismaUnscoped.paymentLink.findUnique({ where: { id: linkId } });
+    if (!link) throw new NotFoundError('Payment link');
+
+    const receiptNumber = `RCPT-${new Date().getFullYear()}-${randomBytes(4).toString('hex').toUpperCase()}`;
+    const paid = Number(paidAmount.toFixed(2));
+
+    await prismaUnscoped.payment.create({
+      data: {
+        organizationId: link.organizationId,
+        customerId: link.customerId,
+        orderId: link.resourceType === 'ORDER' ? link.resourceId : null,
+        invoiceId: link.resourceType === 'INVOICE' ? link.resourceId : null,
+        method: 'WALLET',
+        status: 'PAID',
+        amount: paid,
+        currency: link.currency,
+        provider: 'vhicasar_pay',
+        providerRef: walletTransactionId,
+        paidAt: new Date(),
+        metadata: { paymentLinkId: link.id, token: link.token, receiptNumber, vhicasarId },
+      },
+    });
+
+    const newPaid = round2(Number(link.amountPaid) + paid);
+    const fullyPaid = newPaid >= Number(link.amount) - 0.005;
+    await prismaUnscoped.paymentLink.update({
+      where: { id: link.id },
+      data: {
+        amountPaid: newPaid,
+        status: fullyPaid ? 'PAID' : 'PARTIALLY_PAID',
+        paidAt: fullyPaid ? new Date() : link.paidAt,
+        provider: 'vhicasar_pay',
+        providerRef: walletTransactionId,
+      },
+    });
+
+    await this.settleResource(link.resourceType, link.resourceId).catch((err) =>
+      logger.warn({ err: (err as Error).message, linkId }, 'wallet payment link settle failed'),
+    );
+  },
+
   async settleResource(resourceType: string, resourceId: string | null): Promise<void> {
     if (!resourceId) return;
 
@@ -471,6 +524,20 @@ export const paymentLinksService = {
       await prismaUnscoped.order.update({
         where: { id: resourceId },
         data: { paymentStatus: full ? 'PAID' : 'PARTIALLY_PAID' },
+      });
+    }
+
+    // A chat-created property stay is only a temporary REQUESTED hold until its
+    // payment link is fully paid. Partial/pending links must never confirm it.
+    if (resourceType === 'BOOKING') {
+      const paidLink = await prismaUnscoped.paymentLink.findFirst({
+        where: { resourceType: 'BOOKING', resourceId, status: 'PAID' },
+        select: { id: true },
+      });
+      if (!paidLink) return;
+      await prismaUnscoped.propertyBooking.updateMany({
+        where: { id: resourceId, status: 'REQUESTED' },
+        data: { status: 'CONFIRMED' },
       });
     }
   },

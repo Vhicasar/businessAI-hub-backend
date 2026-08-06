@@ -3,6 +3,9 @@ import { logger } from '../../shared/logger';
 import { paystack, flutterwave, stripe } from '../../infrastructure/payments';
 import type { PaymentProvider } from '../../infrastructure/payments';
 import { billingService } from '../../application/billing/billing.service';
+import { vhicasarPayService } from '../../application/payments/vhicasar-pay.service';
+import { payoutService } from '../../application/payments/payout.service';
+import { prismaUnscoped } from '../../infrastructure/database/prisma';
 
 /**
  * Public payment webhook receivers:
@@ -35,10 +38,58 @@ function makeHandler(provider: PaymentProvider, signatureHeader: string) {
     res.sendStatus(200);
 
     const event = provider.parseWebhookEvent(req.body);
+
+    // Vhicasar Pay wallet top-ups own the `vptop_` reference space — credit the
+    // wallet here instead of running the event through subscription billing.
+    if (event.type === 'charge_success' && event.reference?.startsWith('vptop_')) {
+      void vhicasarPayService.confirmTopUp(event.reference).catch((err) => {
+        logger.error({ err, provider: provider.name, reference: event.reference }, 'Wallet top-up webhook failed');
+      });
+      return;
+    }
+
+    // Bank payouts: `transfer.*` events settle a Payout to its final state so a
+    // customer's money is never left waiting on the reconciliation sweep.
+    void handleTransferEvent(req.body).catch((err) => {
+      logger.error({ err, provider: provider.name }, 'Payout webhook processing failed');
+    });
+
     void billingService.handleWebhookEvent(event).catch((err) => {
       logger.error({ err, provider: provider.name }, 'Payment webhook processing failed');
     });
   };
+}
+
+/**
+ * Resolve a payout from a gateway transfer webhook. Reference-first (that's what
+ * we generated), falling back to the gateway's own id. Both mark* calls are
+ * idempotent, so a replayed webhook is harmless.
+ */
+async function handleTransferEvent(body: unknown): Promise<void> {
+  const evt = body as { event?: string; data?: Record<string, unknown> } | null;
+  const name = String(evt?.event ?? '').toLowerCase();
+  if (!name.startsWith('transfer')) return;
+
+  const data = evt?.data ?? {};
+  const reference = typeof data.reference === 'string' ? data.reference : undefined;
+  const transferCode = typeof data.transfer_code === 'string' ? data.transfer_code : undefined;
+  if (!reference && !transferCode) return;
+
+  const payout = await prismaUnscoped.payout.findFirst({
+    where: {
+      OR: [
+        ...(reference ? [{ idempotencyKey: reference }] : []),
+        ...(transferCode ? [{ providerRef: transferCode }] : []),
+      ],
+    },
+    select: { id: true },
+  });
+  if (!payout) return;
+
+  if (name.includes('success')) await payoutService.markPaid(payout.id);
+  else if (name.includes('failed') || name.includes('reversed')) {
+    await payoutService.markFailed(payout.id, `Gateway reported ${name}`);
+  }
 }
 
 paystackWebhookRoutes.post('/', makeHandler(paystack, 'x-paystack-signature'));

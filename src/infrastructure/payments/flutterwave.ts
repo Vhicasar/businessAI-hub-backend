@@ -3,6 +3,13 @@ import { logger } from '../../shared/logger';
 import { AppError } from '../../shared/errors';
 import { getPaymentConfig, type ResolvedPaymentConfig } from './config';
 import type {
+  BankOption,
+  CreateRecipientInput,
+  CreateRecipientResult,
+  PayoutCapableProvider,
+  TransferInput,
+  TransferResult,
+  TransferState,
   PaymentProvider,
   InitializeTxnInput,
   InitializeTxnResult,
@@ -45,7 +52,15 @@ function toMajor(amount: number): number {
   return Math.round(amount) / 100;
 }
 
-export class FlutterwaveClient implements PaymentProvider {
+/** Flutterwave transfer status → our normalized state. */
+function mapFlwTransferStatus(status: string): TransferState {
+  const s = (status || '').toUpperCase();
+  if (s === 'SUCCESSFUL') return 'PAID';
+  if (s === 'FAILED') return 'FAILED';
+  return 'PENDING'; // NEW | PENDING
+}
+
+export class FlutterwaveClient implements PaymentProvider, PayoutCapableProvider {
   readonly name = 'flutterwave' as const;
 
   /** See PaystackClient: defaults to platform config; bind a resolver for per-org accounts. */
@@ -182,6 +197,67 @@ export class FlutterwaveClient implements PaymentProvider {
     const secret = this.config.webhookSecret;
     if (!secret || !signature) return false;
     return signature === secret;
+  }
+
+
+  // ---- Payouts (Transfers API) ----
+
+  async listBanks(country = 'NG'): Promise<BankOption[]> {
+    const data = await this.request<Array<{ name: string; code: string }>>(
+      `/banks/${encodeURIComponent(country.toUpperCase())}`
+    );
+    return data.map((b) => ({ name: b.name, code: b.code }));
+  }
+
+  async resolveAccount(accountNumber: string, bankCode: string): Promise<{ accountName: string } | null> {
+    try {
+      const data = await this.request<{ account_name: string }>('/accounts/resolve', {
+        method: 'POST',
+        body: JSON.stringify({ account_number: accountNumber, account_bank: bankCode }),
+      });
+      return data?.account_name ? { accountName: data.account_name } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Flutterwave transfers take the destination inline rather than a stored
+   * recipient, so "creating a recipient" just validates the account and returns
+   * a synthetic reference. The real details travel with each transfer.
+   */
+  async createRecipient(input: CreateRecipientInput): Promise<CreateRecipientResult> {
+    const resolved = await this.resolveAccount(input.accountNumber, input.bankCode);
+    return {
+      recipientRef: `${input.bankCode}:${input.accountNumber}`,
+      resolvedName: resolved?.accountName ?? null,
+    };
+  }
+
+  async initiateTransfer(input: TransferInput): Promise<TransferResult> {
+    const [bankFromRef, acctFromRef] = input.recipientRef.split(':');
+    const data = await this.request<{ id: number; status: string; reference?: string }>('/transfers', {
+      method: 'POST',
+      body: JSON.stringify({
+        account_bank: input.bankCode ?? bankFromRef,
+        account_number: input.accountNumber ?? acctFromRef,
+        amount: input.amount / 100, // Flutterwave transfers use major units
+        currency: input.currency.toUpperCase(),
+        reference: input.reference,
+        narration: input.reason ?? 'Vhicasar Pay payout',
+        beneficiary_name: input.accountName,
+      }),
+    });
+    return { providerRef: String(data.id), status: mapFlwTransferStatus(data.status) };
+  }
+
+  async verifyTransfer(reference: string): Promise<TransferResult> {
+    const data = await this.request<Array<{ id: number; status: string; reference: string }>>(
+      `/transfers?reference=${encodeURIComponent(reference)}`
+    );
+    const row = Array.isArray(data) ? data[0] : undefined;
+    if (!row) return { providerRef: reference, status: 'PENDING' };
+    return { providerRef: String(row.id), status: mapFlwTransferStatus(row.status) };
   }
 
   parseWebhookEvent(body: unknown): NormalizedWebhookEvent {

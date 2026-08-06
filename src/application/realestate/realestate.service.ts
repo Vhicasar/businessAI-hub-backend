@@ -46,6 +46,9 @@ export const createPropertySchema = z.object({
   city: z.string().trim().max(100).nullable().optional(),
   state: z.string().trim().max(100).nullable().optional(),
   amenities: z.array(z.string().trim().max(60)).max(40).nullable().optional(),
+  /** Short-stay pricing used by the automated inbox booking flow. */
+  dailyRate: z.coerce.number().positive().nullable().optional(),
+  weeklyRate: z.coerce.number().positive().nullable().optional(),
 });
 export const updatePropertySchema = createPropertySchema.partial();
 
@@ -101,6 +104,7 @@ const propertySelect = {
   bedrooms: true, bathrooms: true, areaSqm: true,
   addressLine1: true, city: true, state: true, ownerId: true, agentId: true,
   amenities: true, description: true, createdAt: true,
+  customFields: true,
   media: mediaSelect,
 } as const;
 
@@ -139,6 +143,15 @@ async function propertiesForDisplay<T extends {
       ...property,
       price: money(property.price),
       rentAmount: money(property.rentAmount),
+      customFields: (() => {
+        const custom = ((property as T & { customFields?: unknown }).customFields as Record<string, unknown> | null) ?? {};
+        return {
+          ...custom,
+          ...(custom.dailyRate != null ? { dailyRate: money(custom.dailyRate) } : {}),
+          ...(custom.nightlyRate != null ? { nightlyRate: money(custom.nightlyRate) } : {}),
+          ...(custom.weeklyRate != null ? { weeklyRate: money(custom.weeklyRate) } : {}),
+        };
+      })(),
       sourceCurrency: property.currency,
       currency: org.currency,
     };
@@ -226,6 +239,10 @@ export const realestateService = {
         city: dto.city ?? null,
         state: dto.state ?? null,
         amenities: dto.amenities ?? undefined,
+        customFields: {
+          ...(dto.dailyRate != null ? { dailyRate: dto.dailyRate } : {}),
+          ...(dto.weeklyRate != null ? { weeklyRate: dto.weeklyRate } : {}),
+        },
       },
       select: propertySelect,
     });
@@ -241,7 +258,17 @@ export const realestateService = {
   async updateProperty(id: string, dto: z.infer<typeof updatePropertySchema>) {
     const existing = await prisma.property.findFirst({ where: { id, deletedAt: null } });
     if (!existing) throw new NotFoundError('Property');
-    const property = await prisma.property.update({
+    const existingCustom = (existing.customFields as Record<string, unknown> | null) ?? {};
+    const customFields = { ...existingCustom };
+    if (dto.dailyRate !== undefined) {
+      if (dto.dailyRate === null) delete customFields.dailyRate;
+      else customFields.dailyRate = dto.dailyRate;
+    }
+    if (dto.weeklyRate !== undefined) {
+      if (dto.weeklyRate === null) delete customFields.weeklyRate;
+      else customFields.weeklyRate = dto.weeklyRate;
+    }
+    await prisma.property.update({
       where: { id },
       data: {
         ...(dto.title !== undefined ? { title: dto.title } : {}),
@@ -260,8 +287,8 @@ export const realestateService = {
         ...(dto.city !== undefined ? { city: dto.city } : {}),
         ...(dto.state !== undefined ? { state: dto.state } : {}),
         ...(dto.amenities !== undefined ? { amenities: dto.amenities ?? undefined } : {}),
+        ...((dto.dailyRate !== undefined || dto.weeklyRate !== undefined) ? { customFields } : {}),
       },
-      select: propertySelect,
     });
     if (dto.status && dto.status !== existing.status) {
       await activityService.record({
@@ -269,8 +296,7 @@ export const realestateService = {
         title: `Property → ${dto.status.toLowerCase().replace(/_/g, ' ')}`,
       });
     }
-    const [resolved] = await withMedia([property]);
-    return resolved!;
+    return this.getProperty(id);
   },
 
   async deleteProperty(id: string) {

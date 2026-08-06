@@ -12,6 +12,11 @@ export const SOCKET_EVENTS = {
   // notifications & presence
   NOTIFICATION_NEW: 'notifications:new',
   PRESENCE_CHANGED: 'presence:changed',
+  // money — emitted the moment it happens so no screen waits for a refresh
+  PAYMENT_RECEIVED: 'payments:received',
+  PAYMENT_STATUS_CHANGED: 'payments:status.changed',
+  WALLET_UPDATED: 'wallet:updated',
+  SETTLEMENT_UPDATED: 'settlement:updated',
   // calls (WebRTC signaling)
   CALL_SIGNAL: 'call:signal',
 } as const;

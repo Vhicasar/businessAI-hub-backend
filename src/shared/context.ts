@@ -7,6 +7,12 @@ import { AsyncLocalStorage } from 'async_hooks';
  */
 export interface RequestContext {
   requestId: string;
+  /**
+   * Ties together work that spans services/requests. Taken from an inbound
+   * X-Correlation-ID when present so a client-initiated flow keeps one id
+   * end-to-end; otherwise it mirrors requestId (API Bible §5/§16).
+   */
+  correlationId?: string;
   userId?: string;
   organizationId?: string;
   membershipId?: string;

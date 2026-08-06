@@ -8,6 +8,9 @@ import swaggerUi from 'swagger-ui-express';
 import { env } from './shared/config/env';
 import { logger } from './shared/logger';
 import { requestContextMiddleware } from './presentation/http/middleware/request-context';
+import { httpMetrics } from './presentation/http/middleware/observability';
+import { normalizeResponse } from './presentation/http/middleware/response-normalizer';
+import { metrics } from './shared/metrics';
 import { apiLimiter } from './presentation/http/middleware/rate-limit';
 import { errorHandler, notFoundHandler } from './presentation/http/middleware/error-handler';
 import { authRoutes } from './presentation/http/v1/auth.routes';
@@ -49,6 +52,22 @@ import { serviceRoutes } from './presentation/http/v1/service.routes';
 import { filesRoutes } from './presentation/http/v1/files.routes';
 import { integrationsRoutes } from './presentation/http/v1/integrations.routes';
 import { brandingRoutes } from './presentation/http/v1/branding.routes';
+import { identityRoutes } from './presentation/http/v1/identity.routes';
+import { vhicasarPayRoutes } from './presentation/http/v1/vhicasar-pay.routes';
+import { fraudRoutes } from './presentation/http/v1/fraud.routes';
+import { posRoutes } from './presentation/http/v1/pos.routes';
+import { appIdentityRoutes, clientErrorRoutes } from './presentation/http/app/identity.routes';
+import { appPayRoutes, appPayPublicRoutes } from './presentation/http/app/pay.routes';
+import { appSuperAppRoutes } from './presentation/http/app/superapp.routes';
+import { appBusinessRoutes } from './presentation/http/app/businesses.routes';
+import { appActivityRoutes } from './presentation/http/app/activity.routes';
+import { appSecurityRoutes } from './presentation/http/app/security.routes';
+import { appLocalizationRoutes } from './presentation/http/app/localization.routes';
+import { businessProfileRoutes } from './presentation/http/v1/business-profile.routes';
+import { qrCenterRoutes } from './presentation/http/v1/qr-center.routes';
+import { settlementRoutes } from './presentation/http/v1/settlement.routes';
+import { loyaltyRoutes } from './presentation/http/v1/loyalty.routes';
+import { promotionsRoutes } from './presentation/http/v1/promotions.routes';
 import { storage } from './infrastructure/storage/storage';
 import { paystackWebhookRoutes, flutterwaveWebhookRoutes, stripeWebhookRoutes } from './presentation/http/paystack-webhook.routes';
 import { openApiDocument } from './presentation/http/swagger';
@@ -79,6 +98,27 @@ export function createApp(): Express {
   app.use(express.urlencoded({ extended: true }));
   app.use(cookieParser());
   app.use(requestContextMiddleware);
+  app.use(httpMetrics);
+  // Never let a null collection reach a client (§11) — an empty list renders,
+  // a null crashes.
+  app.use(normalizeResponse);
+
+  /**
+   * Prometheus scrape endpoint (Part I §14). Outside /api/v1 because scrapers
+   * are infrastructure, not API clients. When METRICS_TOKEN is set the endpoint
+   * requires it — operational metrics shouldn't be world-readable in production.
+   */
+  app.get('/metrics', (req, res) => {
+    const token = process.env.METRICS_TOKEN;
+    if (token) {
+      const provided = req.header('authorization')?.replace(/^Bearer /i, '') ?? req.query.token;
+      if (provided !== token) {
+        res.status(401).type('text/plain').send('metrics token required');
+        return;
+      }
+    }
+    res.type('text/plain; version=0.0.4').send(metrics.render());
+  });
   app.use(
     pinoHttp({
       logger,
@@ -124,6 +164,15 @@ export function createApp(): Express {
   v1.use('/files', filesRoutes);
   v1.use('/developer', developerRoutes);
   v1.use('/integrations', integrationsRoutes);
+  v1.use('/identity', identityRoutes);
+  v1.use('/pay', vhicasarPayRoutes);
+  v1.use('/fraud', fraudRoutes);
+  v1.use('/pos', posRoutes);
+  v1.use('/business-profile', businessProfileRoutes);
+  v1.use('/qr-center', qrCenterRoutes);
+  v1.use('/settlement', settlementRoutes);
+  v1.use('/loyalty', loyaltyRoutes);
+  v1.use('/promotions', promotionsRoutes);
 
   // Service API for the Vhicasar Admin. Mounted only when a key is configured:
   // an endpoint that lists every customer organisation should not exist at all
@@ -138,6 +187,23 @@ export function createApp(): Express {
   // Public REST API for a business's own integrations — API-key authenticated,
   // permissive CORS, scope-gated and per-key rate-limited (see the router).
   app.use('/api/public/v1', cors({ origin: true, credentials: false }), publicApiRoutes);
+
+  // Customer Super App API (Vhicasar ID identity, wallet, QR pay…). Consumer
+  // `app`-scoped tokens, separate from the business /api/v1 surface. Phase 1
+  // ships the Identity Service; further modules mount here as they land.
+  // Public (no app token) gateway redirect target — mounted before the
+  // token-guarded app routers so it stays reachable from the browser.
+  app.use('/api/app/v1', cors({ origin: true, credentials: false }), appPayPublicRoutes);
+  // Crash reports arrive before/without auth, so they mount ahead of the
+  // authenticated app routers.
+  app.use('/api/app/v1', cors({ origin: true, credentials: false }), apiLimiter, clientErrorRoutes);
+  app.use('/api/app/v1', appCors, apiLimiter, appIdentityRoutes);
+  app.use('/api/app/v1', appCors, apiLimiter, appPayRoutes);
+  app.use('/api/app/v1', appCors, apiLimiter, appSuperAppRoutes);
+  app.use('/api/app/v1', appCors, apiLimiter, appBusinessRoutes);
+  app.use('/api/app/v1', appCors, apiLimiter, appActivityRoutes);
+  app.use('/api/app/v1', appCors, apiLimiter, appSecurityRoutes);
+  app.use('/api/app/v1', appCors, apiLimiter, appLocalizationRoutes);
 
   // Public payment-link pages (/pay/<token>) — token-authenticated, any origin.
   app.use('/api/pay', cors({ origin: true, credentials: false }), payRoutes);

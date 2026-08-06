@@ -8,6 +8,7 @@ import { aiInsightsService } from '../../../application/analytics/ai-insights.se
 import { requestContext } from '../../../shared/context';
 import { exchangeRates } from '../../../shared/exchange-rates';
 import { resolveDateRange, previousRange } from '../../../shared/date-range';
+import { dashboardMetrics } from '../../../application/analytics/dashboard-metrics.service';
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<void>): RequestHandler =>
@@ -76,6 +77,22 @@ analyticsRoutes.get(
  * period-over-period deltas against the equal-length previous window. Field
  * names keep the `30` suffix for backwards compatibility with existing clients.
  */
+/**
+ * Everything the business dashboard renders, in one request.
+ *
+ * Separate from `/overview`, which existing clients still depend on: this is
+ * additive, so nothing that reads the old shape has to change.
+ */
+analyticsRoutes.get(
+  '/dashboard',
+  requirePermission('dashboard.view', 'analytics.view'),
+  wrap(async (req, res) => {
+    const range = resolveDateRange(req.query);
+    const data = await dashboardMetrics.build({ from: range.from, to: range.to });
+    res.json({ success: true, data: { ...data, range: { ...data.range, preset: range.preset } } });
+  })
+);
+
 analyticsRoutes.get(
   '/overview',
   requirePermission('dashboard.view', 'analytics.view'),

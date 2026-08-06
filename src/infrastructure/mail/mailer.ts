@@ -200,6 +200,54 @@ export const mailer = {
     );
   },
 
+  /**
+   * Deliver a forgotten-PIN recovery code (§1). A short code rather than a link
+   * because the customer is already inside the app when they ask for it.
+   */
+  async sendTransactionPinReset(to: string, code: string, firstName?: string | null): Promise<MailResult> {
+    return send(
+      to,
+      'Reset your transaction PIN',
+      await layout(
+        'Reset your transaction PIN',
+        `<p>Hi ${firstName ?? 'there'},</p>
+         <p>Enter this code in the app to set a new transaction PIN.</p>
+         <p style="font-size:22px;font-weight:700;letter-spacing:3px">${code}</p>
+         <p style="font-size:12px;color:#6b778c">The code expires in 10 minutes. If you did not ask for
+         this, ignore this email — your PIN has not changed.</p>`
+      ),
+      `Your Vhicasar transaction PIN reset code is ${code}. It expires in 10 minutes.`,
+      { context: { type: 'PASSWORD_RESET' } },
+    );
+  },
+
+  /**
+   * Tell a business owner that a settlement destination changed (§11).
+   *
+   * Deliberately plain and alarming-if-unexpected: this is the notification a
+   * fraudulent bank-account swap has to get past.
+   */
+  async sendSettlementAccountNotice(
+    to: string,
+    title: string,
+    body: string,
+    firstName?: string | null,
+  ): Promise<MailResult> {
+    return send(
+      to,
+      title,
+      await layout(
+        title,
+        `<p>Hi ${firstName ?? 'there'},</p>
+         <p>${body}</p>
+         <p style="font-size:12px;color:#6b778c">If you did not expect this, sign in and review your
+         settlement accounts immediately, then contact support.</p>`
+      ),
+      `${title}. ${body} If you did not expect this, contact support immediately.`,
+      { context: { type: 'PASSWORD_CHANGED' } },
+    );
+  },
+
   async sendInvitation(to: string, orgName: string, token: string, organizationId?: string | null): Promise<MailResult> {
     const url = `${env.WEB_APP_URL}/auth/invite/${token}`;
     return send(

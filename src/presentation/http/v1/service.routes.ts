@@ -9,6 +9,11 @@ import { prismaUnscoped } from '../../../infrastructure/database/prisma';
 import { domainConfigSchema, domainConfigService } from '../../../application/sites/domain-config.service';
 import { getActivePaymentProvider } from '../../../infrastructure/payments';
 import { mailer } from '../../../infrastructure/mail/mailer';
+import { platformMonitoringService, platformAdminService } from '../../../application/monitoring/platform-monitoring.service';
+import { kycService } from '../../../application/identity/kyc.service';
+import { reviewKycSchema } from '../../../application/identity/identity.dto';
+import { rewardCampaigns } from '../../../application/rewards/reward-campaign.service';
+import { walletBuckets } from '../../../application/payments/wallet-buckets.service';
 
 /**
  * Service API — for the Vhicasar Admin, not for tenants or end users.
@@ -358,6 +363,285 @@ serviceRoutes.get(
         })),
       },
     });
+  }),
+);
+
+// ── Platform monitoring for the Super Admin (cross-tenant, key-gated) ──────
+
+/** Payment + fraud KPIs across all organisations (Fraud Center / dashboard). */
+serviceRoutes.get(
+  '/monitoring/overview',
+  wrap(async (_req, res) => {
+    res.json({ success: true, data: await platformMonitoringService.overview() });
+  }),
+);
+
+/** Cross-tenant fraud-alert queue. */
+serviceRoutes.get(
+  '/monitoring/fraud/alerts',
+  validate({
+    query: z.object({
+      status: z.enum(['OPEN', 'REVIEWING', 'CONFIRMED', 'DISMISSED']).optional(),
+      cursor: z.string().optional(),
+      limit: z.coerce.number().int().min(1).max(100).default(30),
+    }),
+  }),
+  wrap(async (req, res) => {
+    const q = req.query as unknown as { status?: string; cursor?: string; limit: number };
+    res.json({ success: true, data: await platformMonitoringService.fraudAlerts(q) });
+  }),
+);
+
+serviceRoutes.post(
+  '/monitoring/fraud/alerts/:id/resolve',
+  validate({ body: z.object({ action: z.enum(['CONFIRMED', 'DISMISSED']), resolution: z.string().trim().max(500).optional() }) }),
+  wrap(async (req, res) => {
+    const data = await platformMonitoringService.resolveAlert(req.params.id as string, req.body.action, req.body.resolution);
+    res.json({ success: true, data });
+  }),
+);
+
+// ── AI monitoring, compliance, feature flags, support (System Bible II §3) ─
+
+serviceRoutes.get(
+  '/monitoring/ai',
+  validate({ query: z.object({ days: z.coerce.number().int().min(1).max(365).default(30) }) }),
+  wrap(async (req, res) => {
+    const { days } = req.query as unknown as { days: number };
+    res.json({ success: true, data: await platformAdminService.aiMonitoring(days) });
+  }),
+);
+
+serviceRoutes.get(
+  '/monitoring/compliance',
+  wrap(async (_req, res) => {
+    res.json({ success: true, data: await platformAdminService.complianceSummary() });
+  }),
+);
+
+serviceRoutes.get(
+  '/monitoring/billing',
+  wrap(async (_req, res) => {
+    res.json({ success: true, data: await platformAdminService.billingMonitoring() });
+  }),
+);
+
+serviceRoutes.get(
+  '/monitoring/events',
+  wrap(async (_req, res) => {
+    res.json({ success: true, data: await platformAdminService.eventHealth() });
+  }),
+);
+
+/** Vhicasar Pay adoption and usage across the platform. */
+serviceRoutes.get(
+  '/monitoring/pay-usage',
+  validate({ query: z.object({ days: z.coerce.number().int().min(1).max(365).default(30) }) }),
+  wrap(async (req, res) => {
+    const { days } = req.query as unknown as { days: number };
+    res.json({ success: true, data: await platformAdminService.payUsage(days) });
+  }),
+);
+
+/** Settlement oversight for the Super Admin (§13). */
+serviceRoutes.get(
+  '/monitoring/settlements',
+  validate({ query: z.object({ limit: z.coerce.number().int().min(1).max(100).default(25) }) }),
+  wrap(async (req, res) => {
+    const { limit } = req.query as unknown as { limit: number };
+    res.json({ success: true, data: await platformAdminService.settlementOversight({ limit }) });
+  }),
+);
+
+serviceRoutes.get(
+  '/monitoring/audit',
+  validate({
+    query: z.object({
+      action: z.string().trim().max(80).optional(),
+      organizationId: z.string().trim().optional(),
+      cursor: z.string().optional(),
+      limit: z.coerce.number().int().min(1).max(100).default(40),
+    }),
+  }),
+  wrap(async (req, res) => {
+    const q = req.query as unknown as { action?: string; organizationId?: string; cursor?: string; limit: number };
+    res.json({ success: true, data: await platformAdminService.auditTrail(q) });
+  }),
+);
+
+// Feature flags
+serviceRoutes.get('/feature-flags', wrap(async (_req, res) => {
+  res.json({ success: true, data: await platformAdminService.listFeatureFlags() });
+}));
+
+serviceRoutes.put(
+  '/feature-flags',
+  validate({
+    body: z.object({
+      key: z.string().trim().min(2).max(80),
+      description: z.string().trim().max(300).optional(),
+      isEnabled: z.boolean(),
+    }),
+  }),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await platformAdminService.upsertFeatureFlag(req.body) });
+  }),
+);
+
+serviceRoutes.put(
+  '/feature-flags/:key/overrides',
+  validate({
+    body: z.object({ organizationId: z.string().trim().min(1), isEnabled: z.boolean() }),
+  }),
+  wrap(async (req, res) => {
+    const data = await platformAdminService.setFeatureFlagOverride(
+      req.params.key as string,
+      req.body.organizationId,
+      req.body.isEnabled,
+    );
+    res.json({ success: true, data });
+  }),
+);
+
+// Support tools
+serviceRoutes.get(
+  '/support/identity',
+  validate({ query: z.object({ q: z.string().trim().min(3).max(80) }) }),
+  wrap(async (req, res) => {
+    const { q } = req.query as unknown as { q: string };
+    res.json({ success: true, data: await platformAdminService.lookupIdentity(q) });
+  }),
+);
+
+serviceRoutes.post(
+  '/support/identity/:id/status',
+  validate({
+    body: z.object({
+      status: z.enum(['ACTIVE', 'SUSPENDED', 'CLOSED']),
+      reason: z.string().trim().max(300).optional(),
+    }),
+  }),
+  wrap(async (req, res) => {
+    const data = await platformAdminService.setIdentityStatus(
+      req.params.id as string,
+      req.body.status,
+      req.body.reason,
+    );
+    res.json({ success: true, data });
+  }),
+);
+
+// ── Reward campaigns (§11, §13) ───────────────────────────────────────────
+
+serviceRoutes.get('/reward-campaigns', wrap(async (_req, res) => {
+  res.json({ success: true, data: await rewardCampaigns.list() });
+}));
+
+serviceRoutes.put(
+  '/reward-campaigns',
+  validate({
+    body: z.object({
+      id: z.string().trim().optional(),
+      name: z.string().trim().min(2).max(140),
+      description: z.string().trim().max(2000).optional(),
+      status: z.enum(['DRAFT', 'ACTIVE', 'PAUSED', 'ENDED', 'SUSPENDED']).optional(),
+      rewardAmount: z.coerce.number().positive().optional(),
+      rewardPercent: z.coerce.number().positive().max(100).optional(),
+      maxRewardPerTxn: z.coerce.number().positive().optional(),
+      minSpend: z.coerce.number().nonnegative().optional(),
+      maxRewardsPerDay: z.coerce.number().int().positive().optional(),
+      maxRewardsPerMonth: z.coerce.number().int().positive().optional(),
+      budget: z.coerce.number().positive().optional(),
+      currency: z.string().trim().length(3),
+      eligibleOrganizationIds: z.array(z.string()).optional(),
+      eligibleCategories: z.array(z.string()).optional(),
+      eligibleCountries: z.array(z.string()).optional(),
+      targetBucket: z.enum(['REWARD', 'CASHBACK', 'AVAILABLE']).optional(),
+      rewardExpiryDays: z.coerce.number().int().positive().optional(),
+      fundingSource: z.enum(['PLATFORM', 'MERCHANT', 'SHARED']).optional(),
+      startsAt: z.coerce.date(),
+      endsAt: z.coerce.date().optional(),
+    }),
+  }),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await rewardCampaigns.upsert(req.body) });
+  }),
+);
+
+serviceRoutes.post(
+  '/reward-campaigns/:id/status',
+  validate({ body: z.object({ status: z.enum(['DRAFT', 'ACTIVE', 'PAUSED', 'ENDED', 'SUSPENDED']) }) }),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await rewardCampaigns.setStatus(req.params.id as string, req.body.status) });
+  }),
+);
+
+serviceRoutes.get(
+  '/reward-campaigns/analytics',
+  validate({ query: z.object({ campaignId: z.string().trim().optional() }) }),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await rewardCampaigns.analytics(req.query.campaignId as string | undefined) });
+  }),
+);
+
+/** Rewards held by the abuse checks, awaiting a human decision (§15). */
+serviceRoutes.get('/reward-grants/pending', wrap(async (_req, res) => {
+  res.json({ success: true, data: await rewardCampaigns.pendingReviews() });
+}));
+
+serviceRoutes.post(
+  '/reward-grants/:id/review',
+  validate({ body: z.object({ action: z.enum(['APPROVE', 'REJECT']), notes: z.string().trim().max(500).optional() }) }),
+  wrap(async (req, res) => {
+    const data = await rewardCampaigns.reviewGrant(req.params.id as string, req.body.action, req.body.notes);
+    res.json({ success: true, data });
+  }),
+);
+
+/** Support release of locked funds (account closure, dispute, error). */
+serviceRoutes.post(
+  '/support/identity/:id/release-locked',
+  validate({
+    body: z.object({
+      amount: z.coerce.number().positive(),
+      currency: z.string().trim().length(3),
+      reason: z.string().trim().min(3).max(300),
+    }),
+  }),
+  wrap(async (req, res) => {
+    const data = await walletBuckets.releaseLockedFunds(
+      req.params.id as string,
+      req.body.amount,
+      req.body.currency,
+      req.body.reason,
+    );
+    res.json({ success: true, data });
+  }),
+);
+
+// ── KYC review queue (platform admin) ────────────────────────────────────
+
+serviceRoutes.get(
+  '/kyc/submissions',
+  validate({
+    query: z.object({
+      status: z.enum(['PENDING', 'APPROVED', 'REJECTED']).optional(),
+      cursor: z.string().optional(),
+      limit: z.coerce.number().int().min(1).max(100).default(30),
+    }),
+  }),
+  wrap(async (req, res) => {
+    const q = req.query as unknown as { status?: string; cursor?: string; limit: number };
+    res.json({ success: true, data: await kycService.listPending(q) });
+  }),
+);
+
+serviceRoutes.post(
+  '/kyc/submissions/:id/review',
+  validate({ body: reviewKycSchema }),
+  wrap(async (req, res) => {
+    const data = await kycService.review(req.params.id as string, req.body, 'PLATFORM_ADMIN');
+    res.json({ success: true, data });
   }),
 );
 

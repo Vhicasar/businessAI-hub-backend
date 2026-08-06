@@ -8,9 +8,12 @@ import { kbService } from '../support/kb.service';
 import { knowledgeService } from '../knowledge/knowledge.service';
 import { ordersService } from '../orders/orders.service';
 import { appointmentsService } from '../appointments/appointments.service';
+import { paymentLinksService } from '../payments/payment-links.service';
 import { supportService } from '../support/support.service';
 import { notifyService } from '../notifications/notify.service';
 import { currentOrgId, resolveEntitlements } from '../billing/entitlements';
+import { env } from '../../shared/config/env';
+import { filesService } from '../files/files.service';
 
 /** Clamp a model-provided priority to the ticket priority enum. */
 function normalizePriority(p?: string): 'LOW' | 'MEDIUM' | 'HIGH' | 'URGENT' {
@@ -104,9 +107,16 @@ async function productContext(query: string) {
     name: true,
     description: true,
     variants: variantSelect,
+    images: { orderBy: { position: 'asc' as const }, take: 3, select: { fileId: true } },
   };
   let products = await prisma.product.findMany({
-    where: terms.length ? { ...base, OR: terms.map((t) => ({ name: { contains: t, mode: 'insensitive' as const } })) } : base,
+    where: terms.length ? {
+      ...base,
+      OR: terms.flatMap((t) => [
+        { name: { contains: t, mode: 'insensitive' as const } },
+        { description: { contains: t, mode: 'insensitive' as const } },
+      ]),
+    } : base,
     take: 8,
     orderBy: { createdAt: 'desc' },
     select,
@@ -116,6 +126,177 @@ async function productContext(query: string) {
     products = await prisma.product.findMany({ where: base, take: 6, orderBy: { createdAt: 'desc' }, select });
   }
   return products.filter((p) => p.variants.length > 0);
+}
+
+/** Available properties relevant to a customer's natural-language request. */
+async function propertyContext(query: string) {
+  const terms = (query.toLowerCase().match(/[a-z0-9]{3,}/g) ?? []).slice(0, 12);
+  const base = { deletedAt: null, status: 'AVAILABLE' as const };
+  const select = {
+    id: true, reference: true, title: true, description: true, type: true,
+    purpose: true, price: true, rentAmount: true, rentPeriod: true, currency: true,
+    bedrooms: true, bathrooms: true, city: true, state: true, amenities: true,
+    customFields: true,
+    media: {
+      where: { kind: 'IMAGE' },
+      orderBy: { position: 'asc' as const },
+      take: 3,
+      select: { fileId: true },
+    },
+  };
+  let properties = await prisma.property.findMany({
+    where: terms.length ? {
+      ...base,
+      OR: terms.flatMap((term) => [
+        { title: { contains: term, mode: 'insensitive' as const } },
+        { description: { contains: term, mode: 'insensitive' as const } },
+        { city: { contains: term, mode: 'insensitive' as const } },
+        { state: { contains: term, mode: 'insensitive' as const } },
+      ]),
+    } : base,
+    take: 8,
+    orderBy: { createdAt: 'desc' },
+    select,
+  });
+  if (properties.length === 0) {
+    properties = await prisma.property.findMany({ where: base, take: 6, orderBy: { createdAt: 'desc' }, select });
+  }
+  return properties;
+}
+
+function propertyStayRates(property: { customFields: unknown }): { daily: number; weekly: number } {
+  const custom = (property.customFields as Record<string, unknown> | null) ?? {};
+  // Long-term rent must never be mistaken for an Airbnb nightly charge.
+  // Short-stay properties opt in explicitly through customFields.
+  const dailyValue = Number(custom.dailyRate ?? custom.nightlyRate ?? 0);
+  const weeklyValue = Number(custom.weeklyRate ?? 0);
+  return {
+    daily: Number.isFinite(dailyValue) && dailyValue > 0 ? dailyValue : 0,
+    weekly: Number.isFinite(weeklyValue) && weeklyValue > 0 ? weeklyValue : 0,
+  };
+}
+
+function calculateStayPrice(rates: { daily: number; weekly: number }, durationMin: number) {
+  const days = Math.max(1, Math.ceil(durationMin / (24 * 60)));
+  if (!rates.daily && !rates.weekly) return { days, weeks: 0, remainderDays: days, total: 0 };
+  const effectiveDaily = rates.daily || rates.weekly / 7;
+  if (!rates.weekly || days < 7) return { days, weeks: 0, remainderDays: days, total: effectiveDaily * days };
+  const weeks = Math.floor(days / 7);
+  const remainderDays = days % 7;
+  return { days, weeks, remainderDays, total: rates.weekly * weeks + effectiveDaily * remainderDays };
+}
+
+async function createStayBooking(
+  organizationId: string,
+  customerId: string,
+  input: { propertyId?: string; checkIn?: string; checkOut?: string; notes?: string },
+) {
+  const propertyId = input.propertyId?.trim();
+  if (!propertyId) throw new Error('no property was selected');
+  const checkIn = new Date(input.checkIn ?? '');
+  const checkOut = new Date(input.checkOut ?? '');
+  if (Number.isNaN(checkIn.getTime()) || Number.isNaN(checkOut.getTime()) || checkOut <= checkIn) {
+    throw new Error('valid check-in and check-out dates are required');
+  }
+  if (checkIn.getTime() < Date.now() - 60_000) throw new Error('the check-in time has passed');
+  const durationMin = Math.ceil((checkOut.getTime() - checkIn.getTime()) / 60_000);
+  if (durationMin > 90 * 24 * 60) throw new Error('online stays are limited to 90 days');
+
+  const property = await prisma.property.findFirst({
+    where: { id: propertyId, status: 'AVAILABLE', deletedAt: null },
+    select: { id: true, title: true, currency: true, rentAmount: true, customFields: true },
+  });
+  if (!property) throw new Error('that property is not available');
+  const rates = propertyStayRates(property);
+  if (!rates.daily && !rates.weekly) throw new Error('that property has no daily or weekly stay rate configured');
+
+  const possibleClashes = await prisma.propertyBooking.findMany({
+    where: {
+      propertyId,
+      status: { notIn: ['CANCELLED', 'NO_SHOW'] },
+      scheduledAt: { lt: checkOut },
+    },
+    select: { id: true, status: true, scheduledAt: true, durationMin: true },
+  });
+  const requestedIds = possibleClashes.filter((b) => b.status === 'REQUESTED').map((b) => b.id);
+  const activeHolds = requestedIds.length
+    ? await prisma.paymentLink.findMany({
+        where: {
+          resourceType: 'BOOKING', resourceId: { in: requestedIds },
+          status: { in: ['PENDING', 'PARTIALLY_PAID'] },
+          OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+        },
+        select: { resourceId: true },
+      })
+    : [];
+  const activeHoldIds = new Set(activeHolds.map((link) => link.resourceId).filter(Boolean));
+  const staleIds = possibleClashes
+    .filter((b) => b.status === 'REQUESTED' && !activeHoldIds.has(b.id))
+    .map((b) => b.id);
+  if (staleIds.length) {
+    await prisma.propertyBooking.updateMany({
+      where: { id: { in: staleIds }, status: 'REQUESTED' },
+      data: { status: 'CANCELLED' },
+    });
+  }
+  const clash = possibleClashes.some((booking) => {
+    if (booking.status === 'REQUESTED' && !activeHoldIds.has(booking.id)) return false;
+    const end = booking.scheduledAt.getTime() + booking.durationMin * 60_000;
+    return end > checkIn.getTime();
+  });
+  if (clash) throw new Error('those dates are no longer available');
+
+  const recent = await prisma.propertyBooking.findFirst({
+    where: {
+      propertyId, customerId, kind: 'STAY', scheduledAt: checkIn,
+      status: { notIn: ['CANCELLED', 'NO_SHOW'] },
+      createdAt: { gte: new Date(Date.now() - 10 * 60_000) },
+    },
+    select: { id: true },
+  });
+  let bookingId = recent?.id;
+  if (!bookingId) {
+    const booking = await prisma.propertyBooking.create({
+      data: {
+        organizationId, propertyId, customerId, kind: 'STAY', status: 'REQUESTED',
+        scheduledAt: checkIn, durationMin, notes: input.notes?.trim().slice(0, 1000) || null,
+      },
+      select: { id: true },
+    });
+    bookingId = booking.id;
+  }
+
+  const existingLink = await prisma.paymentLink.findFirst({
+    where: {
+      resourceType: 'BOOKING', resourceId: bookingId,
+      status: { in: ['PENDING', 'PARTIALLY_PAID'] },
+      OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+    },
+    orderBy: { createdAt: 'desc' },
+    select: { token: true, amount: true, currency: true },
+  });
+  if (existingLink) {
+    return {
+      bookingId,
+      amount: Number(existingLink.amount), currency: existingLink.currency,
+      url: `${env.WEB_APP_URL.replace(/\/+$/, '')}/pay/${existingLink.token}`,
+    };
+  }
+
+  const price = calculateStayPrice(rates, durationMin);
+  try {
+    const link = await paymentLinksService.create({
+      resourceType: 'BOOKING', resourceId: bookingId, customerId,
+      amount: price.total, currency: property.currency,
+      description: `${property.title}: ${price.days} day${price.days === 1 ? '' : 's'}`,
+      allowPartial: false,
+      expiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+    }, null);
+    return { bookingId, amount: link.amount, currency: link.currency, url: link.url };
+  } catch (error) {
+    if (!recent) await prisma.propertyBooking.delete({ where: { id: bookingId } }).catch(() => undefined);
+    throw error;
+  }
 }
 
 /**
@@ -396,7 +577,9 @@ export const aiService = {
    * Bot reply with handoff contract. Returns null when the bot should stay
    * silent and hand the conversation to a human.
    */
-  async autoReplyDraft(conversationId: string): Promise<string | null> {
+  async autoReplyDraft(
+    conversationId: string,
+  ): Promise<string | { text: string; mediaUrls: string[] } | null> {
     const { provider } = await resolveAiOptional();
     if (!provider) return null;
     const { conversation, transcript } = await conversationTranscript(conversationId, 20);
@@ -427,9 +610,49 @@ export const aiService = {
         const v = p.variants[0]!;
         const price = `${v.currency} ${Number(v.price).toLocaleString()}`;
         const desc = p.description ? ` — ${p.description.slice(0, 90)}` : '';
-        return `- ${p.name}: ${price}${desc}`;
+        return `- ${p.name} [productId=${p.id}; images=${p.images.length}]: ${price}${desc}`;
       })
       .join('\n');
+
+    // Property recommendations and stay availability. IDs are supplied only as
+    // machine-action handles; customer-facing replies use titles/references.
+    const properties = await propertyContext(lastInbound);
+    const propertyIds = properties.map((p) => p.id);
+    const upcomingPropertyBookings = propertyIds.length
+      ? await prisma.propertyBooking.findMany({
+          where: {
+            propertyId: { in: propertyIds },
+            status: { notIn: ['CANCELLED', 'NO_SHOW'] },
+            scheduledAt: { gte: new Date() },
+          },
+          select: { propertyId: true, scheduledAt: true, durationMin: true },
+          take: 80,
+          orderBy: { scheduledAt: 'asc' },
+        })
+      : [];
+    const propertiesCtx = properties.map((p) => {
+      const stayRates = propertyStayRates(p);
+      const amount = p.price
+        ? `sale ${p.currency} ${Number(p.price).toLocaleString()}`
+        : p.rentAmount
+          ? `${p.rentPeriod?.toLowerCase() ?? 'rent'} ${p.currency} ${Number(p.rentAmount).toLocaleString()}`
+          : 'price on request';
+      const unavailable = upcomingPropertyBookings
+        .filter((b) => b.propertyId === p.id)
+        .slice(0, 10)
+        .map((b) => {
+          const end = new Date(b.scheduledAt.getTime() + b.durationMin * 60_000);
+          return `${b.scheduledAt.toISOString()}..${end.toISOString()}`;
+        });
+      const shortStay = [
+        stayRates.daily ? `daily ${p.currency} ${stayRates.daily.toLocaleString()}` : '',
+        stayRates.weekly ? `weekly ${p.currency} ${stayRates.weekly.toLocaleString()}` : '',
+      ].filter(Boolean).join(', ') || 'short-stay not configured';
+      return `- ${p.title} [propertyId=${p.id}; ref=${p.reference}; images=${p.media.length}]: ${p.type}, ${p.purpose}, ${amount}; ${shortStay}; ` +
+        `${p.bedrooms ?? '?'} bed, ${p.bathrooms ?? '?'} bath; ${[p.city, p.state].filter(Boolean).join(', ') || 'location not listed'}; ` +
+        `amenities=${JSON.stringify(p.amenities ?? [])}; ${p.description?.slice(0, 140) ?? ''}; ` +
+        `unavailable=${unavailable.length ? unavailable.join(',') : 'none listed'}`;
+    }).join('\n');
 
     // Only show offers that are valid now. Coupon limits and customer-specific
     // eligibility are still enforced atomically by ordersService at creation.
@@ -520,6 +743,19 @@ export const aiService = {
             'placing the later confirmed order. Mention relevant active promotions from OFFERS without ' +
             'inventing eligibility. If a supplied code is absent from OFFERS, explain it cannot be ' +
             'verified and ask them to check it. If unsure whether they confirmed, ask again and omit "order".\n' +
+            'RECOMMENDATIONS: infer practical preferences from the customer description (use case, ' +
+            'location, budget, bedrooms, amenities, dates, product features) and recommend at most three ' +
+            'best matches from PRODUCTS and PROPERTIES. Explain each match briefly using only listed facts. ' +
+            'Ask one focused follow-up question when a critical preference is missing. Never recommend an ' +
+            'unlisted item or property and never expose internal propertyId values to the customer. ' +
+            'When recommending an item that has images, include it in recommendationMedia using its exact ' +
+            'listed id. Include at most three recommended items and never select media for an item you did not recommend.\n' +
+            'PROPERTY STAYS: for Airbnb/short-stay requests, collect check-in, check-out and the selected ' +
+            'property. Treat the unavailable ranges in PROPERTIES as blocked. First quote the exact property, ' +
+            'dates, nightly rate and estimated total and ask the customer to confirm and pay; OMIT stayBooking. ' +
+            'ONLY in a LATER message after explicit confirmation, return stayBooking with the exact propertyId, ' +
+            'ISO checkIn/checkOut and optional notes. The server rechecks availability and creates a 30-minute ' +
+            'payment link. Never claim the stay is confirmed until payment succeeds; say it is held pending payment.\n' +
             'APPOINTMENTS: when the customer wants to book/schedule an appointment, viewing, or ' +
             'consultation, offer the available times from APPOINTMENTS below in the customer\'s words ' +
             '(their local, friendly time) and ask which works — do NOT include "booking" yet. ONLY in a ' +
@@ -530,10 +766,13 @@ export const aiService = {
             'Respond with JSON only. Shape: {"handoff": <bool>, "reply": "<text>", ' +
             '"save"?: {"name"?, "email"?, "phone"?, "details"?: {"field": "value"}}, "order"?: {"items": [{"name", "quantity"}], "couponCode"?}, ' +
             '"ticket"?: {"subject": "<short>", "priority": "LOW|MEDIUM|HIGH|URGENT"}, ' +
-            '"booking"?: {"start": "<ISO from a listed slot>", "typeId"?, "notes"?}}. ' +
+            '"booking"?: {"start": "<ISO from a listed slot>", "typeId"?, "notes"?}, ' +
+            '"stayBooking"?: {"propertyId": "<exact listed id>", "checkIn": "<ISO>", "checkOut": "<ISO>", "notes"?}, ' +
+            '"recommendationMedia"?: [{"type": "PRODUCT|PROPERTY", "id": "<exact listed id>"}]}. ' +
             'ALWAYS include a friendly "reply", even when handoff is true.\n\n' +
             `KNOWLEDGE:\n${knowledge || '(none retrieved for this message)'}\n\n` +
             `PRODUCTS:\n${productsCtx || '(no products available)'}\n\n` +
+            `PROPERTIES:\n${propertiesCtx || '(no properties available)'}\n\n` +
             `OFFERS:\n${offersCtx || '(no active offers)'}\n\n` +
             `APPOINTMENTS:\n${apptCtx}`,
         },
@@ -552,6 +791,8 @@ export const aiService = {
       order?: { items?: { name?: string; quantity?: number }[]; couponCode?: string };
       ticket?: { subject?: string; priority?: string };
       booking?: { start?: string; typeId?: string; notes?: string };
+      stayBooking?: { propertyId?: string; checkIn?: string; checkOut?: string; notes?: string };
+      recommendationMedia?: { type?: string; id?: string }[];
     }>(raw);
     if (!parsed) return null;
 
@@ -611,6 +852,24 @@ export const aiService = {
       } catch (err) {
         reply += `\n\n(I couldn't book that time — ${(err as Error).message}. Would you like me to connect you to the team?)`;
         logger.warn({ err }, 'Chat appointment booking failed');
+      }
+    }
+
+    // Create a short-stay hold only after the customer confirms the quoted
+    // property and dates. Availability is checked again inside the helper.
+    if (parsed.stayBooking?.propertyId) {
+      try {
+        const stay = await createStayBooking(
+          conversation.organizationId,
+          conversation.customer.id,
+          parsed.stayBooking,
+        );
+        reply +=
+          `\n\n🏠 Your stay is held pending payment. Pay ${stay.currency} ` +
+          `${Number(stay.amount).toLocaleString()} within 30 minutes to confirm: ${stay.url}`;
+      } catch (err) {
+        reply += `\n\n(I couldn't hold that property — ${(err as Error).message}. Please choose another date or property.)`;
+        logger.warn({ err }, 'Chat property stay booking failed');
       }
     }
 
@@ -692,7 +951,25 @@ export const aiService = {
       }
     }
 
-    return reply.trim() || null;
+    const finalReply = reply.trim();
+    if (!finalReply) return null;
+
+    const requestedMedia = (parsed.recommendationMedia ?? []).slice(0, 3);
+    const fileIds: string[] = [];
+    for (const item of requestedMedia) {
+      const id = item.id?.trim();
+      if (!id) continue;
+      if (item.type?.toUpperCase() === 'PRODUCT') {
+        const product = products.find((p) => p.id === id);
+        if (product?.images[0]?.fileId) fileIds.push(product.images[0].fileId);
+      } else if (item.type?.toUpperCase() === 'PROPERTY') {
+        const property = properties.find((p) => p.id === id);
+        if (property?.media[0]?.fileId) fileIds.push(property.media[0].fileId);
+      }
+    }
+    const urls = await filesService.urlMap(fileIds);
+    const mediaUrls = fileIds.map((id) => urls.get(id)).filter((url): url is string => Boolean(url));
+    return mediaUrls.length ? { text: finalReply, mediaUrls } : finalReply;
   },
 
   // ---------------------------------------------------------- lead scoring

@@ -115,47 +115,41 @@ export class WhatsAppAdapter implements ChannelAdapter {
     if (!accessToken || !phoneNumberId) {
       throw new AppError('CHANNEL_MISCONFIGURED', 500, 'WhatsApp credentials incomplete');
     }
-    const res = await fetch(`${GRAPH}/${phoneNumberId}/messages`, {
+    const mediaUrls = (payload.mediaUrls ?? []).slice(0, 3);
+    const bodies = mediaUrls.length
+      ? mediaUrls.map((link, index) => ({
+          messaging_product: 'whatsapp',
+          to: payload.recipientExternalId,
+          type: 'image',
+          image: { link, ...(index === 0 ? { caption: payload.text } : {}) },
+        }))
+      : [payload.isMarketing && payload.templateName
+          ? {
+              messaging_product: 'whatsapp', to: payload.recipientExternalId, type: 'template',
+              template: {
+                name: payload.templateName,
+                language: { code: payload.templateLanguage || 'en_US' },
+                components: [{ type: 'body', parameters: [{ type: 'text', text: payload.text }] }],
+              },
+            }
+          : { messaging_product: 'whatsapp', to: payload.recipientExternalId, type: 'text', text: { body: payload.text } }];
+    let providerMessageId = '';
+    for (const body of bodies) {
+      const res = await fetch(`${GRAPH}/${phoneNumberId}/messages`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${accessToken}`,
       },
-      body: JSON.stringify(
-        payload.isMarketing && payload.templateName
-          ? {
-              messaging_product: 'whatsapp',
-              to: payload.recipientExternalId,
-              type: 'template',
-              template: {
-                name: payload.templateName,
-                language: { code: payload.templateLanguage || 'en_US' },
-                components: [{
-                  type: 'body',
-                  parameters: [{ type: 'text', text: payload.text }],
-                }],
-              },
-            }
-          : {
-              messaging_product: 'whatsapp',
-              to: payload.recipientExternalId,
-              type: 'text',
-              text: { body: payload.text },
-            },
-      ),
-    });
-    const json = (await res.json()) as {
-      messages?: { id: string }[];
-      error?: { message?: string };
-    };
-    if (!res.ok || !json.messages?.[0]) {
-      throw new AppError(
-        'CHANNEL_SEND_FAILED',
-        502,
-        `WhatsApp send failed: ${json.error?.message ?? res.status}`
-      );
+        body: JSON.stringify(body),
+      });
+      const json = (await res.json()) as { messages?: { id: string }[]; error?: { message?: string } };
+      if (!res.ok || !json.messages?.[0]) {
+        throw new AppError('CHANNEL_SEND_FAILED', 502, `WhatsApp send failed: ${json.error?.message ?? res.status}`);
+      }
+      providerMessageId ||= json.messages[0].id;
     }
-    return { providerMessageId: json.messages[0].id };
+    return { providerMessageId };
   }
 
   async onAccountConnected(account: ChannelAccountRef, webhookUrl: string): Promise<string | null> {

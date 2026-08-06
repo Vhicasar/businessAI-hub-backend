@@ -269,7 +269,13 @@ export const inboxService = {
     const reply = await aiService.autoReplyDraft(conversationId);
     if (!reply) return; // handoff or AI disabled — a human takes it
 
-    await this.sendMessage(conversationId, reply, null, 'BOT');
+    await this.sendMessage(
+      conversationId,
+      typeof reply === 'string' ? reply : reply.text,
+      null,
+      'BOT',
+      typeof reply === 'string' ? undefined : reply.mediaUrls,
+    );
     await prisma.conversation.update({
       where: { id: conversationId },
       data: { isBotHandled: true },
@@ -282,7 +288,8 @@ export const inboxService = {
     conversationId: string,
     text: string,
     authorUserId: string | null,
-    authorType: 'AGENT' | 'BOT' = 'AGENT'
+    authorType: 'AGENT' | 'BOT' = 'AGENT',
+    mediaUrls?: string[],
   ) {
     const conversation = await prisma.conversation.findFirst({
       where: { id: conversationId },
@@ -300,6 +307,11 @@ export const inboxService = {
       throw new ConflictError('Customer has no identity on this channel');
     }
 
+    const safeMediaUrls = (mediaUrls ?? []).filter((url) => /^https?:\/\//i.test(url)).slice(0, 3);
+    const needsLinkFallback = ['WEB_CHAT', 'EMAIL'].includes(conversation.channelAccount.channelType);
+    const deliveredText = safeMediaUrls.length && needsLinkFallback
+      ? `${text}\n\nSample images:\n${safeMediaUrls.join('\n')}`
+      : text;
     const message = await prisma.message.create({
       data: {
         organizationId: conversation.organizationId,
@@ -309,7 +321,7 @@ export const inboxService = {
         authorUserId,
         aiGenerated: authorType === 'BOT',
         contentType: 'TEXT',
-        body: text,
+        body: deliveredText,
         status: 'QUEUED',
       },
     });
@@ -323,7 +335,8 @@ export const inboxService = {
       const result = await adapter.sendMessage(
         {
           recipientExternalId: identity.externalId,
-          text,
+          text: deliveredText,
+          mediaUrls: safeMediaUrls,
           ...(conversation.channelAccount.channelType === 'EMAIL' && replySubject ? { subject: replySubject } : {}),
         },
         toAccountRef(conversation.channelAccount)
@@ -342,7 +355,7 @@ export const inboxService = {
 
     await prisma.conversation.update({
       where: { id: conversationId },
-      data: { lastMessageAt: new Date(), lastMessageText: text.slice(0, 200) },
+      data: { lastMessageAt: new Date(), lastMessageText: deliveredText.slice(0, 200) },
     });
 
     const sent = await prisma.message.findUniqueOrThrow({ where: { id: message.id } });

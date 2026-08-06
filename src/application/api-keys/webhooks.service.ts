@@ -10,8 +10,31 @@ const currentOrgId = (): string => {
   return id;
 };
 
-/** Events a webhook endpoint can subscribe to. */
-export const WEBHOOK_EVENTS = ['order.created', 'customer.created', 'message.received'] as const;
+/**
+ * Events a webhook endpoint can subscribe to (API Bible §13). The `vhicasar_*`
+ * and payment events are bridged from the domain-event outbox; the rest are
+ * dispatched inline by their modules.
+ */
+export const WEBHOOK_EVENTS = [
+  'order.created',
+  'customer.created',
+  'message.received',
+  'payment.completed',
+  'payment.refunded',
+  'payment.blocked',
+  'wallet.credited',
+  'wallet.debited',
+  'payout.paid',
+  'payout.failed',
+  'settlement.created',
+  'customer.linked',
+  'booking.confirmed',
+  'loyalty.awarded',
+  'subscription.changed',
+  'property.listed',
+  'fraud.alert_created',
+  'shift.closed',
+] as const;
 export type WebhookEvent = (typeof WEBHOOK_EVENTS)[number];
 
 export const webhooksService = {

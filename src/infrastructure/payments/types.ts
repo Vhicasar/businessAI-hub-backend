@@ -85,3 +85,64 @@ export interface PaymentProvider {
   /** Stop a recurring subscription so it no longer auto-charges. */
   disableSubscription(subscriptionCode: string): Promise<void>;
 }
+
+// ---- Payouts / disbursements (money leaving the platform) ----
+
+export interface CreateRecipientInput {
+  accountName: string;
+  accountNumber: string;
+  bankCode: string;
+  currency: string;
+  type?: 'BANK_ACCOUNT' | 'MOBILE_MONEY';
+}
+
+export interface CreateRecipientResult {
+  recipientRef: string;
+  /** Name the bank has on file, when the gateway resolves it. */
+  resolvedName?: string | null;
+}
+
+export interface TransferInput {
+  recipientRef: string;
+  /** Amount in the smallest currency unit (kobo/cents). */
+  amount: number;
+  currency: string;
+  reference: string;
+  reason?: string;
+  /** Destination details — some gateways transfer without a stored recipient. */
+  accountNumber?: string;
+  bankCode?: string;
+  accountName?: string;
+}
+
+export type TransferState = 'PENDING' | 'PAID' | 'FAILED' | 'REVERSED';
+
+export interface TransferResult {
+  providerRef: string;
+  status: TransferState;
+  message?: string;
+}
+
+export interface BankOption {
+  name: string;
+  code: string;
+}
+
+/**
+ * Optional gateway capability: sending money OUT to a bank account. Not every
+ * provider is enabled for transfers on every account, so this is a separate
+ * interface — callers check `supportsPayouts()` before relying on it.
+ */
+export interface PayoutCapableProvider {
+  listBanks(country?: string): Promise<BankOption[]>;
+  /** Verify an account number resolves, before we ever store it. */
+  resolveAccount(accountNumber: string, bankCode: string): Promise<{ accountName: string } | null>;
+  createRecipient(input: CreateRecipientInput): Promise<CreateRecipientResult>;
+  initiateTransfer(input: TransferInput): Promise<TransferResult>;
+  verifyTransfer(reference: string): Promise<TransferResult>;
+}
+
+export function supportsPayouts(p: unknown): p is PaymentProvider & PayoutCapableProvider {
+  const c = p as Partial<PayoutCapableProvider>;
+  return typeof c?.initiateTransfer === 'function' && typeof c?.createRecipient === 'function';
+}

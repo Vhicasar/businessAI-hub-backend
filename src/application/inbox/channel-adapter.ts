@@ -25,6 +25,8 @@ export interface OutboundPayload {
   isMarketing?: boolean;
   templateName?: string;
   templateLanguage?: string;
+  /** Public image URLs to deliver natively when the channel supports media. */
+  mediaUrls?: string[];
 }
 
 export interface SendResult {

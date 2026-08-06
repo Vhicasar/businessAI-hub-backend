@@ -9,6 +9,7 @@ import { syncAiConfigFromAdmin } from '../../../application/ai/ai-sync';
 import { requireFeature } from '../middleware/plan-guard';
 import { z } from 'zod';
 import { validate } from '../middleware/validate';
+import { replySuggestions } from '../../../application/ai/reply-suggestions.service';
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<void>): RequestHandler =>
@@ -110,6 +111,45 @@ aiRoutes.post(
   requirePermission('ai.use_assistant', 'inbox.reply'),
   wrap(async (req, res) => {
     res.json({ success: true, data: await aiService.suggestReply(req.params.id as string) });
+  })
+);
+
+/**
+ * Several drafts at different angles (§7) — the ✨ AI Reply button.
+ *
+ * Read-only by construction: this returns drafts for a human to pick from and
+ * edit. Nothing is ever sent from here.
+ */
+aiRoutes.post(
+  '/conversations/:id/suggest-replies',
+  requirePermission('ai.use_assistant', 'inbox.reply'),
+  validate({
+    body: z
+      .object({
+        tones: z
+          .array(z.enum(['PROFESSIONAL', 'FRIENDLY', 'UPSELL', 'FOLLOW_UP', 'APPOINTMENT', 'COMPLAINT', 'URGENT']))
+          .max(5)
+          .optional(),
+      })
+      .optional(),
+  }),
+  wrap(async (req, res) => {
+    const data = await replySuggestions.generate(req.params.id as string, {
+      tones: req.body?.tones,
+      userId: req.auth?.userId,
+    });
+    res.json({ success: true, data });
+  })
+);
+
+/** Record that a draft was actually sent, and whether the agent edited it. */
+aiRoutes.post(
+  '/reply-suggestions/:id/used',
+  requirePermission('inbox.reply'),
+  validate({ body: z.object({ sentContent: z.string().max(4000) }) }),
+  wrap(async (req, res) => {
+    const data = await replySuggestions.markUsed(req.params.id as string, req.body.sentContent);
+    res.json({ success: true, data: { id: data.id, wasEdited: data.wasEdited } });
   })
 );
 
