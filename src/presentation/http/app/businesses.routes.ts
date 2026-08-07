@@ -129,7 +129,18 @@ appBusinessRoutes.get(
   })
 );
 
-// ---- Promotions & loyalty for one business (§7, §8) ----
+// ---- Promotions & loyalty (§7, §8) ----
+
+/**
+ * Every offer across every business the customer belongs to. The entry point
+ * for "what deals do I have?", which no per-business screen can answer.
+ */
+appBusinessRoutes.get(
+  '/promotions',
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await businessDashboard.allPromotions(req.appAuth!.vhicasarId) });
+  })
+);
 
 /** Promotions this customer can actually claim right now. */
 appBusinessRoutes.get(

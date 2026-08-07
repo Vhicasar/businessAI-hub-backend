@@ -514,31 +514,36 @@ enum StorageDriver {
 // ============================================================
 
 model Organization {
-  id           String       @id @default(cuid())
-  name         String
-  slug         String       @unique
-  businessType BusinessType @default(ECOMMERCE)
-  status       OrgStatus    @default(TRIAL)
-  logoFileId   String?
-  website      String?
-  email        String?
-  phone        String?
-  addressLine1 String?
-  addressLine2 String?
-  city         String?
-  state        String?
-  country      String?      @db.Char(2)
-  postalCode   String?
-  timezone     String       @default("UTC")
+  id                   String       @id @default(cuid())
+  name                 String
+  slug                 String       @unique
+  businessType         BusinessType @default(ECOMMERCE)
+  status               OrgStatus    @default(TRIAL)
+  logoFileId           String?
+  website              String?
+  email                String?
+  phone                String?
+  addressLine1         String?
+  addressLine2         String?
+  city                 String?
+  state                String?
+  country              String?      @db.Char(2)
+  postalCode           String?
+  timezone             String       @default("UTC")
   /// Set from the owner's location at signup (see shared/currency.ts). This
   /// default only applies when that can't be determined — naira rather than
   /// USD, because the subscription plans are priced in NGN.
-  currency     String       @default("NGN") @db.Char(3)
-  locale       String       @default("en")
-  settings     Json?
-  createdAt    DateTime     @default(now())
-  updatedAt    DateTime     @updatedAt
-  deletedAt    DateTime?
+  currency             String       @default("NGN") @db.Char(3)
+  locale               String       @default("en")
+  /// Print a scannable pay code on invoices, receipts and rent demands.
+  /// On by default: a customer holding a bill should be able to settle it
+  /// without typing anything. A business that bills on account, or is not
+  /// collecting through the platform, turns it off.
+  paymentQrOnDocuments Boolean      @default(true)
+  settings             Json?
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+  deletedAt            DateTime?
 
   branches        Branch[]
   departments     Department[]
@@ -1456,12 +1461,13 @@ model Product {
   updatedAt      DateTime      @updatedAt
   deletedAt      DateTime?
 
-  category    ProductCategory? @relation(fields: [categoryId], references: [id])
-  brand       Brand?           @relation(fields: [brandId], references: [id])
+  category    ProductCategory?  @relation(fields: [categoryId], references: [id])
+  brand       Brand?            @relation(fields: [brandId], references: [id])
   variants    ProductVariant[]
   images      ProductImage[]
-  bundleItems BundleItem[]     @relation("BundleChild")
+  bundleItems BundleItem[]      @relation("BundleChild")
   bundles     ProductBundle[]
+  suppliers   SupplierProduct[]
 
   @@unique([organizationId, slug])
   @@index([organizationId, status])
@@ -1638,7 +1644,11 @@ model Promotion {
   redemptionCount Int             @default(0)
   /// Happy-hour / flash windows: {days:[1..7], from:"17:00", to:"19:00"}
   schedule        Json?
-  /// When to push-notify subscribers.
+  /// Tell linked customers this offer exists. On by default: a promotion
+  /// nobody is told about is the commonest reason a campaign does nothing.
+  notifyCustomers Boolean         @default(true)
+  /// When to push-notify subscribers. Filled in automatically on creation from
+  /// `startsAt`, so a merchant never has to think about it.
   notifyAt        DateTime?
   notifiedAt      DateTime?
   imageUrl        String?
@@ -1771,21 +1781,87 @@ model Supplier {
   id             String    @id @default(cuid())
   organizationId String
   name           String
+  /// Short internal reference the buying team uses on paperwork.
+  code           String?
+  contactName    String?
   email          String?
   phone          String?
+  website        String?
   addressLine1   String?
+  addressLine2   String?
   city           String?
+  state          String?
+  postalCode     String?
   country        String?   @db.Char(2)
   paymentTerms   String?
+  /// Currency this supplier invoices in; null = the organization's own.
+  currency       String?   @db.Char(3)
+  taxId          String?
+  /// Typical days from order to delivery, used to warn on restock timing.
+  leadTimeDays   Int?
+  /// Buyer's own 1–5 score. Deliberately manual: nobody has enough purchase
+  /// history at signup for a computed rating to mean anything.
+  rating         Int?
+  tags           String[]  @default([])
+  notes          String?   @db.Text
   isActive       Boolean   @default(true)
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
   deletedAt      DateTime?
 
   purchaseOrders PurchaseOrder[]
+  contacts       SupplierContact[]
+  products       SupplierProduct[]
 
   @@unique([organizationId, name])
   @@index([organizationId])
+}
+
+/// People to call at a supplier. Separate from `Supplier.contactName` because
+/// real suppliers have a sales rep, an accounts contact and a warehouse line,
+/// and the buyer needs to reach the right one.
+model SupplierContact {
+  id             String   @id @default(cuid())
+  organizationId String
+  supplierId     String
+  name           String
+  role           String?
+  email          String?
+  phone          String?
+  isPrimary      Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, supplierId])
+}
+
+/// What a supplier sells us, at what price. Keyed by product rather than
+/// variant so the link survives variant churn; per-variant cost lives on the
+/// purchase order line where it is actually negotiated.
+model SupplierProduct {
+  id             String   @id @default(cuid())
+  organizationId String
+  supplierId     String
+  productId      String
+  /// The supplier's own catalogue number — what goes on the purchase order.
+  supplierSku    String?
+  costPrice      Decimal? @db.Decimal(14, 2)
+  currency       String?  @db.Char(3)
+  leadTimeDays   Int?
+  minOrderQty    Decimal? @db.Decimal(12, 3)
+  /// The one to reorder from by default. At most one per product; enforced in
+  /// the service, since a partial unique index can't be expressed here.
+  isPreferred    Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([supplierId, productId])
+  @@index([organizationId, productId])
 }
 
 model PurchaseOrder {
@@ -1802,6 +1878,17 @@ model PurchaseOrder {
   expectedAt     DateTime?
   orderedAt      DateTime?
   receivedAt     DateTime?
+  /// Raised by the reorder watcher rather than a person. Surfaced in the UI so
+  /// nobody is surprised by paperwork they did not create.
+  autoGenerated  Boolean             @default(false)
+  /// Opaque token printed as a QR on the order document. Scanning it in the
+  /// warehouse opens this order ready to receive, so nobody has to find it by
+  /// number. Random rather than signed: the token *is* the secret, it is only
+  /// ever accepted from an authenticated session, and it can be rotated by
+  /// reprinting. Nullable so orders raised before this shipped still open.
+  scanToken      String?             @unique
+  cancelledAt    DateTime?
+  cancelReason   String?
   notes          String?             @db.Text
   createdById    String?
   createdAt      DateTime            @default(now())
@@ -1824,11 +1911,42 @@ model PurchaseOrderItem {
   unitCost        Decimal @db.Decimal(14, 2)
   taxRate         Decimal @default(0) @db.Decimal(5, 2)
   total           Decimal @db.Decimal(14, 2)
+  /// Snapshot of the supplier's own catalogue number at the time of ordering,
+  /// so a reprinted PO still matches what the supplier was sent.
+  supplierSku     String?
 
-  purchaseOrder PurchaseOrder  @relation(fields: [purchaseOrderId], references: [id])
+  purchaseOrder PurchaseOrder  @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
   variant       ProductVariant @relation(fields: [variantId], references: [id])
 
   @@index([purchaseOrderId])
+}
+
+/// When and how a business wants stock reordered for it.
+///
+/// A typed row rather than a blob on `Organization.settings` because the
+/// watcher has to find the businesses that opted in without reading and parsing
+/// the settings of every organization on the platform.
+model ReorderPolicy {
+  id                String    @id @default(cuid())
+  organizationId    String    @unique
+  /// Raise purchase orders automatically when stock reaches its reorder point.
+  isEnabled         Boolean   @default(false)
+  /// DRAFT keeps a buyer in the loop; ORDERED sends without asking. Draft is
+  /// the default: automatic spending should be a deliberate second decision.
+  createAs          String    @default("DRAFT")
+  /// Used when a stock level names a reorder point but no quantity to buy.
+  defaultReorderQty Decimal?  @db.Decimal(12, 3)
+  /// Don't raise another order for the same item within this window. Stops a
+  /// slow-arriving delivery from generating a new PO every sweep.
+  cooldownHours     Int       @default(24)
+  /// Skip items with no supplier attached rather than raising an order nobody
+  /// can send. Off means those items are reported instead.
+  skipUnsourced     Boolean   @default(true)
+  lastRunAt         DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([isEnabled])
 }
 
 // ============================================================
@@ -1886,6 +2004,9 @@ model Order {
   discountTotal     Decimal       @default(0) @db.Decimal(14, 2)
   total             Decimal       @default(0) @db.Decimal(14, 2)
   paymentStatus     PaymentStatus @default(PENDING)
+  /// Whether this order has to be delivered. Drives the delivery panel and the
+  /// dispatch half of the status flow; a counter sale never needs either.
+  requiresDelivery  Boolean       @default(false)
   couponCode        String?
   notes             String?       @db.Text
   placedById        String? // agent Membership id when created on behalf
@@ -1960,17 +2081,94 @@ model Shipment {
   trackingNumber    String?
   trackingUrl       String?
   shippingAddressId String?
+  /// Delivery gateway this shipment was booked with; null for a shipment
+  /// recorded by hand before any gateway was connected.
+  providerId        String?
+  /// The gateway's own id for this delivery — what its webhooks quote.
+  externalId        String?
+  /// Carrier-specific status text, kept verbatim next to our mapped status so
+  /// support can see what the gateway actually said.
+  statusDetail      String?
+  labelUrl          String?
+  cost              Decimal?       @db.Decimal(14, 2)
+  currency          String?        @db.Char(3)
+  recipientName     String?
+  recipientPhone    String?
+  /// Free-form destination for gateways that take an address string rather
+  /// than a structured CustomerAddress.
+  dropoffAddress    String?
+  pickupAddress     String?
+  notes             String?        @db.Text
+  estimatedAt       DateTime?
+  lastSyncedAt      DateTime?
   shippedAt         DateTime?
   deliveredAt       DateTime?
   createdAt         DateTime       @default(now())
   updatedAt         DateTime       @updatedAt
 
-  order           Order            @relation(fields: [orderId], references: [id])
-  shippingAddress CustomerAddress? @relation(fields: [shippingAddressId], references: [id])
+  order           Order             @relation(fields: [orderId], references: [id])
+  shippingAddress CustomerAddress?  @relation(fields: [shippingAddressId], references: [id])
+  provider        DeliveryProvider? @relation(fields: [providerId], references: [id])
+  events          DeliveryEvent[]
 
   @@unique([organizationId, number])
   @@index([orderId])
   @@index([trackingNumber])
+  @@index([providerId, externalId])
+}
+
+/// A delivery gateway a business has connected — a courier API, or their own
+/// riders. Credentials live here rather than in org settings so a business can
+/// run several couriers side by side and pick per order.
+model DeliveryProvider {
+  id             String    @id @default(cuid())
+  organizationId String
+  name           String
+  /// Which adapter drives it. See delivery/adapters for the registry.
+  adapter        String    @default("MANUAL")
+  isActive       Boolean   @default(true)
+  /// Used when an order is dispatched without naming a gateway.
+  isDefault      Boolean   @default(false)
+  /// Adapter credentials (api keys, account ids). Never returned to clients.
+  credentials    Json?
+  /// Non-secret adapter configuration: base URL, webhook field mappings, the
+  /// pickup address, whether to auto-advance the order status.
+  settings       Json?
+  /// Shared secret the gateway signs its tracking callbacks with.
+  webhookSecret  String?
+  lastUsedAt     DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  shipments Shipment[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId, isActive])
+}
+
+/// Tracking history for a shipment. Append-only: it is the audit trail behind
+/// every automatic order-status change, and duplicate callbacks are deduped on
+/// (shipmentId, externalEventId) rather than overwriting.
+model DeliveryEvent {
+  id              String         @id @default(cuid())
+  organizationId  String
+  shipmentId      String
+  status          ShipmentStatus
+  description     String?
+  location        String?
+  /// The gateway's event id, when it sends one — couriers retry callbacks.
+  externalEventId String?
+  /// Where it came from: WEBHOOK | POLL | MANUAL.
+  source          String         @default("MANUAL")
+  raw             Json?
+  occurredAt      DateTime       @default(now())
+  createdAt       DateTime       @default(now())
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+
+  @@unique([shipmentId, externalEventId])
+  @@index([shipmentId, occurredAt])
 }
 
 model ReturnRequest {
@@ -4077,6 +4275,11 @@ model PaymentSession {
   expiresAt             DateTime
   /// Filled when a customer scans/authorizes the session.
   customerVhicasarId    String?
+  /// Promotion the customer chose at confirmation. `amount` stays the gross the
+  /// merchant asked for; `discountAmount` is what the promotion took off, so
+  /// the books show both what was charged and what was given away.
+  promotionId           String?
+  discountAmount        Decimal?             @db.Decimal(14, 2)
   deviceId              String?
   paymentId             String? // resulting Payment row
   walletTransactionId   String?

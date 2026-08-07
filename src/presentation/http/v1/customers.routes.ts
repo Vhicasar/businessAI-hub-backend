@@ -46,6 +46,23 @@ customersRoutes.post(
   })
 );
 
+/**
+ * Type-ahead lookup used by the "select existing customer" step, so staff can
+ * find a person mid-sale without leaving the workflow.
+ *
+ * Declared ahead of `/:id`: Express matches in declaration order, so a literal
+ * path placed after a parameter route is read as an id and never reached.
+ */
+customersRoutes.get(
+  '/lookup',
+  requirePermission('customers.read'),
+  validate({ query: z.object({ q: z.string().trim().min(2).max(80), limit: z.coerce.number().int().min(1).max(20).default(8) }) }),
+  wrap(async (req, res) => {
+    const { q, limit } = req.query as unknown as { q: string; limit: number };
+    res.json({ success: true, data: await quickCreate.lookup(q, limit) });
+  })
+);
+
 customersRoutes.get(
   '/:id',
   requirePermission('customers.read'),
@@ -141,20 +158,6 @@ customersRoutes.delete(
 );
 
 // ---- Inline customer creation for POS / orders / bookings (§23) ----
-
-/**
- * Type-ahead lookup used by the "select existing customer" step, so staff can
- * find a person mid-sale without leaving the workflow.
- */
-customersRoutes.get(
-  '/lookup',
-  requirePermission('customers.read'),
-  validate({ query: z.object({ q: z.string().trim().min(2).max(80), limit: z.coerce.number().int().min(1).max(20).default(8) }) }),
-  wrap(async (req, res) => {
-    const { q, limit } = req.query as unknown as { q: string; limit: number };
-    res.json({ success: true, data: await quickCreate.lookup(q, limit) });
-  })
-);
 
 /**
  * Find-or-create in one call. Matches on email → phone → government id before

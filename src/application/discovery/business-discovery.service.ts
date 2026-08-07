@@ -85,6 +85,44 @@ const publicBusinessView = (org: {
   website: org.website,
 });
 
+/** What a business with nothing running looks like, so the shape never varies. */
+const EMPTY_OFFERS = { activePromotionCount: 0, topPromotion: null as string | null };
+
+/**
+ * Live-offer counts for a page of businesses, in one query.
+ *
+ * "Live" means the same thing here as on the promotion list: ACTIVE and inside
+ * its date window. Time-of-day windows (happy hour) are deliberately *not*
+ * applied — this is a shop-window count, and hiding a happy-hour deal at
+ * breakfast would tell the customer the business has nothing on.
+ */
+async function livePromotionSummary(
+  organizationIds: string[]
+): Promise<Map<string, { activePromotionCount: number; topPromotion: string | null }>> {
+  const out = new Map<string, { activePromotionCount: number; topPromotion: string | null }>();
+  if (organizationIds.length === 0) return out;
+
+  const now = new Date();
+  const promotions = await prismaUnscoped.promotion.findMany({
+    where: {
+      organizationId: { in: organizationIds },
+      status: 'ACTIVE',
+      startsAt: { lte: now },
+      endsAt: { gte: now },
+    },
+    select: { organizationId: true, name: true, endsAt: true },
+    orderBy: { endsAt: 'asc' },
+  });
+
+  for (const p of promotions) {
+    const entry = out.get(p.organizationId);
+    if (entry) entry.activePromotionCount += 1;
+    // Ordered by soonest-ending, so the first one seen is the most urgent.
+    else out.set(p.organizationId, { activePromotionCount: 1, topPromotion: p.name });
+  }
+  return out;
+}
+
 const orgSelect = {
   id: true,
   name: true,
@@ -165,8 +203,12 @@ export const businessDiscovery = {
 
     const hasMore = rows.length > params.limit;
     const items = hasMore ? rows.slice(0, params.limit) : rows;
+    // Offers are the reason a customer taps through, so the count and the
+    // headline deal ride along with the search result rather than waiting for
+    // the profile screen.
+    const offers = await livePromotionSummary(items.map((o) => o.id));
     return {
-      items: items.map(publicBusinessView),
+      items: items.map((o) => ({ ...publicBusinessView(o), ...(offers.get(o.id) ?? EMPTY_OFFERS) })),
       nextCursor: hasMore ? (items[items.length - 1]?.id ?? null) : null,
     };
   },
@@ -192,6 +234,9 @@ export const businessDiscovery = {
           endsAt: { gte: new Date() },
         },
         select: { id: true, name: true, description: true, kind: true, discountType: true, discountValue: true, endsAt: true, imageUrl: true },
+        // Soonest to expire first, matching the search results — otherwise the
+        // "top offer" on a card changes depending on which screen rendered it.
+        orderBy: { endsAt: 'asc' },
         take: 10,
       }),
       vhicasarId
@@ -217,6 +262,10 @@ export const businessDiscovery = {
         endsAt: p.endsAt,
         imageUrl: p.imageUrl,
       })),
+      // Same two fields the search results carry, so a card rendered from
+      // either payload shows the same badge.
+      activePromotionCount: promotions.length,
+      topPromotion: promotions[0]?.name ?? null,
       isJoined: Boolean(link && link.status === 'ACTIVE'),
       joinedAt: link?.linkedAt ?? null,
     };

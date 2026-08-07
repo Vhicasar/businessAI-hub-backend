@@ -6,7 +6,10 @@ import type { DetectedType } from './detect';
  * is all that's needed for it to appear in the importer.
  */
 
-export const ENTITIES = ['customers', 'leads', 'employees', 'products', 'kb-articles'] as const;
+export const ENTITIES = [
+  'customers', 'leads', 'employees', 'products', 'kb-articles',
+  'suppliers', 'supplier-products', 'purchase-orders', 'reorder-levels',
+] as const;
 export type Entity = (typeof ENTITIES)[number];
 
 export interface FieldDef {
@@ -178,6 +181,54 @@ export const FIELD_DEFS: Record<Entity, FieldDef[]> = {
     },
   ],
 
+  suppliers: [
+    externalId('Supplier ID (from your old system)', ['supplier id', 'supplierid', 'id', 'external id', 'vendor id', 'reference']),
+    { key: 'name', label: 'Supplier name', required: true, accepts: ['text', 'fullName'], aliases: ['name', 'supplier', 'supplier name', 'vendor', 'vendor name', 'company'] },
+    { key: 'code', label: 'Supplier code', accepts: ['text', 'number'], aliases: ['code', 'supplier code', 'vendor code', 'short code'] },
+    { key: 'contactName', label: 'Main contact', accepts: ['text', 'fullName'], aliases: ['contact', 'contact name', 'rep', 'sales rep', 'account manager'] },
+    EMAIL,
+    PHONE,
+    { key: 'website', label: 'Website', accepts: ['text'], aliases: ['website', 'url', 'web', 'site'] },
+    ...ADDRESS,
+    { key: 'paymentTerms', label: 'Payment terms', accepts: ['text'], aliases: ['payment terms', 'terms', 'credit terms'], hint: 'Free text, e.g. "Net 30"' },
+    { key: 'currency', label: 'Currency', accepts: ['text'], aliases: ['currency', 'currency code', 'invoice currency'], hint: 'A 3-letter code (NGN, USD, GBP)' },
+    { key: 'taxId', label: 'Tax ID', accepts: ['text', 'number'], aliases: ['tax id', 'vat number', 'tin', 'tax number'] },
+    { key: 'leadTimeDays', label: 'Lead time (days)', accepts: ['number'], aliases: ['lead time', 'lead time days', 'delivery days', 'leadtime'] },
+    { key: 'rating', label: 'Rating (1-5)', accepts: ['number'], aliases: ['rating', 'score', 'stars'] },
+    { key: 'tags', label: 'Tags', accepts: ['text'], aliases: ['tags', 'labels', 'categories'], hint: 'Comma separated' },
+    { key: 'notes', label: 'Notes', accepts: ['text'], aliases: ['notes', 'comment', 'remarks'] },
+  ],
+
+  'supplier-products': [
+    { key: 'supplier', label: 'Supplier', required: true, accepts: ['text', 'fullName'], aliases: ['supplier', 'supplier name', 'vendor'], hint: 'Matched by name or supplier code' },
+    { key: 'sku', label: 'Product SKU', required: true, accepts: ['text', 'number'], aliases: ['sku', 'product sku', 'item code', 'code'], hint: 'Your own SKU, used to find the product' },
+    { key: 'supplierSku', label: "Supplier's SKU", accepts: ['text', 'number'], aliases: ['supplier sku', 'vendor sku', 'their code', 'supplier code'] },
+    { key: 'costPrice', label: 'Cost price', accepts: ['currency', 'number'], aliases: ['cost', 'cost price', 'buy price', 'unit cost', 'price'] },
+    { key: 'currency', label: 'Currency', accepts: ['text'], aliases: ['currency', 'currency code'] },
+    { key: 'leadTimeDays', label: 'Lead time (days)', accepts: ['number'], aliases: ['lead time', 'lead time days', 'delivery days'] },
+    { key: 'minOrderQty', label: 'Minimum order quantity', accepts: ['number'], aliases: ['moq', 'min order', 'minimum order', 'min qty'] },
+    { key: 'isPreferred', label: 'Preferred supplier', accepts: ['boolean'], aliases: ['preferred', 'is preferred', 'primary', 'default'] },
+  ],
+
+  'purchase-orders': [
+    { key: 'number', label: 'Order number', accepts: ['text', 'number'], aliases: ['number', 'po number', 'order number', 'reference'], hint: 'Generated when left blank' },
+    { key: 'supplier', label: 'Supplier', required: true, accepts: ['text', 'fullName'], aliases: ['supplier', 'supplier name', 'vendor'] },
+    { key: 'warehouse', label: 'Deliver to', accepts: ['text'], aliases: ['warehouse', 'location', 'deliver to', 'destination'], hint: 'Defaults to your default warehouse' },
+    { key: 'sku', label: 'Product SKU', required: true, accepts: ['text', 'number'], aliases: ['sku', 'item code', 'product code'] },
+    { key: 'quantity', label: 'Quantity', required: true, accepts: ['number'], aliases: ['quantity', 'qty', 'ordered', 'units'] },
+    { key: 'unitCost', label: 'Unit cost', accepts: ['currency', 'number'], aliases: ['unit cost', 'cost', 'price', 'unit price'], hint: "Falls back to the supplier's agreed price" },
+    { key: 'taxRate', label: 'Tax rate (%)', accepts: ['number'], aliases: ['tax', 'tax rate', 'vat'] },
+    { key: 'expectedAt', label: 'Expected date', accepts: ['date'], aliases: ['expected', 'expected date', 'eta', 'due date', 'delivery date'] },
+    { key: 'notes', label: 'Notes', accepts: ['text'], aliases: ['notes', 'comment', 'remarks'] },
+  ],
+
+  'reorder-levels': [
+    { key: 'sku', label: 'Product SKU', required: true, accepts: ['text', 'number'], aliases: ['sku', 'item code', 'product code', 'code'] },
+    { key: 'warehouse', label: 'Warehouse', accepts: ['text'], aliases: ['warehouse', 'location', 'store'], hint: 'Defaults to your default warehouse' },
+    { key: 'reorderPoint', label: 'Reorder at', required: true, accepts: ['number'], aliases: ['reorder point', 'reorder at', 'min stock', 'minimum', 'low stock level', 'par level'] },
+    { key: 'reorderQty', label: 'Quantity to order', accepts: ['number'], aliases: ['reorder quantity', 'reorder qty', 'order quantity', 'restock qty'] },
+  ],
+
   'kb-articles': [
     { key: 'title', label: 'Title', required: true, accepts: ['text', 'fullName'], aliases: ['title', 'name', 'subject', 'article title', 'question'] },
     { key: 'body', label: 'Body', required: true, accepts: ['text'], aliases: ['body', 'content', 'description', 'article body', 'html', 'answer'] },
@@ -197,4 +248,8 @@ export const EITHER_OR: Record<Entity, string[][]> = {
   employees: [['firstName', 'fullName'], ['lastName', 'fullName']],
   products: [],
   'kb-articles': [],
+  suppliers: [],
+  'supplier-products': [],
+  'purchase-orders': [],
+  'reorder-levels': [],
 };

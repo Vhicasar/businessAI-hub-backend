@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { prisma } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { ConflictError, NotFoundError, ValidationError } from '../../shared/errors';
+import { promotionEngine } from './promotion-engine.service';
 
 const oid = () => { const id = requestContext.get()?.organizationId; if (!id) throw new Error('No tenant'); return id; };
 export const couponSchema = z.object({
@@ -14,6 +15,11 @@ export const promotionSchema = z.object({
   name: z.string().trim().min(2).max(120), description: z.string().trim().max(1000).nullable().optional(), discountType: z.enum(['PERCENTAGE', 'FIXED_AMOUNT']),
   discountValue: z.coerce.number().positive(), status: z.enum(['SCHEDULED', 'ACTIVE', 'PAUSED', 'ENDED']).default('ACTIVE'),
   scope: z.enum(['ALL', 'PRODUCTS', 'PROPERTIES']), targetIds: z.array(z.string()).default([]), startsAt: z.coerce.date(), endsAt: z.coerce.date(),
+  /** Announce it to linked customers. On unless the merchant says otherwise. */
+  notifyCustomers: z.boolean().default(true),
+  minSpend: z.coerce.number().nonnegative().nullable().optional(),
+  maxPerCustomer: z.coerce.number().int().positive().default(1),
+  terms: z.string().trim().max(4000).nullable().optional(),
 }).refine((v) => v.endsAt > v.startsAt, { message: 'End date must be after start date' });
 
 export async function validateCoupon(code: string, amount: number, customerId?: string) {
@@ -40,6 +46,29 @@ export const promotionsService = {
     return prisma.coupon.create({ data: { organizationId: oid(), ...data } });
   },
   listPromotions: () => prisma.promotion.findMany({ orderBy: { createdAt: 'desc' } }),
-  createPromotion: (data: z.infer<typeof promotionSchema>) => prisma.promotion.create({ data: { organizationId: oid(), name: data.name, description: data.description, discountType: data.discountType, discountValue: data.discountValue, status: data.status, startsAt: data.startsAt, endsAt: data.endsAt, appliesTo: { scope: data.scope, ids: data.targetIds } } }),
+
+  /**
+   * Created through the promotion engine rather than a direct write.
+   *
+   * There is one creation path on purpose: the engine is what schedules the
+   * customer announcement, writes the audit row and emits the event. A
+   * promotion created here used to do none of that, so an offer made from the
+   * web app existed but nobody was ever told about it.
+   */
+  createPromotion: (data: z.infer<typeof promotionSchema>) =>
+    promotionEngine.upsert(oid(), {
+      name: data.name,
+      description: data.description ?? undefined,
+      discountType: data.discountType,
+      discountValue: data.discountValue,
+      status: data.status,
+      startsAt: data.startsAt,
+      endsAt: data.endsAt,
+      appliesTo: { scope: data.scope, ids: data.targetIds },
+      notifyCustomers: data.notifyCustomers,
+      minSpend: data.minSpend ?? undefined,
+      maxPerCustomer: data.maxPerCustomer,
+      terms: data.terms ?? undefined,
+    }),
   validate: validateCoupon,
 };

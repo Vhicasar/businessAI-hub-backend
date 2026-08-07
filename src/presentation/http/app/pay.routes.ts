@@ -94,11 +94,17 @@ appPayRoutes.post(
   })
 );
 
-/** Scan a dynamic QR: read-only view of the pending charge. */
+/**
+ * Scan a dynamic QR: read-only view of the pending charge, plus the offers the
+ * scanning customer could apply to it.
+ */
 appPayRoutes.get(
   '/payments/session/:token',
   wrap(async (req, res) => {
-    const data = await vhicasarPayService.describeSession(req.params.token as string);
+    const data = await vhicasarPayService.describeSession(
+      req.params.token as string,
+      req.appAuth!.vhicasarId
+    );
     res.json({ success: true, data });
   })
 );

@@ -206,11 +206,15 @@ export const paymentLinksService = {
     if (!link) throw new NotFoundError('Payment link');
     const org = await prismaUnscoped.organization.findUnique({
       where: { id: link.organizationId },
-      select: { name: true },
+      select: { name: true, status: true, deletedAt: true },
     });
     const { provider } = await providerFor(link.organizationId);
     const expired = !!link.expiresAt && link.expiresAt.getTime() < Date.now();
     const outstanding = round2(Number(link.amount) - Number(link.amountPaid));
+    // A link outlives the moment it was created — a printed code can be scanned
+    // months later — so the business's standing is checked at payment time, not
+    // only at issue time. A suspended or closed business cannot keep collecting.
+    const collectible = Boolean(org) && !org!.deletedAt && (org!.status === 'ACTIVE' || org!.status === 'TRIAL');
     const effectiveStatus = expired && link.status === 'PENDING' ? 'EXPIRED' : link.status;
 
     return {
@@ -224,7 +228,12 @@ export const paymentLinksService = {
       status: effectiveStatus,
       allowPartial: link.allowPartial,
       expiresAt: link.expiresAt,
-      payable: !expired && effectiveStatus !== 'PAID' && effectiveStatus !== 'CANCELLED' && outstanding > 0,
+      payable:
+        collectible &&
+        !expired &&
+        effectiveStatus !== 'PAID' &&
+        effectiveStatus !== 'CANCELLED' &&
+        outstanding > 0,
       onlineEnabled: provider.enabled,
     };
   },

@@ -15,8 +15,18 @@ export const PERMISSION_MODULES = {
   quotations: ['read', 'create', 'update', 'delete', 'send'],
   contracts: ['read', 'create', 'update', 'delete'],
   catalog: ['read', 'create', 'update', 'delete', 'manage_pricing'],
-  inventory: ['read', 'adjust', 'transfer', 'manage_warehouses'],
-  purchasing: ['read', 'create', 'update', 'delete', 'receive'],
+  inventory: ['read', 'adjust', 'transfer', 'manage_warehouses', 'set_reorder_levels'],
+  // Who you buy from. Separate from `purchasing` because maintaining the
+  // supplier book is a different job from raising and receiving orders — a
+  // buyer needs both, a warehouse hand only needs to read.
+  suppliers: ['read', 'create', 'update', 'delete', 'manage_products'],
+  purchasing: ['read', 'create', 'update', 'delete', 'receive', 'configure_reorder'],
+  // Couriers and shipments. `configure` is an integration change (credentials,
+  // webhook secrets); `dispatch` and `update_status` are day-to-day fulfilment,
+  // so a packer can send a parcel without being able to swap the courier
+  // account or read its keys.
+  delivery: ['read', 'configure', 'dispatch', 'update_status'],
+  promotions: ['read', 'create', 'update', 'publish'],
   orders: ['read', 'create', 'update', 'cancel', 'fulfill', 'refund', 'export'],
   pos: ['operate'],
   invoices: ['read', 'create', 'update', 'void', 'send'],
@@ -103,6 +113,8 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, { description: string; permis
       'inbox.read', 'inbox.reply', 'inbox.assign', 'inbox.resolve',
       'orders.read', 'orders.create', 'orders.export',
       'catalog.read', 'invoices.read', 'invoices.create', 'invoices.send',
+      // Answering "where is my order?" needs the delivery, not just the order.
+      'delivery.read', 'promotions.read',
       'analytics.view', 'ai.use_assistant', 'files.read', 'files.upload',
     ],
   },
@@ -112,16 +124,19 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, { description: string; permis
       'dashboard.view',
       ...keysFor('inbox', 'support', 'kb'),
       'customers.read', 'customers.update',
-      'orders.read', 'invoices.read',
+      'orders.read', 'invoices.read', 'delivery.read', 'promotions.read',
       'ai.use_assistant', 'files.read', 'files.upload',
     ],
   },
   Warehouse: {
-    description: 'Inventory, transfers, purchasing and order fulfillment',
+    description: 'Inventory, suppliers, purchasing, receiving and dispatch',
     permissions: [
       'dashboard.view',
-      ...keysFor('inventory', 'purchasing'),
+      ...keysFor('inventory', 'purchasing', 'suppliers'),
       'catalog.read', 'orders.read', 'orders.fulfill',
+      // Dispatches parcels and moves them along, but connecting a courier
+      // account is an integration change that belongs to an administrator.
+      'delivery.read', 'delivery.dispatch', 'delivery.update_status',
       'files.read', 'files.upload',
     ],
   },
@@ -139,7 +154,7 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, { description: string; permis
     description: 'Campaigns, segments, automations and loyalty',
     permissions: [
       'dashboard.view',
-      ...keysFor('marketing', 'segments', 'automations', 'loyalty'),
+      ...keysFor('marketing', 'segments', 'automations', 'loyalty', 'promotions'),
       'customers.read', 'customers.export', 'catalog.read',
       'analytics.view', 'ai.use_assistant', 'files.read', 'files.upload',
     ],

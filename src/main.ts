@@ -23,6 +23,7 @@ import {
 } from './application/payments/payout-sweeps';
 import { startWebhookRetrySweep } from './application/api-keys/webhook-delivery.service';
 import { startPromotionNotifier } from './application/marketing/promotion-engine.service';
+import { startReorderWatcher } from './application/purchasing/reorder.service';
 import { reconcileSystemRolePermissions } from './application/roles/reconcile-permissions';
 import { closeQueues, queueEnabled } from './infrastructure/queue/queue';
 import { createApp } from './app';
@@ -62,6 +63,7 @@ async function bootstrap(): Promise<void> {
   startRewardExpiry(); // expire reward points past their window
   startSettlementRuns(); // release settlements as their schedule comes due (§10)
   startPromotionNotifier(); // push scheduled promotion notifications
+  startReorderWatcher(); // raise purchase orders when stock hits its reorder point
   logger.info(
     queueEnabled()
       ? '📮 Queue mode: async — workflow & campaign jobs handed to the worker (run `npm run worker`)'

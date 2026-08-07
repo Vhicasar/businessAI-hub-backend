@@ -5,6 +5,9 @@ import { crmService } from '../crm/crm.service';
 import { canSeeSalary, employeesService } from '../employees/employees.service';
 import { catalogService } from '../catalog/catalog.service';
 import { kbService } from '../support/kb.service';
+import { suppliersService } from '../purchasing/suppliers.service';
+import { purchaseOrdersService } from '../purchasing/purchase-orders.service';
+import { reorderService } from '../purchasing/reorder.service';
 import { parseCsv, splitName, toCsv } from './csv';
 import { analyzeColumns, toColumns, type ColumnAnalysis } from './mapping';
 import { EITHER_OR, ENTITIES, FIELD_DEFS, type Entity } from './fields';
@@ -61,6 +64,12 @@ const num = (v: string | undefined): number | null => {
 const bool = (v: string | undefined, dflt = false): boolean => {
   if (v === undefined || v.trim() === '') return dflt;
   return /^(true|yes|y|1)$/i.test(v.trim());
+};
+/** A date column, or null when it is blank or unparseable. */
+const date = (v: string | undefined): Date | null => {
+  if (v === undefined || v.trim() === '') return null;
+  const d = new Date(v.trim());
+  return Number.isNaN(d.getTime()) ? null : d;
 };
 
 // -------------------------------------------------------------------- analyze
@@ -165,6 +174,17 @@ interface Ctx {
   brands: Map<string, string>;
   /** SKUs claimed earlier in this same batch, so generated ones don't collide. */
   skus: Set<string>;
+  /** Suppliers by lower-cased name *and* code, so a file can use either. */
+  suppliers: Map<string, { id: string; currency: string | null; leadTimeDays: number | null }>;
+  /** Variants by SKU — how a purchasing file points at a product. */
+  variantsBySku: Map<string, { id: string; productId: string; costPrice: string | null }>;
+  warehouses: { id: string; name: string; code: string; isDefault: boolean }[];
+  /**
+   * Purchase orders opened earlier in the same file, keyed by supplier +
+   * warehouse. One row per line item is how these files come, so lines have to
+   * accumulate onto one order rather than raising one order each.
+   */
+  openOrders: Map<string, string>;
 }
 
 /** Common country names → ISO-3166 alpha-2, since the column requires a 2-letter code. */
@@ -517,6 +537,171 @@ function importerFor(entity: Entity, ctx: Ctx): RowImporter {
         }
       };
 
+    case 'suppliers':
+      return async (row) => {
+        const name = val(row, 'name');
+        if (!name) throw new Error('Missing supplier name');
+        const countryRaw = val(row, 'country');
+        const country = countryRaw ? toCountryCode(countryRaw) : null;
+        if (countryRaw && !country) throw new Error(`Unrecognised country "${countryRaw}"`);
+
+        try {
+          const created = await suppliersService.create({
+            name,
+            code: val(row, 'code') ?? null,
+            contactName: val(row, 'contactName') ?? null,
+            email: val(row, 'email') ?? null,
+            phone: val(row, 'phone') ?? null,
+            website: val(row, 'website') ?? null,
+            addressLine1: val(row, 'addressLine1') ?? null,
+            addressLine2: val(row, 'addressLine2') ?? null,
+            city: val(row, 'city') ?? null,
+            state: val(row, 'state') ?? null,
+            postalCode: val(row, 'postalCode') ?? null,
+            country: country ?? ctx.defaultCountry,
+            paymentTerms: val(row, 'paymentTerms') ?? null,
+            currency: (val(row, 'currency') ?? '').toUpperCase() || null,
+            taxId: val(row, 'taxId') ?? null,
+            leadTimeDays: num(val(row, 'leadTimeDays')),
+            rating: num(val(row, 'rating')),
+            tags: (val(row, 'tags') ?? '').split(',').map((x) => x.trim()).filter(Boolean),
+            notes: val(row, 'notes') ?? null,
+          } as never);
+          ctx.suppliers.set(name.toLowerCase(), {
+            id: created.id, currency: created.currency, leadTimeDays: created.leadTimeDays,
+          });
+          return 'created';
+        } catch (e) {
+          // A name that already exists is a re-run of the same file, not a
+          // failure worth stopping on.
+          if (/already exists/i.test(msg(e))) return 'skipped';
+          throw e;
+        }
+      };
+
+    case 'supplier-products':
+      return async (row) => {
+        const supplierName = val(row, 'supplier');
+        const sku = val(row, 'sku');
+        if (!supplierName) throw new Error('Missing supplier');
+        if (!sku) throw new Error('Missing product SKU');
+        const supplier = ctx.suppliers.get(supplierName.toLowerCase());
+        if (!supplier) throw new Error(`No supplier called "${supplierName}"`);
+        const variant = ctx.variantsBySku.get(sku.toLowerCase());
+        if (!variant) throw new Error(`No product with SKU "${sku}"`);
+
+        await suppliersService.linkProduct(supplier.id, {
+          productId: variant.productId,
+          supplierSku: val(row, 'supplierSku') ?? null,
+          // Fall back to what the product already costs, so a file that only
+          // names the pairing still records a usable price.
+          costPrice: num(val(row, 'costPrice')) ?? (variant.costPrice ? Number(variant.costPrice) : null),
+          currency: (val(row, 'currency') ?? '').toUpperCase() || null,
+          leadTimeDays: num(val(row, 'leadTimeDays')),
+          minOrderQty: num(val(row, 'minOrderQty')),
+          isPreferred: bool(val(row, 'isPreferred')),
+        } as never);
+        return 'created';
+      };
+
+    case 'purchase-orders':
+      return async (row) => {
+        const supplierName = val(row, 'supplier');
+        const sku = val(row, 'sku');
+        const quantity = num(val(row, 'quantity'));
+        if (!supplierName) throw new Error('Missing supplier');
+        if (!sku) throw new Error('Missing product SKU');
+        if (quantity === null || quantity <= 0) throw new Error('Missing or invalid quantity');
+
+        const supplier = ctx.suppliers.get(supplierName.toLowerCase());
+        if (!supplier) throw new Error(`No supplier called "${supplierName}"`);
+        const variant = ctx.variantsBySku.get(sku.toLowerCase());
+        if (!variant) throw new Error(`No product with SKU "${sku}"`);
+
+        const warehouseName = val(row, 'warehouse');
+        const warehouse = warehouseName
+          ? ctx.warehouses.find(
+              (w) => w.name.toLowerCase() === warehouseName.toLowerCase() ||
+                     w.code.toLowerCase() === warehouseName.toLowerCase()
+            )
+          : ctx.warehouses.find((w) => w.isDefault) ?? ctx.warehouses[0];
+        if (!warehouse) throw new Error(warehouseName ? `No warehouse called "${warehouseName}"` : 'No warehouse to deliver to');
+
+        const unitCost = num(val(row, 'unitCost')) ?? (variant.costPrice ? Number(variant.costPrice) : 0);
+        const line = {
+          variantId: variant.id,
+          quantity,
+          unitCost,
+          taxRate: num(val(row, 'taxRate')) ?? 0,
+        };
+
+        // One row per line: append to the order already open for this
+        // supplier/warehouse in this file rather than raising a new one.
+        const key = `${supplier.id}:${warehouse.id}`;
+        const existingId = ctx.openOrders.get(key);
+        if (existingId) {
+          const existing = await purchaseOrdersService.get(existingId);
+          await purchaseOrdersService.update(existingId, {
+            items: [
+              ...existing.items.map((i) => ({
+                variantId: i.variantId,
+                quantity: Number(i.quantity),
+                unitCost: Number(i.unitCost),
+                taxRate: Number(i.taxRate),
+              })),
+              line,
+            ],
+          } as never);
+          return 'created';
+        }
+
+        const created = await purchaseOrdersService.create({
+          supplierId: supplier.id,
+          warehouseId: warehouse.id,
+          expectedAt: date(val(row, 'expectedAt')),
+          notes: val(row, 'notes') ?? null,
+          items: [line],
+        } as never);
+        ctx.openOrders.set(key, created.id);
+        return 'created';
+      };
+
+    case 'reorder-levels':
+      return async (row) => {
+        const sku = val(row, 'sku');
+        const point = num(val(row, 'reorderPoint'));
+        if (!sku) throw new Error('Missing product SKU');
+        if (point === null) throw new Error('Missing reorder point');
+        const variant = ctx.variantsBySku.get(sku.toLowerCase());
+        if (!variant) throw new Error(`No product with SKU "${sku}"`);
+
+        const warehouseName = val(row, 'warehouse');
+        const warehouse = warehouseName
+          ? ctx.warehouses.find(
+              (w) => w.name.toLowerCase() === warehouseName.toLowerCase() ||
+                     w.code.toLowerCase() === warehouseName.toLowerCase()
+            )
+          : ctx.warehouses.find((w) => w.isDefault) ?? ctx.warehouses[0];
+        if (!warehouse) throw new Error(warehouseName ? `No warehouse called "${warehouseName}"` : 'No warehouse');
+
+        // The stock row may not exist yet for a product never counted here.
+        const level = await prisma.stockLevel.upsert({
+          where: { warehouseId_variantId: { warehouseId: warehouse.id, variantId: variant.id } },
+          update: {},
+          create: {
+            organizationId: (await prisma.warehouse.findFirstOrThrow({ where: { id: warehouse.id }, select: { organizationId: true } })).organizationId,
+            warehouseId: warehouse.id,
+            variantId: variant.id,
+            quantity: 0,
+          },
+        });
+        await reorderService.setReorderLevel(level.id, {
+          reorderPoint: point,
+          reorderQty: num(val(row, 'reorderQty')),
+        });
+        return 'created';
+      };
+
     case 'kb-articles':
       return async (row) => {
         const title = val(row, 'title');
@@ -598,9 +783,51 @@ export async function importEntity(entity: Entity, csv: string, mapping?: Mappin
     entity === 'products' ? catalogService.listBrands() : Promise.resolve([]),
   ]);
 
+  // Purchasing files reference suppliers by name and products by SKU, so both
+  // lookups are loaded up front rather than queried per row.
+  const purchasingEntity = entity === 'suppliers' || entity === 'supplier-products'
+    || entity === 'purchase-orders' || entity === 'reorder-levels';
+  const [supplierRows, variantRows, warehouseRows] = await Promise.all([
+    purchasingEntity
+      ? prisma.supplier.findMany({
+          where: { deletedAt: null },
+          select: { id: true, name: true, code: true, currency: true, leadTimeDays: true },
+        })
+      : Promise.resolve([]),
+    purchasingEntity
+      ? prisma.productVariant.findMany({
+          where: { deletedAt: null },
+          select: { id: true, sku: true, productId: true, costPrice: true },
+        })
+      : Promise.resolve([]),
+    purchasingEntity
+      ? prisma.warehouse.findMany({
+          where: { deletedAt: null, isActive: true },
+          select: { id: true, name: true, code: true, isDefault: true },
+        })
+      : Promise.resolve([]),
+  ]);
+
+  const suppliersByKey = new Map<string, { id: string; currency: string | null; leadTimeDays: number | null }>();
+  for (const s of supplierRows) {
+    const entry = { id: s.id, currency: s.currency, leadTimeDays: s.leadTimeDays };
+    suppliersByKey.set(s.name.toLowerCase(), entry);
+    // Files often carry the code rather than the full name.
+    if (s.code) suppliersByKey.set(s.code.toLowerCase(), entry);
+  }
+
   const importRow = importerFor(entity, {
     currency: org.currency,
     defaultCountry: org.country ?? null,
+    suppliers: suppliersByKey,
+    variantsBySku: new Map(
+      variantRows.map((v) => [
+        v.sku.toLowerCase(),
+        { id: v.id, productId: v.productId, costPrice: v.costPrice?.toString() ?? null },
+      ])
+    ),
+    warehouses: warehouseRows,
+    openOrders: new Map<string, string>(),
     departments: allDepartments.filter((d) => !d.deletedAt).map((d) => ({ id: d.id, code: d.code, name: d.name })),
     deptCodes: new Set(allDepartments.map((d) => d.code)),
     members: members.map((m) => ({
@@ -792,6 +1019,115 @@ export async function exportEntity(entity: Entity): Promise<{ filename: string; 
         orderBy: { updatedAt: 'desc' },
       });
       return { filename: `kb-articles-${stamp}.csv`, csv: toCsv(['title', 'body', 'status', 'isPublic', 'viewCount'], rows as never) };
+    }
+
+    case 'suppliers': {
+      const rows = await prisma.supplier.findMany({
+        where: { deletedAt: null },
+        orderBy: [{ isActive: 'desc' }, { name: 'asc' }],
+      });
+      const flat = rows.map((s) => ({
+        name: s.name, code: s.code, contactName: s.contactName, email: s.email, phone: s.phone,
+        website: s.website, addressLine1: s.addressLine1, addressLine2: s.addressLine2,
+        city: s.city, state: s.state, postalCode: s.postalCode, country: s.country,
+        paymentTerms: s.paymentTerms, currency: s.currency, taxId: s.taxId,
+        leadTimeDays: s.leadTimeDays, rating: s.rating,
+        // Re-importable: the importer splits this back on commas.
+        tags: s.tags.join(', '),
+        notes: s.notes, isActive: s.isActive,
+      }));
+      const headers = ['name', 'code', 'contactName', 'email', 'phone', 'website', 'addressLine1',
+        'addressLine2', 'city', 'state', 'postalCode', 'country', 'paymentTerms', 'currency',
+        'taxId', 'leadTimeDays', 'rating', 'tags', 'notes', 'isActive'];
+      return { filename: `suppliers-${stamp}.csv`, csv: toCsv(headers, flat as never) };
+    }
+
+    case 'supplier-products': {
+      const rows = await prisma.supplierProduct.findMany({
+        include: {
+          supplier: { select: { name: true, deletedAt: true } },
+          product: { select: { name: true, variants: { where: { deletedAt: null }, select: { sku: true }, take: 1 } } },
+        },
+        orderBy: [{ isPreferred: 'desc' }],
+      });
+      const flat = rows
+        .filter((r) => r.supplier.deletedAt === null)
+        .map((r) => ({
+          supplier: r.supplier.name,
+          product: r.product.name,
+          sku: r.product.variants[0]?.sku ?? '',
+          supplierSku: r.supplierSku,
+          costPrice: r.costPrice?.toFixed(2) ?? '',
+          currency: r.currency,
+          leadTimeDays: r.leadTimeDays,
+          minOrderQty: r.minOrderQty?.toString() ?? '',
+          isPreferred: r.isPreferred,
+        }));
+      const headers = ['supplier', 'product', 'sku', 'supplierSku', 'costPrice', 'currency',
+        'leadTimeDays', 'minOrderQty', 'isPreferred'];
+      return { filename: `supplier-products-${stamp}.csv`, csv: toCsv(headers, flat as never) };
+    }
+
+    case 'purchase-orders': {
+      const rows = await prisma.purchaseOrder.findMany({
+        include: {
+          supplier: { select: { name: true } },
+          warehouse: { select: { name: true } },
+          items: { include: { variant: { select: { sku: true, product: { select: { name: true } } } } } },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+      // One row per line, which is both how the importer reads them and how a
+      // spreadsheet is usually wanted for reconciliation.
+      const flat = rows.flatMap((po) =>
+        po.items.map((i) => ({
+          number: po.number,
+          status: po.status,
+          supplier: po.supplier.name,
+          warehouse: po.warehouse.name,
+          product: i.variant.product.name,
+          sku: i.variant.sku,
+          supplierSku: i.supplierSku,
+          quantity: i.quantity.toString(),
+          receivedQty: i.receivedQty.toString(),
+          unitCost: i.unitCost.toFixed(2),
+          taxRate: i.taxRate.toString(),
+          lineTotal: i.total.toFixed(2),
+          currency: po.currency,
+          orderTotal: po.total.toFixed(2),
+          expectedAt: po.expectedAt?.toISOString().slice(0, 10) ?? '',
+          orderedAt: po.orderedAt?.toISOString().slice(0, 10) ?? '',
+          receivedAt: po.receivedAt?.toISOString().slice(0, 10) ?? '',
+          autoGenerated: po.autoGenerated,
+          notes: po.notes,
+        }))
+      );
+      const headers = ['number', 'status', 'supplier', 'warehouse', 'product', 'sku', 'supplierSku',
+        'quantity', 'receivedQty', 'unitCost', 'taxRate', 'lineTotal', 'currency', 'orderTotal',
+        'expectedAt', 'orderedAt', 'receivedAt', 'autoGenerated', 'notes'];
+      return { filename: `purchase-orders-${stamp}.csv`, csv: toCsv(headers, flat as never) };
+    }
+
+    case 'reorder-levels': {
+      const rows = await prisma.stockLevel.findMany({
+        include: {
+          warehouse: { select: { name: true } },
+          variant: { select: { sku: true, product: { select: { name: true } } } },
+        },
+        orderBy: { id: 'asc' },
+      });
+      const flat = rows.map((l) => ({
+        sku: l.variant.sku,
+        product: l.variant.product.name,
+        warehouse: l.warehouse.name,
+        onHand: l.quantity.toString(),
+        reserved: l.reserved.toString(),
+        // Blank rather than "null" so an export can be filled in and re-imported.
+        reorderPoint: l.reorderPoint?.toString() ?? '',
+        reorderQty: l.reorderQty?.toString() ?? '',
+      }));
+      const headers = ['sku', 'product', 'warehouse', 'onHand', 'reserved', 'reorderPoint', 'reorderQty'];
+      return { filename: `reorder-levels-${stamp}.csv`, csv: toCsv(headers, flat as never) };
     }
   }
 }

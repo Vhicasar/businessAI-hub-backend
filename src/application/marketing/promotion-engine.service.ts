@@ -6,7 +6,7 @@ import { emitEvent } from '../../shared/domain-events';
 import { money, ZERO } from '../../shared/money';
 import { logger } from '../../shared/logger';
 import { auditService } from '../audit/audit.service';
-import { consumerPush } from '../notifications/consumer-push.service';
+import { notifyCustomer } from '../notifications/notify';
 
 /**
  * Promotion engine (§6, §7, §8).
@@ -49,6 +49,17 @@ function withinSchedule(promotion: Promotion, now: Date): boolean {
     return start <= end ? minutes >= start && minutes <= end : minutes >= start || minutes <= end;
   }
   return true;
+}
+
+/**
+ * When to tell customers about an offer: right away if it is already running,
+ * otherwise the moment it starts. Null when the merchant opted out — the
+ * notifier only ever picks up rows with a time on them.
+ */
+function announceAt(startsAt: Date, notifyCustomers: boolean): Date | null {
+  if (!notifyCustomers) return null;
+  const now = new Date();
+  return startsAt > now ? startsAt : now;
 }
 
 interface AudienceRule {
@@ -271,7 +282,7 @@ export const promotionEngine = {
       maxRedemptions: (dto.maxRedemptions as number) ?? null,
       maxPerCustomer: (dto.maxPerCustomer as number) ?? 1,
       schedule: (dto.schedule ?? undefined) as Prisma.InputJsonValue | undefined,
-      notifyAt: (dto.notifyAt as Date) ?? null,
+      notifyCustomers: (dto.notifyCustomers as boolean) ?? true,
       imageUrl: (dto.imageUrl as string) ?? null,
       terms: (dto.terms as string) ?? null,
       appliesTo: (dto.appliesTo ?? undefined) as Prisma.InputJsonValue | undefined,
@@ -280,8 +291,19 @@ export const promotionEngine = {
     };
 
     const promotion = dto.id
-      ? await prisma.promotion.update({ where: { id: dto.id }, data })
-      : await prisma.promotion.create({ data });
+      ? await prisma.promotion.update({
+          where: { id: dto.id },
+          data: { ...data, ...(dto.notifyAt === undefined ? {} : { notifyAt: dto.notifyAt as Date }) },
+        })
+      : await prisma.promotion.create({
+          data: {
+            ...data,
+            // Creating an offer is the moment customers should hear about it.
+            // A merchant shouldn't have to find a separate "announce" button;
+            // when they haven't picked a time, the offer's own start is it.
+            notifyAt: ((dto.notifyAt as Date | undefined) ?? announceAt(dto.startsAt, data.notifyCustomers)),
+          },
+        });
 
     await auditService.record({
       action: dto.id ? 'promotion.updated' : 'promotion.created',
@@ -297,6 +319,13 @@ export const promotionEngine = {
         payload: { name: promotion.name, kind: promotion.kind },
         organizationId,
       });
+      // The notifier only sends for ACTIVE promotions, so an offer created live
+      // goes out on the next tick instead of waiting for someone to activate it.
+      if (promotion.status === 'ACTIVE' && promotion.notifyAt) {
+        void this.sendDueNotifications().catch((err) =>
+          logger.warn({ err, promotionId: promotion.id }, 'immediate promotion announcement failed')
+        );
+      }
     }
     return promotion;
   },
@@ -304,6 +333,20 @@ export const promotionEngine = {
   async setStatus(id: string, status: 'SCHEDULED' | 'ACTIVE' | 'PAUSED' | 'ENDED') {
     const updated = await prisma.promotion.updateMany({ where: { id }, data: { status } });
     if (updated.count === 0) throw new NotFoundError('Promotion');
+    // Activating a scheduled offer is the other moment it becomes news. Only
+    // ever *sets* a missing time — never resends one already announced.
+    if (status === 'ACTIVE') {
+      const promotion = await prismaUnscoped.promotion.findUnique({ where: { id } });
+      if (promotion?.notifyCustomers && !promotion.notifyAt && !promotion.notifiedAt) {
+        await prismaUnscoped.promotion.update({
+          where: { id },
+          data: { notifyAt: announceAt(promotion.startsAt, true) },
+        });
+      }
+      void this.sendDueNotifications().catch((err) =>
+        logger.warn({ err, promotionId: id }, 'promotion announcement failed')
+      );
+    }
     return { id, status };
   },
 
@@ -365,6 +408,7 @@ export const promotionEngine = {
     const due = await prismaUnscoped.promotion.findMany({
       where: {
         status: 'ACTIVE',
+        notifyCustomers: true,
         notifyAt: { lte: now },
         notifiedAt: null,
         endsAt: { gte: now },
@@ -405,15 +449,21 @@ export const promotionEngine = {
 
         for (const link of links) {
           if (optedOut.has(link.vhicasarId)) continue;
-          await consumerPush.sendToIdentity(link.vhicasarId, {
+          // A feed row *and* a push: push is best-effort (no token, revoked
+          // device, FCM off in this environment), and an offer the customer
+          // can't find afterwards may as well not have been sent.
+          await notifyCustomer({
+            vhicasarId: link.vhicasarId,
+            organizationId: promotion.organizationId,
+            category: 'PROMOTION',
             title: `${org?.name ?? 'A business'}: ${promotion.name}`,
             body: promotion.description ?? 'Tap to see this offer.',
+            // The app routes straight here — no manual searching (§7).
+            deeplink: `vhicasar://business/${promotion.organizationId}/promotion/${promotion.id}`,
             data: {
               type: 'promotion',
               organizationId: promotion.organizationId,
               promotionId: promotion.id,
-              // The app routes straight here — no manual searching (§7).
-              deeplink: `vhicasar://business/${promotion.organizationId}/promotion/${promotion.id}`,
             },
           });
         }

@@ -183,6 +183,7 @@ export const inventoryService = {
         quantity: true,
         reserved: true,
         reorderPoint: true,
+        reorderQty: true,
         warehouse: { select: { id: true, name: true, code: true } },
         variant: {
           select: {

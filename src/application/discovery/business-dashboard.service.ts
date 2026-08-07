@@ -1,6 +1,7 @@
 import { Prisma } from '@prisma/client';
 import { prismaUnscoped } from '../../infrastructure/database/prisma';
 import { ForbiddenError, NotFoundError } from '../../shared/errors';
+import { promotionEngine } from '../marketing/promotion-engine.service';
 
 /**
  * Per-business dashboard for the Customer Super App (§4, §8).
@@ -44,6 +45,7 @@ export const businessDashboard = {
         isFavourite: true,
         lastAccessedAt: true,
         linkedAt: true,
+        unreadPromotions: true,
       },
     });
     if (links.length === 0) return [];
@@ -107,6 +109,8 @@ export const businessDashboard = {
         points: loyalty?.balance ?? 0,
         tier: loyalty?.tier ?? null,
         activePromotions: promoCount,
+        /// Offers published since this customer last opened the offers list.
+        unreadPromotions: link.unreadPromotions,
         availableCoupons: couponCount,
         walletBalance: wallet ? decimalStr(wallet.balance) : null,
         isPinned: link.isPinned,
@@ -116,6 +120,58 @@ export const businessDashboard = {
         joinedAt: link.linkedAt,
       };
     });
+  },
+
+  /**
+   * Every offer the customer can claim, across every business they belong to.
+   *
+   * The per-business screen only helps someone who already knows which shop to
+   * look in; this is the "what have I got?" view. Claimability is decided by
+   * the promotion engine per business, so nothing appears here that would be
+   * refused at the till.
+   */
+  async allPromotions(vhicasarId: string) {
+    const links = await prismaUnscoped.customerLink.findMany({
+      where: { vhicasarId, status: 'ACTIVE', isHidden: false },
+      select: { organizationId: true, customerId: true },
+    });
+    if (links.length === 0) return { items: [], businesses: 0, total: 0 };
+
+    const orgs = await prismaUnscoped.organization.findMany({
+      where: { id: { in: links.map((l) => l.organizationId) } },
+      select: {
+        id: true,
+        name: true,
+        logoFileId: true,
+        currency: true,
+        businessProfile: { select: { coverImageUrl: true } },
+      },
+    });
+
+    const perBusiness = await Promise.all(
+      links.map(async (link) => {
+        const offers = await promotionEngine.availableFor(link.organizationId, link.customerId);
+        const org = orgs.find((o) => o.id === link.organizationId);
+        return offers.map((o) => ({
+          ...o,
+          organizationId: link.organizationId,
+          businessName: org?.name ?? 'Business',
+          businessLogoFileId: org?.logoFileId ?? null,
+          businessCoverImageUrl: org?.businessProfile?.coverImageUrl ?? null,
+          currency: org?.currency ?? 'NGN',
+          deeplink: `vhicasar://business/${link.organizationId}/promotion/${o.id}`,
+        }));
+      })
+    );
+
+    // Soonest to expire first: the offer about to be lost is the one worth
+    // showing at the top.
+    const items = perBusiness.flat().sort((a, b) => new Date(a.endsAt).getTime() - new Date(b.endsAt).getTime());
+    return {
+      items,
+      businesses: new Set(items.map((i) => i.organizationId)).size,
+      total: items.length,
+    };
   },
 
   /** Full dashboard for one business (§4). */

@@ -7,7 +7,9 @@ import { requestContext } from '../../shared/context';
 import { AppError, ForbiddenError, NotFoundError, ValidationError } from '../../shared/errors';
 import { money, ZERO } from '../../shared/money';
 import { emitEvent } from '../../shared/domain-events';
+import { logger } from '../../shared/logger';
 import { metrics } from '../../shared/metrics';
+import { promotionEngine } from '../marketing/promotion-engine.service';
 import { getActivePaymentProvider } from '../../infrastructure/payments';
 import { auditService } from '../audit/audit.service';
 import { vhicasarIdService } from '../identity/vhicasar-id.service';
@@ -283,8 +285,15 @@ export const vhicasarPayService = {
     };
   },
 
-  /** Consumer scans the QR: read-only view of what they're about to pay. */
-  async describeSession(sessionToken: string) {
+  /**
+   * Consumer scans the QR: read-only view of what they're about to pay,
+   * including the offers they could put against it.
+   *
+   * The benefit shown here is computed by the same code that will apply it at
+   * confirmation, so the figure on the button is the figure that gets taken
+   * off — the app never does discount arithmetic of its own.
+   */
+  async describeSession(sessionToken: string, vhicasarId?: string) {
     const session = await prismaUnscoped.paymentSession.findUnique({ where: { sessionToken } });
     if (!session) throw new NotFoundError('Payment session');
     if (!verifySignature(session)) throw new AppError('SESSION_INVALID', 400, 'Payment session failed integrity check');
@@ -302,15 +311,62 @@ export const vhicasarPayService = {
       where: { id: session.organizationId },
       select: { name: true },
     });
+
+    const promotions =
+      vhicasarId && status === 'CREATED'
+        ? await this.applicablePromotions(session.organizationId, vhicasarId, session.amount)
+        : [];
+
     return {
       sessionToken: session.sessionToken,
       merchant: org?.name ?? 'Merchant',
+      organizationId: session.organizationId,
       amount: session.amount.toFixed(2),
       currency: session.currency,
       description: session.description,
       status,
       expiresAt: session.expiresAt,
+      /** Always an array — the app renders an empty section, never a crash. */
+      promotions,
     };
+  },
+
+  /**
+   * Offers this customer could put against a spend of `amount`, with what each
+   * is worth. Promotions that would give nothing here (min-spend not met, zero
+   * benefit) are left out rather than shown as unusable.
+   */
+  async applicablePromotions(organizationId: string, vhicasarId: string, amount: Prisma.Decimal) {
+    const link = await prismaUnscoped.customerLink.findUnique({
+      where: { vhicasarId_organizationId: { vhicasarId, organizationId } },
+      select: { customerId: true, status: true },
+    });
+    // Not a customer of this business yet — paying is how they become one, but
+    // offers are for members.
+    if (!link || link.status !== 'ACTIVE') return [];
+
+    const available = await promotionEngine.availableFor(organizationId, link.customerId);
+    const rows = await prismaUnscoped.promotion.findMany({
+      where: { id: { in: available.map((p) => p.id) } },
+    });
+
+    return available
+      .map((p) => {
+        const row = rows.find((r) => r.id === p.id);
+        if (!row) return null;
+        if (row.minSpend && amount.lessThan(row.minSpend)) return null;
+        const benefit = promotionEngine.calculateBenefit(row, amount);
+        if (!benefit.greaterThan(ZERO)) return null;
+        const isCashback = row.kind === 'CASHBACK';
+        return {
+          ...p,
+          benefit: benefit.toFixed(2),
+          // Cashback comes back after paying; a discount comes off up front.
+          appliesAs: isCashback ? ('CASHBACK' as const) : ('DISCOUNT' as const),
+          payableAmount: isCashback ? amount.toFixed(2) : amount.sub(benefit).toFixed(2),
+        };
+      })
+      .filter((p): p is NonNullable<typeof p> => p !== null);
   },
 
   /** Consumer confirms with PIN — the actual money movement. */
@@ -413,12 +469,62 @@ export const vhicasarPayService = {
     const customerWallet = await walletLedger.getOrCreateUserWallet(vhicasarId, currency);
     const merchantWallet = await walletLedger.getOrCreateOrgWallet(session.organizationId, 'MERCHANT', currency);
 
+    /**
+     * Apply the chosen offer before any money moves.
+     *
+     * The claim is made against the promotion engine, which enforces limits,
+     * budget and per-customer caps under its own guard — the app only ever
+     * names a promotion, it never states what it is worth. A promotion that
+     * has just run out fails here, before the debit, so the customer is told
+     * rather than charged the discounted price out of a closed campaign.
+     */
+    let redemption: Awaited<ReturnType<typeof promotionEngine.redeem>> | null = null;
+    let discount = ZERO;
+    let cashback = ZERO;
+    if (dto.promotionId) {
+      const link = await prismaUnscoped.customerLink.findUnique({
+        where: { vhicasarId_organizationId: { vhicasarId, organizationId: session.organizationId } },
+        select: { customerId: true, status: true },
+      });
+      if (!link || link.status !== 'ACTIVE') {
+        throw new AppError('NOT_A_CUSTOMER', 409, 'Join this business to use its offers.');
+      }
+      const promotion = await prismaUnscoped.promotion.findFirst({
+        where: { id: dto.promotionId, organizationId: session.organizationId },
+        select: { kind: true },
+      });
+      if (!promotion) throw new NotFoundError('Promotion');
+
+      try {
+        redemption = await promotionEngine.redeem({
+          organizationId: session.organizationId,
+          promotionId: dto.promotionId,
+          customerId: link.customerId,
+          vhicasarId,
+          spendAmount: amount,
+          currency,
+        });
+      } catch (e) {
+        await prismaUnscoped.paymentAttempt.update({
+          where: { id: attempt.id },
+          data: { status: 'FAILED', failureReason: e instanceof AppError ? e.code : 'PROMOTION_FAILED' },
+        });
+        throw e;
+      }
+      if (promotion.kind === 'CASHBACK') cashback = money(redemption.benefit);
+      else discount = money(redemption.benefit);
+    }
+
+    // What actually leaves the customer's wallet. Cashback is paid back after,
+    // so it does not reduce the charge.
+    const charged = amount.sub(discount);
+
     let txnId: string;
     try {
       const txn = await walletLedger.post({
         type: 'PAYMENT',
         currency,
-        amount,
+        amount: charged,
         organizationId: session.organizationId,
         initiatorVhicasarId: vhicasarId,
         description: session.description ?? 'Vhicasar Pay payment',
@@ -426,8 +532,8 @@ export const vhicasarPayService = {
         idempotencyKey: `pay:${session.id}`, // one payment per session, ever
         paymentSessionId: session.id,
         legs: [
-          { walletId: customerWallet.id, direction: 'DEBIT', amount },
-          { walletId: merchantWallet.id, direction: 'CREDIT', amount },
+          { walletId: customerWallet.id, direction: 'DEBIT', amount: charged },
+          { walletId: merchantWallet.id, direction: 'CREDIT', amount: charged },
         ],
       });
       txnId = txn.id;
@@ -439,20 +545,60 @@ export const vhicasarPayService = {
       throw e;
     }
 
-    // Record a Payment row for the merchant's books.
+    // Record a Payment row for the merchant's books — for what was actually
+    // taken, not the pre-discount ask.
     const payment = await prismaUnscoped.payment.create({
       data: {
         organizationId: session.organizationId,
         method: 'WALLET',
         status: 'PAID',
-        amount,
+        amount: charged,
         currency,
         provider: 'vhicasar_pay',
         providerRef: txnId,
         paidAt: new Date(),
-        metadata: { paymentSessionId: session.id, vhicasarId },
+        metadata: {
+          paymentSessionId: session.id,
+          vhicasarId,
+          ...(redemption
+            ? { promotionId: redemption.promotionId, promotionBenefit: redemption.benefit, promotionKind: redemption.kind }
+            : {}),
+        },
       },
     });
+
+    if (redemption) {
+      await prismaUnscoped.promotionRedemption.update({
+        where: { id: redemption.redemptionId },
+        data: { paymentId: payment.id },
+      });
+    }
+
+    // Cashback is a second, merchant-funded posting: the customer paid in full
+    // and gets money back into their cashback bucket, where it is visibly
+    // distinct from what they topped up themselves.
+    if (cashback.greaterThan(ZERO)) {
+      try {
+        await walletLedger.post({
+          type: 'ADJUSTMENT',
+          currency,
+          amount: cashback,
+          organizationId: session.organizationId,
+          initiatorVhicasarId: vhicasarId,
+          description: `Cashback — ${session.description ?? 'Vhicasar Pay payment'}`,
+          idempotencyKey: `cashback:${session.id}`,
+          paymentSessionId: session.id,
+          legs: [
+            { walletId: merchantWallet.id, direction: 'DEBIT', amount: cashback },
+            { walletId: customerWallet.id, direction: 'CREDIT', amount: cashback, bucket: 'CASHBACK' },
+          ],
+        });
+      } catch (err) {
+        // The payment itself succeeded; a failed cashback posting must not undo
+        // it. Log loudly — this is money owed to the customer.
+        logger.error({ err, sessionId: session.id }, 'cashback posting failed after payment');
+      }
+    }
 
     // Immutable transition: only a still-CREATED session can complete.
     const done = await prismaUnscoped.paymentSession.updateMany({
@@ -460,6 +606,8 @@ export const vhicasarPayService = {
       data: {
         status: 'COMPLETED',
         customerVhicasarId: vhicasarId,
+        promotionId: redemption?.promotionId ?? null,
+        discountAmount: discount.greaterThan(ZERO) ? discount : null,
         deviceId: dto.deviceId ?? null,
         paymentId: payment.id,
         walletTransactionId: txnId,
@@ -492,7 +640,12 @@ export const vhicasarPayService = {
       action: 'vhicasar_pay.payment_completed',
       entityType: 'PaymentSession',
       entityId: session.id,
-      after: { amount: amount.toFixed(2), currency, paymentId: payment.id },
+      after: {
+        amount: charged.toFixed(2),
+        currency,
+        paymentId: payment.id,
+        ...(redemption ? { promotionId: redemption.promotionId, benefit: redemption.benefit } : {}),
+      },
     });
     await emitEvent({
       name: 'PaymentCompleted',
@@ -500,7 +653,7 @@ export const vhicasarPayService = {
       aggregateId: session.id,
       payload: {
         paymentId: payment.id,
-        amount: amount.toFixed(2),
+        amount: charged.toFixed(2),
         currency,
         vhicasarId,
         organizationId: session.organizationId,
@@ -512,7 +665,13 @@ export const vhicasarPayService = {
     return {
       paymentId: payment.id,
       transactionId: txnId,
-      amount: amount.toFixed(2),
+      /** What was actually charged, after any discount. */
+      amount: charged.toFixed(2),
+      /** What the merchant originally asked for, so a receipt can show both. */
+      originalAmount: amount.toFixed(2),
+      discount: discount.greaterThan(ZERO) ? discount.toFixed(2) : null,
+      cashback: cashback.greaterThan(ZERO) ? cashback.toFixed(2) : null,
+      promotionId: redemption?.promotionId ?? null,
       currency,
       status: 'COMPLETED' as const,
       wallet: walletView(fresh),
@@ -674,6 +833,16 @@ export const vhicasarPayService = {
     if (link.status === 'CANCELLED') throw new AppError('LINK_CANCELLED', 409, 'This payment link was cancelled.');
     if (link.expiresAt && link.expiresAt.getTime() < Date.now()) {
       throw new AppError('LINK_EXPIRED', 409, 'This payment link has expired.');
+    }
+    // Enforced at payment time as well as at issue time: a printed code can be
+    // scanned long after it was made, and a business suspended in between must
+    // not be able to keep taking money.
+    const payee = await prismaUnscoped.organization.findUnique({
+      where: { id: link.organizationId },
+      select: { status: true, deletedAt: true },
+    });
+    if (!payee || payee.deletedAt || (payee.status !== 'ACTIVE' && payee.status !== 'TRIAL')) {
+      throw new AppError('MERCHANT_UNAVAILABLE', 409, 'This business cannot currently take payments.');
     }
 
     const outstanding = money(link.amount).minus(link.amountPaid);

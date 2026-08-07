@@ -21,6 +21,11 @@ const PERMS: Record<Entity, { read: string[]; write: string[] }> = {
   employees: { read: ['employees.read'], write: ['employees.create'] },
   products: { read: ['catalog.read'], write: ['catalog.create'] },
   'kb-articles': { read: ['support.read'], write: ['support.update'] },
+  suppliers: { read: ['suppliers.read'], write: ['suppliers.create'] },
+  'supplier-products': { read: ['suppliers.read'], write: ['suppliers.manage_products'] },
+  'purchase-orders': { read: ['purchasing.read'], write: ['purchasing.create'] },
+  // Reorder levels live on stock, so they follow the inventory permission.
+  'reorder-levels': { read: ['inventory.read'], write: ['inventory.set_reorder_levels'] },
 };
 
 const analyzeBody = z.object({ csv: z.string().min(1).max(20_000_000) });

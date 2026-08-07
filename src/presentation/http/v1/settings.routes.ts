@@ -14,6 +14,7 @@ import {
   orgPaymentAccountService,
 } from '../../../application/payments/org-account.service';
 import { getWorkspaceConfig } from '../../../application/settings/workspace-config';
+import { addressBook } from '../../../application/settings/address-book.service';
 
 /** Attach an already-uploaded file as the logo, or null to remove it. */
 const logoSchema = z.object({ fileId: z.string().min(1).nullable() });
@@ -126,5 +127,22 @@ settingsRoutes.delete(
   requirePermission('settings.manage_org'),
   wrap(async (_req, res) => {
     res.json({ success: true, data: await orgPaymentAccountService.remove() });
+  })
+);
+
+/**
+ * Places this business already uses — cities, states and countries drawn from
+ * its own customers, suppliers, warehouses and branches.
+ *
+ * Address autofill without an external geocoder. A business enters the same
+ * handful of cities over and over, so its own records are both the most
+ * accurate source and the one that needs no third-party key, no per-lookup
+ * cost, and no customer address leaving the platform to be completed.
+ */
+settingsRoutes.get(
+  '/address-book',
+  requirePermission('customers.read', 'suppliers.read', 'inventory.read'),
+  wrap(async (_req, res) => {
+    res.json({ success: true, data: await addressBook() });
   })
 );

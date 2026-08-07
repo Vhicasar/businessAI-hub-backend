@@ -39,6 +39,9 @@ const promotionSchema = z.object({
     scope: z.enum(['ALL', 'CATEGORIES', 'PRODUCTS', 'SERVICES']).default('ALL'),
     ids: z.array(z.string()).default([]),
   }).optional(),
+  /** Off suppresses the customer announcement entirely. */
+  notifyCustomers: z.boolean().default(true),
+  /** Omit to announce as soon as the offer starts. */
   notifyAt: z.coerce.date().optional(),
   imageUrl: z.string().trim().max(500).optional(),
   terms: z.string().trim().max(4000).optional(),
@@ -52,7 +55,7 @@ promotionsRoutes.use(authenticate, requireTenant);
 
 promotionsRoutes.get(
   '/',
-  requirePermission('marketing.read'),
+  requirePermission('promotions.read', 'marketing.read'),
   wrap(async (req, res) => {
     res.json({ success: true, data: await promotionEngine.list(req.auth!.organizationId as string) });
   })
@@ -60,7 +63,7 @@ promotionsRoutes.get(
 
 promotionsRoutes.put(
   '/',
-  requirePermission('marketing.update'),
+  requirePermission('promotions.update', 'marketing.update'),
   validate({ body: promotionSchema }),
   wrap(async (req, res) => {
     const data = await promotionEngine.upsert(req.auth!.organizationId as string, req.body);
@@ -70,7 +73,7 @@ promotionsRoutes.put(
 
 promotionsRoutes.post(
   '/:id/status',
-  requirePermission('marketing.update'),
+  requirePermission('promotions.update', 'marketing.update'),
   validate({ body: z.object({ status: z.enum(['SCHEDULED', 'ACTIVE', 'PAUSED', 'ENDED']) }) }),
   wrap(async (req, res) => {
     res.json({ success: true, data: await promotionEngine.setStatus(req.params.id as string, req.body.status) });
@@ -80,7 +83,7 @@ promotionsRoutes.post(
 /** Campaign performance for the business (§14). */
 promotionsRoutes.get(
   '/analytics',
-  requirePermission('marketing.read', 'analytics.view'),
+  requirePermission('promotions.read', 'analytics.view'),
   validate({ query: z.object({ promotionId: z.string().trim().optional() }) }),
   wrap(async (req, res) => {
     const data = await promotionEngine.analytics(

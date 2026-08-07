@@ -42,6 +42,11 @@ export type TransferDto = z.infer<typeof transferSchema>;
 
 export const confirmPaymentSchema = z.object({
   sessionToken: z.string().trim().min(10).max(200),
+  /**
+   * Offer to put against this payment. Only the id travels — the server works
+   * out what it is worth, so the client can't talk itself into a discount.
+   */
+  promotionId: z.string().trim().max(60).optional(),
   ...authFields,
   /** Server-issued single-use challenge (see POST /payments/nonce). */
   nonce: z.string().trim().max(200).optional(),
