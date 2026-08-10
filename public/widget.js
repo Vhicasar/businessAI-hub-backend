@@ -100,7 +100,6 @@
       'white-space:pre-wrap;word-break:break-word}' +
       '.bhw-m.in{background:var(--bhw);color:var(--bhw-on);align-self:flex-end;border-bottom-right-radius:5px}' +
       '.bhw-m.out{background:#fff;color:#1f2937;align-self:flex-start;border:1px solid #e5e7eb;border-bottom-left-radius:5px}' +
-      '.bhw-ai{display:block;font-size:10px;font-weight:700;letter-spacing:.04em;opacity:.65;margin-bottom:3px}' +
       '.bhw-form{display:flex;align-items:center;border-top:1px solid #e5e7eb;background:#fff;padding:6px 6px 6px 4px}' +
       '.bhw-input{flex:1;border:none;outline:none;padding:12px;font-size:14px;background:transparent;color:#1f2937}' +
       '.bhw-send{border:none;background:var(--bhw);color:var(--bhw-on);cursor:pointer;width:40px;height:40px;' +
@@ -306,12 +305,6 @@
       // INBOUND = visitor's own message (they are the "customer" side)
       el.className = 'bhw-m ' + (m.direction === 'INBOUND' ? 'in' : 'out');
       el.textContent = m.body || '';
-      if (m.aiGenerated) {
-        var ai = document.createElement('span');
-        ai.className = 'bhw-ai';
-        ai.textContent = '✦ AI generated';
-        el.prepend(ai);
-      }
       msgsEl.appendChild(el);
       lastSeen = m.createdAt;
       if (!open && m.direction !== 'INBOUND') setUnread(unread + 1);
