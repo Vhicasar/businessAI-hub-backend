@@ -109,7 +109,7 @@ export const customersService = {
 
   async get(id: string) {
     const customer = await prisma.customer.findFirst({
-      where: { id, deletedAt: null, isProvisional: false },
+      where: { id, deletedAt: null },
       select: detailSelect,
     });
     if (!customer) throw new NotFoundError('Customer');
@@ -118,7 +118,7 @@ export const customersService = {
 
   /** Customer 360: related deals, orders, invoices and open tasks + roll-ups. */
   async overview(id: string) {
-    const exists = await prisma.customer.findFirst({ where: { id, deletedAt: null, isProvisional: false }, select: { id: true } });
+    const exists = await prisma.customer.findFirst({ where: { id, deletedAt: null }, select: { id: true } });
     if (!exists) throw new NotFoundError('Customer');
 
     const [deals, orders, invoices, tasks] = await Promise.all([

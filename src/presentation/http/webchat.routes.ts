@@ -141,6 +141,7 @@ webchatRoutes.post(
 const messageSchema = z.object({
   visitorId: z.string().min(10).max(64),
   text: z.string().trim().min(1).max(2000),
+  clientMessageId: z.string().trim().regex(/^[a-zA-Z0-9_-]{8,80}$/).optional(),
 });
 
 webchatRoutes.post(
@@ -158,7 +159,9 @@ webchatRoutes.post(
         inboxService.processInbound(
           { id: account.id, organizationId: account.organizationId, channelType: 'WEB_CHAT' },
           {
-            providerMessageId: `wc_${randomUUID()}`,
+            providerMessageId: req.body.clientMessageId
+              ? `wc_client_${req.body.clientMessageId}`
+              : `wc_${randomUUID()}`,
             senderExternalId: req.body.visitorId,
             contentType: 'TEXT',
             text: req.body.text,
@@ -206,7 +209,7 @@ webchatRoutes.get(
       },
       orderBy: { createdAt: 'asc' },
       take: 100,
-      select: { id: true, direction: true, body: true, createdAt: true },
+      select: { id: true, direction: true, body: true, aiGenerated: true, createdAt: true },
     });
     res.json({ success: true, data: { messages } });
   })

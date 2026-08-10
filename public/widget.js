@@ -39,6 +39,8 @@
   var pollTimer = null;
   var unread = 0;
   var greeted = false;
+  var pollInFlight = false;
+  var renderedMessageIds = Object.create(null);
 
   // ---------- helpers ----------
   // Readable text colour (black/white) for a given background, per WCAG luma.
@@ -98,6 +100,7 @@
       'white-space:pre-wrap;word-break:break-word}' +
       '.bhw-m.in{background:var(--bhw);color:var(--bhw-on);align-self:flex-end;border-bottom-right-radius:5px}' +
       '.bhw-m.out{background:#fff;color:#1f2937;align-self:flex-start;border:1px solid #e5e7eb;border-bottom-left-radius:5px}' +
+      '.bhw-ai{display:block;font-size:10px;font-weight:700;letter-spacing:.04em;opacity:.65;margin-bottom:3px}' +
       '.bhw-form{display:flex;align-items:center;border-top:1px solid #e5e7eb;background:#fff;padding:6px 6px 6px 4px}' +
       '.bhw-input{flex:1;border:none;outline:none;padding:12px;font-size:14px;background:transparent;color:#1f2937}' +
       '.bhw-send{border:none;background:var(--bhw);color:var(--bhw-on);cursor:pointer;width:40px;height:40px;' +
@@ -297,10 +300,18 @@
 
   function render(messages) {
     messages.forEach(function (m) {
+      if (m.id && renderedMessageIds[m.id]) return;
+      if (m.id) renderedMessageIds[m.id] = true;
       var el = document.createElement('div');
       // INBOUND = visitor's own message (they are the "customer" side)
       el.className = 'bhw-m ' + (m.direction === 'INBOUND' ? 'in' : 'out');
       el.textContent = m.body || '';
+      if (m.aiGenerated) {
+        var ai = document.createElement('span');
+        ai.className = 'bhw-ai';
+        ai.textContent = '✦ AI generated';
+        el.prepend(ai);
+      }
       msgsEl.appendChild(el);
       lastSeen = m.createdAt;
       if (!open && m.direction !== 'INBOUND') setUnread(unread + 1);
@@ -338,12 +349,13 @@
   }
 
   function poll() {
-    if (!visitorId) return;
+    if (!visitorId || pollInFlight) return;
+    pollInFlight = true;
     var q = '?visitorId=' + encodeURIComponent(visitorId) +
       (lastSeen ? '&after=' + encodeURIComponent(lastSeen) : '');
     api('/messages' + q, {}).then(function (json) {
       if (json && json.success) render(json.data.messages);
-    }).catch(function () { /* transient */ });
+    }).catch(function () { /* transient */ }).finally(function () { pollInFlight = false; });
   }
 
   function onSubmit(e) {
@@ -352,10 +364,11 @@
     if (!text) return;
     inputEl.value = '';
     sendEl.disabled = true;
+    var clientMessageId = 'm_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 12);
     ensureSession().then(function () {
       api('/messages', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ visitorId: visitorId, text: text }),
+        body: JSON.stringify({ visitorId: visitorId, text: text, clientMessageId: clientMessageId }),
       }).then(poll);
     });
   }

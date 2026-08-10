@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { ChannelType } from '@prisma/client';
+import { Prisma, type ChannelType } from '@prisma/client';
 import { ConflictError, NotFoundError } from '../../shared/errors';
 import { prisma } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
@@ -59,6 +59,20 @@ function toAccountRef(account: {
       : {},
     webhookSecret: account.webhookSecret,
   };
+}
+
+/** Capture an explicitly stated visitor name without depending on an AI reply. */
+function statedName(text: string | null | undefined): string | null {
+  if (!text) return null;
+  const match = text.match(/\b(?:my name is|i am|i'm)\s+([\p{L}][\p{L}'-]{1,49})(?:\s+([\p{L}][\p{L}'-]{1,49}))?/iu);
+  if (!match?.[1]) return null;
+  const first = match[1];
+  const notNames = new Set([
+    'interested', 'looking', 'trying', 'writing', 'contacting', 'ready', 'happy',
+    'sorry', 'here', 'calling', 'asking', 'reaching',
+  ]);
+  if (notNames.has(first.toLowerCase())) return null;
+  return [first, match[2]].filter(Boolean).join(' ');
 }
 
 export const inboxService = {
@@ -155,19 +169,51 @@ export const inboxService = {
     });
     if (existing) return;
 
-    const message = await prisma.message.create({
-      data: {
-        organizationId: account.organizationId,
-        conversationId: conversation.id,
-        direction: 'INBOUND',
-        authorType: 'CUSTOMER',
-        contentType: inbound.contentType,
-        body: inbound.text ?? null,
-        status: 'DELIVERED',
-        providerMessageId: inbound.providerMessageId,
-        sentAt: inbound.sentAt ?? new Date(),
-      },
-    });
+    let message;
+    try {
+      message = await prisma.message.create({
+        data: {
+          organizationId: account.organizationId,
+          conversationId: conversation.id,
+          direction: 'INBOUND',
+          authorType: 'CUSTOMER',
+          contentType: inbound.contentType,
+          body: inbound.text ?? null,
+          status: 'DELIVERED',
+          providerMessageId: inbound.providerMessageId,
+          sentAt: inbound.sentAt ?? new Date(),
+        },
+      });
+    } catch (error) {
+      // Two identical webhook/widget retries may race past the read above. The
+      // database uniqueness constraint is the final idempotency boundary.
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return;
+      throw error;
+    }
+
+    // Persist names such as “I am Victor” before AI handoff/auto-reply runs.
+    const placeholderName = /^(website|visitor|guest|anonymous|unknown|customer)$/i.test(
+      identity.customer.firstName.trim(),
+    );
+    const sharedName = account.channelType === 'WEB_CHAT' && (identity.customer.isProvisional || placeholderName)
+      ? statedName(inbound.text)
+      : null;
+    if (sharedName) {
+      const [firstName, ...lastName] = sharedName.split(/\s+/);
+      await prisma.customer.update({
+        where: { id: identity.customerId },
+        data: {
+          firstName: firstName!,
+          lastName: lastName.join(' ') || null,
+          displayName: sharedName,
+          isProvisional: false,
+        },
+      });
+      identity.customer.firstName = firstName!;
+      identity.customer.lastName = lastName.join(' ') || null;
+      identity.customer.displayName = sharedName;
+      identity.customer.isProvisional = false;
+    }
 
     await prisma.$transaction([
       prisma.conversation.update({
@@ -221,8 +267,7 @@ export const inboxService = {
           },
         },
         { assigneeMembershipId: conversation.assignedToId },
-      ).catch((err) => { console.log("Message sending error"); logger.warn({ err, conversationId: conversation.id }, 'Inbound notification failed') });
-      console.log("Message sent");
+      ).catch((err) => logger.warn({ err, conversationId: conversation.id }, 'Inbound notification failed'));
     }
 
     // Async sentiment (no-op when AI is disabled; never blocks the webhook).

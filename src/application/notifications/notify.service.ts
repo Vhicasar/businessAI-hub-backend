@@ -270,7 +270,7 @@ export const notifyService = {
       });
       const assigneeId = opts.assigneeMembershipId ?? null;
       const unassignedRoles = new Set(['manager', 'sales', 'customer support', 'marketing']);
-    const userIds = memberships
+      let userIds = memberships
         .filter((membership) => {
           const role = membership.role.name.trim().toLowerCase();
           if (assigneeId) {
@@ -278,15 +278,16 @@ export const notifyService = {
           }
           return membership.isOwner || role === 'owner' || unassignedRoles.has(role);
         })
-      .map((membership) => membership.userId);
-    logger.info(
-      { orgId, assigned: Boolean(assigneeId), recipients: new Set(userIds).size },
-      'Chat push recipients resolved',
-    );
-    await this.pushToUsers([...new Set(userIds)], input);
-      console.log("Message sent 1");
+        .map((membership) => membership.userId);
+      if (userIds.length === 0) userIds = memberships.map((membership) => membership.userId);
+      logger.info(
+        { orgId, assigned: Boolean(assigneeId), recipients: new Set(userIds).size },
+        'Chat push recipients resolved',
+      );
+      await this.pushToUsers([...new Set(userIds)], input);
     } catch (error) {
-      console.log("Message sending error 1");
+      logger.error({ err: error, orgId, type: input.type }, 'Chat push delivery failed');
+      throw error;
     }
   },
 };
