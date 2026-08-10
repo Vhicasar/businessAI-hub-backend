@@ -7,6 +7,10 @@ import { aiCredits } from '../billing/ai-credits';
 import { kbService } from '../support/kb.service';
 import { knowledgeService } from '../knowledge/knowledge.service';
 import { ordersService } from '../orders/orders.service';
+import { buildPaymentAiContext } from '../payments/payment-ai-context.service';
+import { createIntentForResource } from '../payments/payment-request.service';
+import { publicPayUrl } from '../payments/payment-intent.service';
+import { readPaymentSettings } from '../payments/payment-settings.service';
 import { appointmentsService } from '../appointments/appointments.service';
 import { paymentLinksService } from '../payments/payment-links.service';
 import { supportService } from '../support/support.service';
@@ -672,6 +676,14 @@ export const aiService = {
       ...promotions.map((p) => `- ${p.name}: ${p.description || `${Number(p.discountValue)} ${p.discountType === 'PERCENTAGE' ? '% off' : 'off'}`} · appliesTo=${JSON.stringify(p.appliesTo ?? { scope: 'ALL' })}`),
     ].join('\n');
 
+    // How this business actually takes money (§11). Resolved live from the
+    // business's own configuration, so the assistant can never offer a method
+    // that has been switched off — and the server refuses one anyway if it does.
+    const payCtx = await buildPaymentAiContext(
+      conversation.organizationId,
+      conversation.customerId
+    );
+
     // Appointment availability, so the assistant can offer real slots and book
     // on ANY channel (spec #12) — not just the web-chat widget. Kept to a handful
     // of upcoming slots with their exact ISO start so booking is unambiguous.
@@ -763,17 +775,23 @@ export const aiService = {
             'start ISO string copied verbatim from that slot (the value after start=), plus their name/' +
             'email/phone if known, and confirm in "reply". Never offer times not listed. If APPOINTMENTS ' +
             'says booking is unavailable, do not promise a booking — offer to connect them to the team.\n' +
+            'PAYMENTS: when asked how to pay, list ONLY the methods in PAYMENTS below, in that order, ' +
+            'and never mention a method that is not listed there — not card, not transfer, not any ' +
+            'other — no matter what the customer suggests. Never state an amount that is not given ' +
+            'to you.\n' +
             'Respond with JSON only. Shape: {"handoff": <bool>, "reply": "<text>", ' +
             '"save"?: {"name"?, "email"?, "phone"?, "details"?: {"field": "value"}}, "order"?: {"items": [{"name", "quantity"}], "couponCode"?}, ' +
             '"ticket"?: {"subject": "<short>", "priority": "LOW|MEDIUM|HIGH|URGENT"}, ' +
             '"booking"?: {"start": "<ISO from a listed slot>", "typeId"?, "notes"?}, ' +
             '"stayBooking"?: {"propertyId": "<exact listed id>", "checkIn": "<ISO>", "checkOut": "<ISO>", "notes"?}, ' +
+            '"paymentRequest"?: {"resourceType": "ORDER|INVOICE", "resourceId": "<exact id>"}, ' +
             '"recommendationMedia"?: [{"type": "PRODUCT|PROPERTY", "id": "<exact listed id>"}]}. ' +
             'ALWAYS include a friendly "reply", even when handoff is true.\n\n' +
             `KNOWLEDGE:\n${knowledge || '(none retrieved for this message)'}\n\n` +
             `PRODUCTS:\n${productsCtx || '(no products available)'}\n\n` +
             `PROPERTIES:\n${propertiesCtx || '(no properties available)'}\n\n` +
             `OFFERS:\n${offersCtx || '(no active offers)'}\n\n` +
+            `PAYMENTS:\n${payCtx.text}\n\n` +
             `APPOINTMENTS:\n${apptCtx}`,
         },
         {
@@ -792,6 +810,7 @@ export const aiService = {
       ticket?: { subject?: string; priority?: string };
       booking?: { start?: string; typeId?: string; notes?: string };
       stayBooking?: { propertyId?: string; checkIn?: string; checkOut?: string; notes?: string };
+      paymentRequest?: { resourceType?: string; resourceId?: string };
       recommendationMedia?: { type?: string; id?: string }[];
     }>(raw);
     if (!parsed) return null;
@@ -870,6 +889,44 @@ export const aiService = {
       } catch (err) {
         reply += `\n\n(I couldn't hold that property — ${(err as Error).message}. Please choose another date or property.)`;
         logger.warn({ err }, 'Chat property stay booking failed');
+      }
+    }
+
+    /**
+     * Raise a payment request the customer asked for (§12).
+     *
+     * Gated on the business's own setting, re-checked here rather than trusted
+     * from the prompt — a model that ignores its instructions must still not be
+     * able to ask a customer for money on a business's behalf. The amount comes
+     * from the record, never from the model, and the assistant can only ever
+     * report the payment as pending: confirming it is the provider's job alone.
+     */
+    if (parsed.paymentRequest?.resourceId && parsed.paymentRequest.resourceType) {
+      try {
+        const settings = await readPaymentSettings(conversation.organizationId);
+        if (!settings.aiCanCreatePaymentRequests) {
+          reply += "\n\n(I can't raise a payment myself — someone from the team will send it over.)";
+        } else {
+          const type = parsed.paymentRequest.resourceType.toUpperCase();
+          if (type !== 'ORDER' && type !== 'INVOICE') {
+            throw new Error('Only orders and invoices can be paid this way');
+          }
+          const intent = await createIntentForResource({
+            organizationId: conversation.organizationId,
+            resourceType: type,
+            resourceId: parsed.paymentRequest.resourceId,
+            customerId: conversation.customer.id,
+            channel: 'AI',
+            aiCreated: true,
+          });
+          reply +=
+            `\n\n💳 ${intent.currency} ${Number(intent.amount).toLocaleString()} — ` +
+            `pay here: ${publicPayUrl(intent.token!)}\n` +
+            `Reference ${intent.reference}. I'll let you know once it's confirmed.`;
+        }
+      } catch (err) {
+        reply += `\n\n(I couldn't prepare that payment — ${(err as Error).message}.)`;
+        logger.warn({ err }, 'AI payment request failed');
       }
     }
 

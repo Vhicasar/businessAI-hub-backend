@@ -34,7 +34,16 @@ export const createCampaignSchema = z.object({
   imageUrl: z.string().url().max(2000).nullable().optional(),
   templateName: z.string().trim().max(512).nullable().optional(),
   templateLanguage: z.string().trim().max(20).default('en_US'),
-  audience: z.enum(['ALL_OPTED_IN']).default('ALL_OPTED_IN'),
+  audience: z.enum(['ALL_OPTED_IN', 'SELECTED']).default('ALL_OPTED_IN'),
+  recipientIds: z.array(z.string().cuid()).max(MAX_RECIPIENTS).default([]),
+}).superRefine((value, ctx) => {
+  if (value.audience === 'SELECTED' && value.recipientIds.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['recipientIds'],
+      message: 'Select at least one contact',
+    });
+  }
 });
 export const updateCampaignSchema = z.object({
   name: z.string().trim().min(1).max(160).optional(),
@@ -80,6 +89,7 @@ export const campaignService = {
         content: {
           body: dto.body,
           audience: dto.audience,
+          recipientIds: dto.audience === 'SELECTED' ? [...new Set(dto.recipientIds)] : [],
           imageUrl: dto.imageUrl ?? null,
           templateName: dto.templateName ?? null,
           templateLanguage: dto.templateLanguage,
@@ -137,18 +147,26 @@ export const campaignService = {
     };
   },
 
-  async reachableCustomers(channel: ChannelType) {
+  async reachableCustomers(channel: ChannelType, recipientIds?: string[]) {
     // Marketing consent is mandatory — never message customers who opted out.
     const base = { deletedAt: null, isProvisional: false, isBlocked: false, marketingOptIn: true };
     if (channel === 'EMAIL') {
       return prisma.customer.findMany({
-        where: { ...base, email: { not: null } },
+        where: {
+          ...base,
+          email: { not: null },
+          ...(recipientIds ? { id: { in: recipientIds } } : {}),
+        },
         select: { id: true, firstName: true },
         take: MAX_RECIPIENTS,
       });
     }
     return prisma.customer.findMany({
-      where: { ...base, identities: { some: { channelType: channel } } },
+      where: {
+        ...base,
+        identities: { some: { channelType: channel } },
+        ...(recipientIds ? { id: { in: recipientIds } } : {}),
+      },
       select: { id: true, firstName: true },
       take: MAX_RECIPIENTS,
     });
@@ -166,8 +184,10 @@ export const campaignService = {
       throw new ConflictError('Campaign has already been sent');
     }
     const channel = channelFor(campaign.type);
+    const content = (campaign.content as { audience?: string; recipientIds?: string[] }) ?? {};
+    const selectedIds = content.audience === 'SELECTED' ? content.recipientIds ?? [] : undefined;
     const [customers, ent, account] = await Promise.all([
-      this.reachableCustomers(channel),
+      this.reachableCustomers(channel, selectedIds),
       resolveEntitlements(orgId()),
       prisma.channelAccount.findFirst({
         where: { channelType: channel, isActive: true, deletedAt: null },
@@ -232,11 +252,14 @@ export const campaignService = {
       imageUrl?: string;
       templateName?: string;
       templateLanguage?: string;
+      audience?: string;
+      recipientIds?: string[];
     }) ?? {};
     const body = content.body ?? '';
     const imageUrl = content.imageUrl ?? '';
 
-    const customers = await this.reachableCustomers(channel);
+    const selectedIds = content.audience === 'SELECTED' ? content.recipientIds ?? [] : undefined;
+    const customers = await this.reachableCustomers(channel, selectedIds);
     let sent = 0;
     let failed = 0;
     for (const c of customers) {

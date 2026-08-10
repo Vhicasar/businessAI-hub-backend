@@ -5,7 +5,7 @@
  * call time via `getActivePaymentProvider()`.
  */
 
-export type PaymentProviderName = 'paystack' | 'flutterwave' | 'stripe';
+export type PaymentProviderName = 'paystack' | 'flutterwave' | 'stripe' | 'opay' | 'moniepoint';
 
 export interface InitializeTxnInput {
   email: string;

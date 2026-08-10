@@ -15,6 +15,8 @@ export interface PaymentConfigOverride {
   secretKey: string | null;
   webhookSecret: string | null;
   publicKey: string | null;
+  /** See ResolvedPaymentConfig.merchantId. */
+  merchantId?: string | null;
   chargeCurrencies: string[];
   callbackUrl: string | null;
 }
@@ -24,6 +26,17 @@ export interface ResolvedPaymentConfig {
   secretKey: string;
   webhookSecret: string;
   publicKey: string;
+  /**
+   * A third account identifier some gateways need alongside the key pair,
+   * because the keys alone do not say which account to credit:
+   *
+   *   - OPay      → Merchant ID, sent in the `MerchantId` header
+   *   - Moniepoint → Monnify Contract Code, sent in the request body
+   *
+   * Empty for gateways that identify the merchant from the secret key alone
+   * (Paystack, Flutterwave, Stripe).
+   */
+  merchantId: string;
   chargeCurrencies: string[];
   callbackUrl: string;
 }
@@ -67,7 +80,8 @@ export function getPaymentConfig(): ResolvedPaymentConfig {
       ? override.chargeCurrencies.map((c) => c.toUpperCase())
       : env.billing.chargeCurrencies;
   const callbackUrl = override?.callbackUrl || env.billing.callbackUrl;
-  return { provider, secretKey, webhookSecret, publicKey, chargeCurrencies, callbackUrl };
+  const merchantId = override?.merchantId || '';
+  return { provider, secretKey, webhookSecret, publicKey, merchantId, chargeCurrencies, callbackUrl };
 }
 
 /** Currencies the active merchant account can settle. */

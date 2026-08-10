@@ -44,18 +44,20 @@ const DEFAULT_PRICING: SmsPricing = {
 
 const pricingSchema = z.object({
   currency: z.string().length(3).transform((v) => v.toUpperCase()),
-  unitCost: z.coerce.number().positive(),
+  // Zero explicitly means platform-sponsored/free delivery.
+  unitCost: z.coerce.number().nonnegative(),
   channels: z.object({
-    SMS: z.object({ enabled: z.boolean().default(true), unitCost: z.coerce.number().positive() }),
-    EMAIL: z.object({ enabled: z.boolean().default(true), unitCost: z.coerce.number().positive() }),
-    WHATSAPP: z.object({ enabled: z.boolean().default(true), unitCost: z.coerce.number().positive() }),
+    SMS: z.object({ enabled: z.boolean().default(true), unitCost: z.coerce.number().nonnegative() }),
+    EMAIL: z.object({ enabled: z.boolean().default(true), unitCost: z.coerce.number().nonnegative() }),
+    WHATSAPP: z.object({ enabled: z.boolean().default(true), unitCost: z.coerce.number().nonnegative() }),
   }).optional(),
   lowBalanceThreshold: z.coerce.number().nonnegative().default(500),
   packages: z.array(z.object({
     id: z.string().min(1),
     name: z.string().min(1),
     credits: z.coerce.number().int().positive(),
-    price: z.coerce.number().positive(),
+    // Accept zero so an admin can publish a fully free messaging configuration.
+    price: z.coerce.number().nonnegative(),
   })).min(1),
 });
 
@@ -117,15 +119,18 @@ export const smsWalletService = {
     const config = await pricing();
     const wallet = await walletFor(organizationId, config);
     const channel = config.channels[channelType];
+    const totalCost = channel.unitCost * quantity;
+    const free = channel.enabled && channel.unitCost === 0;
     return {
       channelType,
       quantity,
       enabled: channel.enabled,
       unitCost: channel.unitCost,
-      totalCost: channel.unitCost * quantity,
+      totalCost,
       balance: Number(wallet.balance),
       currency: wallet.currency,
-      affordable: channel.enabled && Number(wallet.balance) >= channel.unitCost * quantity,
+      free,
+      affordable: channel.enabled && (free || Number(wallet.balance) >= totalCost),
     };
   },
 
@@ -145,8 +150,9 @@ export const smsWalletService = {
     const used = sends;
     const enabledCosts = Object.values(config.channels).filter((c) => c.enabled).map((c) => c.unitCost);
     const cheapest = Math.min(...enabledCosts, config.unitCost);
-    const remaining = Math.floor(Number(wallet.balance) / cheapest);
-    return { used, limit: used + remaining };
+    // At least one free channel means credit balance does not cap total sends.
+    const remaining = cheapest === 0 ? null : Math.floor(Number(wallet.balance) / cheapest);
+    return { used, limit: remaining === null ? null : used + remaining };
   },
 
   async summary() {
@@ -177,7 +183,9 @@ export const smsWalletService = {
           { ...value, unitCost: money(value.unitCost) },
         ]),
       ),
-      estimatedMessages: Math.floor(Number(wallet.balance) / config.unitCost),
+      estimatedMessages: config.unitCost === 0
+        ? null
+        : Math.floor(Number(wallet.balance) / config.unitCost),
       packages: config.packages.map((p) => ({ ...p, price: money(p.price) })),
       transactions: transactions.map((t) => ({
         ...t,
@@ -208,6 +216,11 @@ export const smsWalletService = {
         403,
         `${params.channelType} paid delivery is currently disabled by the platform administrator.`,
       );
+    }
+    // Free delivery bypasses the prepaid wallet entirely. The provider send
+    // still runs normally; only the platform credit charge is skipped.
+    if (channelPricing.unitCost === 0) {
+      return `free_${params.channelType.toLowerCase()}_${Date.now().toString(36)}_${randomUUID()}`;
     }
     const reference = `msg_${params.channelType.toLowerCase()}_${Date.now().toString(36)}_${randomUUID()}`;
     const amount = new Prisma.Decimal(channelPricing.unitCost);

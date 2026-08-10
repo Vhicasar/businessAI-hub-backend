@@ -17,6 +17,7 @@ import { startEventDispatcher } from './application/events/event-dispatcher';
 import { registerCoreSubscribers } from './application/events/subscribers';
 import {
   startNoncePurge,
+  startPaymentReconciliation,
   startPayoutReconciliation,
   startRewardExpiry,
   startSettlementRuns,
@@ -58,6 +59,7 @@ async function bootstrap(): Promise<void> {
   registerCoreSubscribers(); // wire domain-event handlers
   startEventDispatcher(); // drain the DomainEvent outbox to the event bus
   startPayoutReconciliation(); // resolve in-flight bank payouts if a webhook is missed
+  startPaymentReconciliation(); // recover collections whose webhook never arrived
   startNoncePurge(); // drop spent device-signature challenges
   startWebhookRetrySweep(); // retry outbound webhook deliveries with backoff
   startRewardExpiry(); // expire reward points past their window

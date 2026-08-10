@@ -73,6 +73,9 @@ import { loyaltyRoutes } from './presentation/http/v1/loyalty.routes';
 import { promotionsRoutes } from './presentation/http/v1/promotions.routes';
 import { storage } from './infrastructure/storage/storage';
 import { paystackWebhookRoutes, flutterwaveWebhookRoutes, stripeWebhookRoutes } from './presentation/http/paystack-webhook.routes';
+import { paymentWebhookRoutes } from './presentation/http/payment-webhooks.routes';
+import { paymentIntentRoutes } from './presentation/http/v1/payment-intents.routes';
+import { paymentsConfigRoutes } from './presentation/http/v1/payments-config.routes';
 import { openApiDocument } from './presentation/http/swagger';
 
 export function createApp(): Express {
@@ -167,6 +170,8 @@ export function createApp(): Express {
   v1.use('/search', searchRoutes);
   v1.use('/billing', billingRoutes);
   v1.use('/payment-links', paymentLinksRoutes);
+  v1.use('/payment-intents', paymentIntentRoutes);
+  v1.use('/payments/config', paymentsConfigRoutes);
   v1.use('/files', filesRoutes);
   v1.use('/developer', developerRoutes);
   v1.use('/integrations', integrationsRoutes);
@@ -235,6 +240,10 @@ export function createApp(): Express {
       stream.pipe(res);
     });
   }
+
+  // Per-business payment collection webhooks. Mounted first: the path is the
+  // most specific, and it is the one carrying customer money.
+  app.use('/api/webhooks/payments', paymentWebhookRoutes);
 
   // Public payment webhooks (signature-verified) — mounted before the channel
   // webhook receiver so their specific paths win.

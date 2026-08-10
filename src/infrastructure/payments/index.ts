@@ -1,6 +1,8 @@
 import { paystack, PaystackClient } from './paystack';
 import { flutterwave, FlutterwaveClient } from './flutterwave';
 import { stripe, StripeClient } from './stripe';
+import { opay, OpayClient } from './opay';
+import { moniepoint, MoniepointClient } from './moniepoint';
 import { getPaymentConfig, type ResolvedPaymentConfig } from './config';
 import type { PaymentProvider } from './types';
 
@@ -11,7 +13,11 @@ import type { PaymentProvider } from './types';
  */
 export function getActivePaymentProvider(): PaymentProvider {
   const p = getPaymentConfig().provider;
-  return p === 'flutterwave' ? flutterwave : p === 'stripe' ? stripe : paystack;
+  return p === 'flutterwave' ? flutterwave
+    : p === 'stripe' ? stripe
+    : p === 'opay' ? opay
+    : p === 'moniepoint' ? moniepoint
+    : paystack;
 }
 
 /**
@@ -20,14 +26,21 @@ export function getActivePaymentProvider(): PaymentProvider {
  * Paystack/Flutterwave account rather than the platform's.
  */
 export function buildPaymentProvider(cfg: ResolvedPaymentConfig): PaymentProvider {
-  return cfg.provider === 'flutterwave'
-    ? new FlutterwaveClient(() => cfg)
-    : cfg.provider === 'stripe'
-      ? new StripeClient(() => cfg)
-      : new PaystackClient(() => cfg);
+  switch (cfg.provider) {
+    case 'flutterwave':
+      return new FlutterwaveClient(() => cfg);
+    case 'stripe':
+      return new StripeClient(() => cfg);
+    case 'opay':
+      return new OpayClient(() => cfg);
+    case 'moniepoint':
+      return new MoniepointClient(() => cfg);
+    default:
+      return new PaystackClient(() => cfg);
+  }
 }
 
-export { paystack, flutterwave, stripe };
+export { paystack, flutterwave, stripe, opay, moniepoint };
 export { getPaymentConfig, getChargeCurrencies, setPaymentConfigOverride } from './config';
 export type { ResolvedPaymentConfig, PaymentConfigOverride } from './config';
 export * from './types';

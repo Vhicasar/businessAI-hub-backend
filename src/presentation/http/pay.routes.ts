@@ -2,6 +2,10 @@ import { Router, type Request, type RequestHandler, type Response } from 'expres
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 import { paymentLinksService } from '../../application/payments/payment-links.service';
+import {
+  publicPaymentView,
+  publicReceipt,
+} from '../../application/payments/payment-public.service';
 import { validate } from './middleware/validate';
 
 /**
@@ -25,11 +29,18 @@ const wrap =
     fn(req, res).catch(next);
   };
 
-/** Public details for the pay page. */
+/**
+ * Public details for the pay page.
+ *
+ * Served from the Payment Intent, which every payment link was migrated onto,
+ * so tokens already printed on invoices and encoded in QR codes keep working.
+ * The `methods` list is resolved on every read rather than stored, which is
+ * what makes a business's toggle apply here immediately (§22).
+ */
 payRoutes.get(
   '/:token',
   wrap(async (req, res) => {
-    res.json({ success: true, data: await paymentLinksService.publicView(req.params.token as string) });
+    res.json({ success: true, data: await publicPaymentView(req.params.token as string) });
   }),
 );
 
@@ -62,10 +73,10 @@ payRoutes.get(
   }),
 );
 
-/** Printable receipt for a settled link. */
+/** Printable receipt for a settled payment. */
 payRoutes.get(
   '/:token/receipt',
   wrap(async (req, res) => {
-    res.json({ success: true, data: await paymentLinksService.receipt(req.params.token as string) });
+    res.json({ success: true, data: await publicReceipt(req.params.token as string) });
   }),
 );

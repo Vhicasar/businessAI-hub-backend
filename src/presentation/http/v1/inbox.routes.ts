@@ -103,6 +103,36 @@ inboxRoutes.post(
   })
 );
 
+/**
+ * Raise a payment request from inside a conversation (§10).
+ *
+ * The agent names what is being paid for, not how much: the amount comes from
+ * the order or invoice, and a free-text charge needs an explicit amount and the
+ * permission to ask for one. The customer receives a card with a pay link whose
+ * methods are resolved when they open it, so it reflects the business's
+ * settings at that moment rather than at the moment the agent typed.
+ */
+inboxRoutes.post(
+  '/conversations/:id/payment-request',
+  requirePermission('payments.request'),
+  validate({
+    body: z.object({
+      resourceType: z.enum(['ORDER', 'INVOICE', 'DEPOSIT', 'CUSTOM']),
+      resourceId: z.string().trim().max(60).optional(),
+      amount: z.number().positive().max(1_000_000_000).optional(),
+      description: z.string().trim().max(300).optional(),
+    }),
+  }),
+  wrap(async (req, res) => {
+    const data = await inboxService.createPaymentRequest(
+      req.params.id as string,
+      req.body,
+      req.auth?.membershipId ?? null
+    );
+    res.status(201).json({ success: true, data });
+  })
+);
+
 // channel accounts
 inboxRoutes.get(
   '/channels',

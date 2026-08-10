@@ -74,7 +74,10 @@ export const PLAN_CATALOG: PlanSeed[] = [
     maxChannels: 1,
     maxContacts: 100,
     aiCreditsMonthly: 100,
-    features: ['inbox', 'ai_support', 'crm', 'catalog', 'orders', 'invoices', 'knowledge_base'],
+    features: [
+      'inbox', 'ai_support', 'crm', 'catalog', 'orders', 'invoices',
+      'knowledge_base', 'marketing', 'pos',
+    ],
     isPublic: true,
     position: 1,
   },

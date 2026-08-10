@@ -30,7 +30,24 @@ export const PERMISSION_MODULES = {
   orders: ['read', 'create', 'update', 'cancel', 'fulfill', 'refund', 'export'],
   pos: ['operate'],
   invoices: ['read', 'create', 'update', 'void', 'send'],
-  payments: ['read', 'record', 'refund'],
+  // Taking money. `request` raises a payment intent against something owed and
+  // is the everyday job of anyone serving a customer; `configure_methods` and
+  // `connect_provider` change how the business gets paid at all, which is a
+  // finance decision, not a counter-staff one. `cancel` and `refund` move money
+  // that has already been promised or taken, so they stay separate again.
+  payments: [
+    'read',
+    'record',
+    'refund',
+    'request',
+    'cancel',
+    'history',
+    'configure_methods',
+    'connect_provider',
+    'manage_settings',
+    'view_reports',
+    'reconcile',
+  ],
   payment_links: ['read', 'create', 'cancel', 'share'],
   vhicasar_pay: ['read', 'session_create', 'session_cancel', 'settle', 'chargeback', 'payout', 'payout_account'],
   marketing: ['read', 'create', 'update', 'delete', 'send'],
@@ -113,6 +130,10 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, { description: string; permis
       'inbox.read', 'inbox.reply', 'inbox.assign', 'inbox.resolve',
       'orders.read', 'orders.create', 'orders.export',
       'catalog.read', 'invoices.read', 'invoices.create', 'invoices.send',
+      // Asking a customer to pay for what was just agreed is the job. Changing
+      // how the business gets paid at all is not.
+      'payments.read', 'payments.request', 'payments.history',
+      'payment_links.read', 'payment_links.create', 'payment_links.share',
       // Answering "where is my order?" needs the delivery, not just the order.
       'delivery.read', 'promotions.read',
       'analytics.view', 'ai.use_assistant', 'files.read', 'files.upload',
@@ -125,6 +146,9 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, { description: string; permis
       ...keysFor('inbox', 'support', 'kb'),
       'customers.read', 'customers.update',
       'orders.read', 'invoices.read', 'delivery.read', 'promotions.read',
+      // §10: an agent settles "how do I pay?" inside the conversation.
+      'payments.read', 'payments.request', 'payments.history',
+      'payment_links.read', 'payment_links.create', 'payment_links.share',
       'ai.use_assistant', 'files.read', 'files.upload',
     ],
   },
@@ -144,7 +168,12 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, { description: string; permis
     description: 'Invoices, payments and financial reporting',
     permissions: [
       'dashboard.view',
-      ...keysFor('invoices', 'payments'),
+      ...keysFor('invoices'),
+      // Everything about money except handling the gateway's credentials —
+      // connecting a provider is an integration change, the same reasoning
+      // that keeps `delivery.configure` away from the warehouse.
+      ...keysFor('payments').filter((k) => k !== 'payments.connect_provider'),
+      ...keysFor('payment_links'),
       'orders.read', 'customers.read', 'contracts.read',
       'analytics.view', 'analytics.export', 'audit.read',
       'files.read', 'files.upload',

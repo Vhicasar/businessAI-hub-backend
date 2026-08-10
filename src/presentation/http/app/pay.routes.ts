@@ -354,3 +354,77 @@ appPayRoutes.post(
     res.status(201).json({ success: true, message: 'Payment completed.', data });
   })
 );
+
+// ---- Universal payment intents (§9) ----
+
+/**
+ * What this payment is, and how the business will let the customer pay it.
+ *
+ * The app renders exactly the `methods` array returned here — it keeps no list
+ * of its own — so a business disabling a method removes it from the app on the
+ * next screen open, with no release and no cache to bust (§22).
+ */
+appPayRoutes.get(
+  '/intents/:reference',
+  wrap(async (req, res) => {
+    const { paymentIntentService } = await import('../../../application/payments/payment-intent.service');
+    const { publicPaymentView } = await import('../../../application/payments/payment-public.service');
+    const intent = await paymentIntentService.byReference(String(req.params.reference));
+    if (!intent.token) {
+      res.status(404).json({ success: false, error: { code: 'NOT_FOUND' } });
+      return;
+    }
+    res.json({ success: true, data: await publicPaymentView(intent.token) });
+  })
+);
+
+/** Everything this customer owes any business, newest first. */
+appPayRoutes.get(
+  '/intents',
+  wrap(async (req, res) => {
+    const { prismaUnscoped } = await import('../../../infrastructure/database/prisma');
+    const { paymentIntentService } = await import('../../../application/payments/payment-intent.service');
+    const vhicasarId = req.appAuth!.vhicasarId;
+
+    // A Vhicasar ID is linked to a customer record per business, so the
+    // customer's payments are found through those links rather than by any
+    // single tenant's customer id.
+    const links = await prismaUnscoped.customerLink.findMany({
+      where: { vhicasarId },
+      select: { customerId: true },
+    });
+    const customerIds = links.map((l) => l.customerId);
+    if (customerIds.length === 0) {
+      res.json({ success: true, data: [] });
+      return;
+    }
+
+    const rows = await prismaUnscoped.paymentIntent.findMany({
+      where: { customerId: { in: customerIds } },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
+    const orgs = await prismaUnscoped.organization.findMany({
+      where: { id: { in: [...new Set(rows.map((r) => r.organizationId))] } },
+      select: { id: true, name: true },
+    });
+    const nameById = new Map(orgs.map((o) => [o.id, o.name]));
+
+    res.json({
+      success: true,
+      data: rows.map((r) => ({
+        reference: r.reference,
+        businessName: nameById.get(r.organizationId) ?? 'Business',
+        description: r.description,
+        amount: Number(r.amount),
+        amountPaid: Number(r.amountPaid),
+        outstanding: paymentIntentService.outstanding(r),
+        currency: r.currency,
+        status: r.status,
+        payable: paymentIntentService.isPayable(r),
+        createdAt: r.createdAt,
+        paidAt: r.paidAt,
+      })),
+    });
+  })
+);

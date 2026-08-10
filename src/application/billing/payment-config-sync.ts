@@ -20,6 +20,15 @@ interface AdminPaymentConfig {
   callbackUrl: string | null;
 }
 
+/**
+ * Gateways the *platform* can bill its own tenants through.
+ *
+ * Deliberately narrower than the set a tenant can collect customer payments
+ * with. Platform billing is recurring, and OPay and Moniepoint are integrated
+ * for one-off collections only — selecting one here would leave every
+ * subscription renewal throwing rather than charging. They are available to
+ * businesses on the Gateway settings screen, which is where they belong.
+ */
 const SUPPORTED: PaymentProviderName[] = ['paystack', 'flutterwave', 'stripe'];
 let lastSyncAt = 0;
 let inFlight: Promise<boolean> | null = null;

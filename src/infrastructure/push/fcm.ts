@@ -175,7 +175,7 @@ export const fcm = {
           notification: {
             title: payload.title,
             body: payload.body,
-            icon: '/brand-icon.svg',
+            icon: '/brand-icon.png',
             tag: groupTag,
             renotify: true,
           },

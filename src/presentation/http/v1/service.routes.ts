@@ -670,3 +670,146 @@ serviceRoutes.get(
     });
   }),
 );
+
+// ---- Payments oversight (§18) ----
+
+/**
+ * Provider capabilities: what each gateway may be used for, platform-wide.
+ *
+ * The ceiling under which businesses choose. An operator can withdraw a method
+ * from a provider — a gateway suspending USSD, say — without a deploy, and
+ * every business collecting through it stops offering it immediately.
+ *
+ * The one thing this cannot do is turn a method *on* for a business that has
+ * switched it off. That direction is deliberate (§18): the hierarchy only ever
+ * subtracts as it goes down.
+ */
+serviceRoutes.get(
+  '/payments/capabilities',
+  wrap(async (_req, res) => {
+    const { PROVIDER_CAPABILITIES, PLATFORM_NATIVE_METHODS } = await import(
+      '../../../infrastructure/payments/capabilities'
+    );
+    const overrides = await prismaUnscoped.providerCapability.findMany({
+      orderBy: [{ provider: 'asc' }, { method: 'asc' }],
+    });
+    res.json({
+      success: true,
+      data: {
+        shipped: PROVIDER_CAPABILITIES,
+        platformNative: PLATFORM_NATIVE_METHODS,
+        overrides,
+      },
+    });
+  })
+);
+
+serviceRoutes.put(
+  '/payments/capabilities',
+  validate({
+    body: z.object({
+      provider: z.string().trim().min(2).max(40),
+      method: z.string().trim().min(2).max(40),
+      enabled: z.boolean(),
+      currencies: z.array(z.string().trim().length(3)).max(30).optional(),
+      countries: z.array(z.string().trim().length(2)).max(60).optional(),
+      minAmount: z.number().nonnegative().optional(),
+      maxAmount: z.number().positive().optional(),
+      notes: z.string().trim().max(300).optional(),
+    }),
+  }),
+  wrap(async (req, res) => {
+    const b = req.body as {
+      provider: string; method: string; enabled: boolean;
+      currencies?: string[]; countries?: string[];
+      minAmount?: number; maxAmount?: number; notes?: string;
+    };
+    const data = {
+      enabled: b.enabled,
+      currencies: (b.currencies ?? []).map((c) => c.toUpperCase()),
+      countries: (b.countries ?? []).map((c) => c.toUpperCase()),
+      minAmount: b.minAmount ?? null,
+      maxAmount: b.maxAmount ?? null,
+      notes: b.notes ?? null,
+    };
+    const saved = await prismaUnscoped.providerCapability.upsert({
+      where: { provider_method: { provider: b.provider, method: b.method as never } },
+      create: { provider: b.provider, method: b.method as never, ...data },
+      update: data,
+    });
+    res.json({ success: true, data: saved });
+  })
+);
+
+/** Inbound webhook log, newest first — including the ones that failed. */
+serviceRoutes.get(
+  '/payments/webhooks',
+  validate({
+    query: z.object({
+      status: z.enum(['RECEIVED', 'PROCESSED', 'FAILED', 'IGNORED']).optional(),
+      provider: z.string().optional(),
+      limit: z.coerce.number().int().min(1).max(200).default(50),
+    }),
+  }),
+  wrap(async (req, res) => {
+    const q = req.query as unknown as { status?: string; provider?: string; limit: number };
+    const rows = await prismaUnscoped.inboundWebhookEvent.findMany({
+      where: {
+        ...(q.status ? { status: q.status as never } : {}),
+        ...(q.provider ? { provider: q.provider } : {}),
+      },
+      orderBy: { receivedAt: 'desc' },
+      take: q.limit,
+    });
+    res.json({ success: true, data: rows });
+  })
+);
+
+/** Push the failed queue through again, on demand. */
+serviceRoutes.post(
+  '/payments/webhooks/retry',
+  wrap(async (_req, res) => {
+    const { paymentWebhookService } = await import(
+      '../../../application/payments/payment-webhook.service'
+    );
+    res.json({ success: true, data: await paymentWebhookService.retryFailed(100) });
+  })
+);
+
+/** Run reconciliation now rather than waiting for the sweep. */
+serviceRoutes.post(
+  '/payments/reconcile',
+  wrap(async (_req, res) => {
+    const { reconcilePayments } = await import(
+      '../../../application/payments/payment-reconciliation.service'
+    );
+    res.json({ success: true, data: await reconcilePayments({ olderThanMinutes: 0 }) });
+  })
+);
+
+/** Payment intents across every business, for support and investigation. */
+serviceRoutes.get(
+  '/payments/intents',
+  validate({
+    query: z.object({
+      status: z.string().optional(),
+      organizationId: z.string().optional(),
+      reference: z.string().optional(),
+      limit: z.coerce.number().int().min(1).max(200).default(50),
+    }),
+  }),
+  wrap(async (req, res) => {
+    const q = req.query as unknown as Record<string, string> & { limit: number };
+    const rows = await prismaUnscoped.paymentIntent.findMany({
+      where: {
+        ...(q.status ? { status: q.status as never } : {}),
+        ...(q.organizationId ? { organizationId: q.organizationId } : {}),
+        ...(q.reference ? { reference: q.reference.toUpperCase() } : {}),
+      },
+      orderBy: { createdAt: 'desc' },
+      take: q.limit,
+      include: { transactions: { orderBy: { createdAt: 'desc' }, take: 10 } },
+    });
+    res.json({ success: true, data: rows });
+  })
+);

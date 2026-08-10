@@ -21,17 +21,32 @@ const outPath = path.join(
 
 const src = fs.readFileSync(schemaPath, 'utf8');
 const models = [];
+const skipped = [];
 let current = null;
+// Doc comments seen since the last model, so a model can opt out next to its
+// own definition rather than in a list that drifts away from the schema.
+let docBlock = '';
 
 for (const raw of src.split('\n')) {
+  if (/^\s*\/\/\//.test(raw)) {
+    docBlock += raw;
+    continue;
+  }
   const line = raw.replace(/\/\/.*$/, '');
   const open = line.match(/^\s*model\s+(\w+)\s*\{/);
   if (open) {
-    current = { name: open[1], hasOrg: false };
+    // `/// @untenanted` marks a model that carries an organizationId but must
+    // NOT be auto-scoped — rows written before a tenant is known, such as an
+    // inbound provider webhook. Scoping those would filter on a context that
+    // does not exist yet.
+    current = { name: open[1], hasOrg: false, optedOut: docBlock.includes('@untenanted') };
+    docBlock = '';
     continue;
   }
+  docBlock = '';
   if (/^\s*\}/.test(line) && current) {
-    if (current.hasOrg) models.push(current.name);
+    if (current.hasOrg && !current.optedOut) models.push(current.name);
+    else if (current.hasOrg) skipped.push(current.name);
     current = null;
     continue;
   }
@@ -47,3 +62,6 @@ ${models.map((m) => `  '${m}',`).join('\n')}
 
 fs.writeFileSync(outPath, content);
 console.log(`✓ tenant-models.generated.ts — ${models.length} tenant-scoped models`);
+if (skipped.length) {
+  console.log(`  opted out of scoping (@untenanted): ${skipped.join(', ')}`);
+}

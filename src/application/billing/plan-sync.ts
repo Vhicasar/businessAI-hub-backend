@@ -33,6 +33,19 @@ interface AdminPlan {
 
 const FEATURE_KEYS_BY_SLUG = new Map<string, FeatureKey[]>(PLAN_CATALOG.map((p) => [p.slug, p.features]));
 
+/**
+ * Functional feature keys are code-owned, so reconcile them even when the
+ * remote commercial catalog is disabled. This also upgrades existing plan
+ * rows after a deployment instead of requiring a manual reseed.
+ */
+async function syncLocalFeatureKeys(): Promise<void> {
+  await Promise.all(
+    [...FEATURE_KEYS_BY_SLUG.entries()].map(([slug, features]) =>
+      prismaUnscoped.plan.updateMany({ where: { slug }, data: { features } }),
+    ),
+  );
+}
+
 function num(v: number | null | undefined): number | null {
   return v === undefined ? null : v;
 }
@@ -114,6 +127,9 @@ export async function syncPlansFromAdmin(): Promise<{ synced: number } | null> {
 
 /** Runs an initial sync (best-effort) and schedules periodic refreshes. */
 export function startPlanSync(): void {
+  void syncLocalFeatureKeys().catch((err) => {
+    logger.warn({ err: (err as Error).message }, 'Local plan feature reconciliation failed');
+  });
   if (!env.adminCatalog.enabled) return;
   void syncPlansFromAdmin();
   const ms = env.adminCatalog.intervalMin * 60_000;

@@ -14,6 +14,33 @@ import { rewardCampaigns } from '../rewards/reward-campaign.service';
 
 let payoutTimer: NodeJS.Timeout | null = null;
 let nonceTimer: NodeJS.Timeout | null = null;
+let inboundTimer: NodeJS.Timeout | null = null;
+
+/**
+ * The money-in counterpart: retries webhooks that failed, asks the gateway
+ * about intents it may have collected without telling us, and closes out
+ * abandoned ones.
+ *
+ * Without this a lost webhook leaves a customer who has paid staring at an
+ * unpaid order, and the only route to a correct state is a human noticing.
+ */
+export function startPaymentReconciliation(intervalMs = 300_000): void {
+  if (inboundTimer) return;
+  const tick = async () => {
+    try {
+      const { reconcilePayments } = await import('./payment-reconciliation.service');
+      const report = await reconcilePayments();
+      if (report.settled > 0 || report.webhooksRecovered > 0) {
+        logger.info(report, 'payment reconciliation recovered payments');
+      }
+    } catch (err) {
+      logger.error({ err }, 'payment reconciliation tick failed');
+    }
+  };
+  inboundTimer = setInterval(() => void tick(), intervalMs);
+  if (typeof inboundTimer.unref === 'function') inboundTimer.unref();
+  logger.info(`💳 Payment reconciliation started (${intervalMs}ms interval)`);
+}
 
 export function startPayoutReconciliation(intervalMs = 120_000): void {
   if (payoutTimer) return;
@@ -146,7 +173,9 @@ export function stopPayoutSweeps(): void {
   if (payoutTimer) clearInterval(payoutTimer);
   if (nonceTimer) clearInterval(nonceTimer);
   if (settlementTimer) clearInterval(settlementTimer);
+  if (inboundTimer) clearInterval(inboundTimer);
   payoutTimer = null;
   nonceTimer = null;
   settlementTimer = null;
+  inboundTimer = null;
 }

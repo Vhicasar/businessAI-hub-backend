@@ -898,6 +898,8 @@ model Customer {
   quotations          Quotation[]
   contracts           Contract[]
   returnRequests      ReturnRequest[]
+  paymentIntents      PaymentIntent[]
+  virtualAccounts     VirtualAccount[]
 
   @@unique([organizationId, email])
   @@unique([organizationId, phone])
@@ -1206,6 +1208,7 @@ model Deal {
   quotations Quotation[]
   contracts  Contract[]
   invoices   Invoice[]
+  paymentIntents PaymentIntent[]
 
   @@index([organizationId, status])
   @@index([pipelineId, stageId])
@@ -2028,6 +2031,7 @@ model Order {
   returnRequests    ReturnRequest[]
   couponRedemptions CouponRedemption[]
   statusHistory     OrderStatusHistory[]
+  paymentIntents    PaymentIntent[]
 
   @@unique([organizationId, number])
   @@index([organizationId, status, createdAt])
@@ -2260,6 +2264,7 @@ model Invoice {
   lease    Lease?        @relation(fields: [leaseId], references: [id])
   items    InvoiceItem[]
   payments Payment[]
+  paymentIntents PaymentIntent[]
 
   @@unique([organizationId, number])
   @@index([organizationId, status, dueAt])
@@ -2287,6 +2292,9 @@ model Payment {
   customerId     String?
   orderId        String?
   invoiceId      String?
+  /// The intent this payment settled, when it came in through one. Null for
+  /// money recorded by hand (cash at the counter, a cheque banked later).
+  paymentIntentId String?
   method         PaymentMethodType
   status         PaymentStatus     @default(PENDING)
   amount         Decimal           @db.Decimal(14, 2)
@@ -2311,6 +2319,7 @@ model Payment {
   @@index([customerId])
   @@index([orderId])
   @@index([providerRef])
+  @@index([paymentIntentId])
 }
 
 enum PaymentLinkStatus {
@@ -2366,6 +2375,318 @@ model PaymentLink {
   @@index([organizationId, status, createdAt])
   @@index([customerId])
   @@index([resourceType, resourceId])
+}
+
+// ============================================================
+// UNIVERSAL PAYMENT INTENT
+// ============================================================
+//
+// One entity for "what the customer is trying to pay for", whatever the thing
+// is and wherever the payment is started — web, customer app, business app,
+// inbox chat, AI, a link, a QR code or the API. Orders, invoices, deals,
+// property and bookings all point at this rather than carrying payment logic
+// of their own.
+
+/// What a customer can be asked to pay for.
+///
+/// Deliberately the same vocabulary as PaymentLinkResource: a link is one way
+/// to *deliver* an intent, not a separate kind of thing.
+enum PaymentIntentResource {
+  ORDER
+  INVOICE
+  DEAL
+  PROPERTY
+  PROPERTY_RESERVATION
+  BOOKING
+  SUBSCRIPTION
+  DEPOSIT
+  QUOTATION
+  RENT
+  INSPECTION_FEE
+  COMMISSION
+  INSTALMENT
+  POS
+  CUSTOM
+}
+
+/// The full life of a payment attempt.
+///
+/// Distinct from the accounting-side `PaymentStatus`, which records what
+/// happened to money already received. This is the state of the *request*.
+enum PaymentIntentStatus {
+  CREATED
+  AWAITING_PAYMENT
+  PROCESSING
+  PAID
+  PARTIALLY_PAID
+  OVERPAID
+  FAILED
+  EXPIRED
+  CANCELLED
+  REFUNDED
+  PARTIALLY_REFUNDED
+  REVERSED
+}
+
+/// Ways a customer can actually pay.
+///
+/// Separate from `PaymentMethodType`, which is the bookkeeping question of how
+/// money arrived (including cash, cheque and COD — things a customer never
+/// picks on a payment page). This enum is the customer-facing catalogue, and
+/// it is the one businesses enable and disable.
+enum PaymentMethodKind {
+  CARD
+  BANK_TRANSFER
+  VIRTUAL_ACCOUNT
+  USSD
+  QR_CODE
+  MOBILE_MONEY
+  PAYMENT_LINK
+  WALLET
+  DIRECT_DEBIT
+  PAY_WITH_BANK
+  APPLE_PAY
+  GOOGLE_PAY
+  PAYPAL
+  CRYPTO
+  CASH_ON_DELIVERY
+}
+
+/// What the customer is trying to pay, and how far along they are.
+///
+/// `resourceType`/`resourceId` stay scalar so any payable thing works without
+/// a schema change, while the four hot relations are also real foreign keys so
+/// rollups and joins are cheap and cannot dangle.
+///
+/// The amount is always the server's. Nothing a client sends is trusted, and
+/// nothing here is marked PAID except by a verified provider transaction.
+model PaymentIntent {
+  id             String                @id @default(cuid())
+  organizationId String
+  /// Customer-visible, unguessable, unique: VH-PI-8F92KLM. This is what the
+  /// customer quotes on a bank transfer and what reconciliation matches on.
+  reference      String                @unique
+  resourceType   PaymentIntentResource
+  resourceId     String?
+  customerId     String?
+  orderId        String?
+  invoiceId      String?
+  dealId         String?
+  propertyId     String?
+
+  amount    Decimal @db.Decimal(14, 2)
+  /// Sum of verified provider transactions. Never written from a client.
+  amountPaid Decimal @default(0) @db.Decimal(14, 2)
+  amountRefunded Decimal @default(0) @db.Decimal(14, 2)
+  currency  String  @default("NGN") @db.Char(3)
+
+  status      PaymentIntentStatus @default(CREATED)
+  description String?
+  /// Set once the customer commits to a method; null while they are choosing.
+  method      PaymentMethodKind?
+  /// Adapter key of the provider that will settle this — "paystack" etc.
+  provider    String?
+  /// Whether the customer may settle this in instalments.
+  allowPartial Boolean            @default(false)
+
+  /// Opaque token behind the public /pay/<token> page and QR codes. Separate
+  /// from `reference`: the reference is quoted out loud and printed on bills,
+  /// the token grants access, so knowing one must not reveal the other.
+  token String? @unique
+
+  /// Where this was raised from, for audit and for the AI to explain itself.
+  channel     String? // WEB | APP | INBOX | AI | LINK | QR | API | POS
+  createdById String? // Membership id, when a person raised it
+  aiCreated   Boolean @default(false)
+
+  expiresAt DateTime?
+  paidAt    DateTime?
+  metadata  Json?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  customer     Customer?            @relation(fields: [customerId], references: [id])
+  order        Order?               @relation(fields: [orderId], references: [id])
+  invoice      Invoice?             @relation(fields: [invoiceId], references: [id])
+  deal         Deal?                @relation(fields: [dealId], references: [id])
+  property     Property?            @relation(fields: [propertyId], references: [id])
+  transactions PaymentTransaction[]
+
+  @@index([organizationId, status, createdAt])
+  @@index([customerId])
+  @@index([resourceType, resourceId])
+  @@index([orderId])
+  @@index([invoiceId])
+  @@index([dealId])
+  @@index([expiresAt])
+}
+
+enum PaymentTransactionStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  REVERSED
+}
+
+/// One verified movement of money against an intent.
+///
+/// An intent can have several: a retry after a failure, or instalments against
+/// a bill that allows them. `providerRef` is unique so a provider replaying a
+/// webhook can never be booked twice.
+model PaymentTransaction {
+  id              String                   @id @default(cuid())
+  organizationId  String
+  paymentIntentId String
+  provider        String
+  /// Gateway's own transaction id. The idempotency anchor for webhooks.
+  providerRef     String
+  method          PaymentMethodKind
+  status          PaymentTransactionStatus @default(PENDING)
+  amount          Decimal                  @db.Decimal(14, 2)
+  currency        String                   @db.Char(3)
+  /// Provider fee, when the gateway reports it.
+  fee             Decimal?                 @db.Decimal(14, 2)
+  /// The payload we verified, kept for dispute and reconciliation.
+  rawPayload      Json?
+  failureReason   String?
+  paidAt          DateTime?
+  createdAt       DateTime                 @default(now())
+  updatedAt       DateTime                 @updatedAt
+
+  paymentIntent PaymentIntent @relation(fields: [paymentIntentId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerRef])
+  @@index([organizationId, status, createdAt])
+  @@index([paymentIntentId])
+}
+
+/// A business's switch for one payment method.
+///
+/// A row exists only where a business has expressed an opinion; absence means
+/// "use the platform default for this method". Kept as rows rather than a JSON
+/// blob because admin, AI, the API and every client query it, and because a
+/// business may enable a method for one currency and not another.
+model PaymentMethodSetting {
+  id             String            @id @default(cuid())
+  organizationId String
+  method         PaymentMethodKind
+  enabled        Boolean           @default(true)
+  /// Empty means "every currency this business collects in".
+  currencies     String[]          @default([])
+  /// Shown to the customer when they pick this method.
+  instructions   String?           @db.Text
+  /// Ordering on the payment page; lower sorts first.
+  sortOrder      Int               @default(0)
+  updatedById    String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  @@unique([organizationId, method])
+  @@index([organizationId, enabled])
+}
+
+/// What a provider can actually do, per method.
+///
+/// Platform-level and admin-editable (§18), so support for a new provider
+/// method is a data change rather than a deploy. This is the ceiling: a
+/// business can only enable what its provider supports here.
+model ProviderCapability {
+  id           String            @id @default(cuid())
+  provider     String
+  method       PaymentMethodKind
+  /// Empty means "any currency the provider settles".
+  currencies   String[]          @default([])
+  /// ISO-2 codes. Empty means "any country".
+  countries    String[]          @default([])
+  /// Platform kill switch, independent of any business's choice.
+  enabled      Boolean           @default(true)
+  /// Some methods only make sense above/below a size — USSD caps, for example.
+  minAmount    Decimal?          @db.Decimal(14, 2)
+  maxAmount    Decimal?          @db.Decimal(14, 2)
+  notes        String?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  @@unique([provider, method])
+  @@index([provider, enabled])
+}
+
+enum VirtualAccountStatus {
+  ACTIVE
+  DORMANT
+  CLOSED
+}
+
+/// A durable account number that money can be sent to.
+///
+/// Held against a business, or against one customer of that business — never
+/// minted per order. A fresh account for every order is a provider-specific
+/// model, expensive, and leaves customers with a drawer full of dead account
+/// numbers; intents reconcile by reference against a stable account instead.
+/// Providers that genuinely require per-charge accounts declare that through
+/// their capability row and are handled by the adapter.
+model VirtualAccount {
+  id             String               @id @default(cuid())
+  organizationId String
+  /// Null for the business's own collection account.
+  customerId     String?
+  provider       String
+  providerRef    String?
+  accountNumber  String
+  accountName    String
+  bankName       String
+  bankCode       String?
+  currency       String               @default("NGN") @db.Char(3)
+  status         VirtualAccountStatus @default(ACTIVE)
+  metadata       Json?
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  customer Customer? @relation(fields: [customerId], references: [id])
+
+  @@unique([provider, accountNumber])
+  @@index([organizationId, status])
+  @@index([customerId])
+}
+
+enum InboundWebhookStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  IGNORED
+}
+
+/// Every webhook a provider has sent us, verified or not.
+///
+/// The unique key is what makes processing idempotent: a provider retrying a
+/// delivery finds its event already recorded and the handler stops. Failures
+/// stay here with their attempt count so a job can retry them and so support
+/// can see what a provider actually sent.
+///
+/// @untenanted — a provider posts with no session and no tenant; which business
+/// an event belongs to is worked out during processing, so this table is read
+/// and written through the unscoped client.
+model InboundWebhookEvent {
+  id             String               @id @default(cuid())
+  provider       String
+  /// Provider's own event id where it gives one, else a hash of the payload.
+  eventKey       String
+  eventType      String?
+  organizationId String?
+  /// Set once the event has been matched to something we know about.
+  paymentIntentId String?
+  status         InboundWebhookStatus @default(RECEIVED)
+  signatureValid Boolean              @default(false)
+  attempts       Int                  @default(0)
+  lastError      String?              @db.Text
+  payload        Json
+  receivedAt     DateTime             @default(now())
+  processedAt    DateTime?
+
+  @@unique([provider, eventKey])
+  @@index([status, receivedAt])
+  @@index([organizationId, receivedAt])
+  @@index([paymentIntentId])
 }
 
 // ============================================================
@@ -2675,6 +2996,7 @@ model Property {
   bookings    PropertyBooking[]
   maintenance MaintenanceRequest[]
   commissions Commission[]
+  paymentIntents PaymentIntent[]
 
   @@unique([organizationId, reference])
   @@index([organizationId, status, type])

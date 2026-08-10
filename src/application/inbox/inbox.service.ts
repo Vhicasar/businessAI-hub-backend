@@ -553,4 +553,73 @@ export const inboxService = {
       select: conversationListSelect,
     });
   },
+
+  /**
+   * Ask the customer in this conversation to pay (§10).
+   *
+   * Raises an intent through the same service every other surface uses — the
+   * agent cannot set a price for an order or invoice, because the figure is
+   * read from the record — then sends the pay link into the thread and records
+   * it on the CRM timeline so the conversation and the customer's history agree.
+   */
+  async createPaymentRequest(
+    conversationId: string,
+    input: {
+      resourceType: 'ORDER' | 'INVOICE' | 'DEPOSIT' | 'CUSTOM';
+      resourceId?: string;
+      amount?: number;
+      description?: string;
+    },
+    membershipId: string | null
+  ) {
+    const conversation = await prisma.conversation.findFirst({
+      where: { id: conversationId },
+      select: { id: true, organizationId: true, customerId: true },
+    });
+    if (!conversation) throw new NotFoundError('Conversation');
+
+    const { createIntentForResource } = await import('../payments/payment-request.service');
+    const { publicPayUrl } = await import('../payments/payment-intent.service');
+
+    const intent = await createIntentForResource({
+      organizationId: conversation.organizationId,
+      resourceType: input.resourceType,
+      resourceId: input.resourceId,
+      customerId: conversation.customerId,
+      amount: input.amount,
+      description: input.description,
+      channel: 'INBOX',
+      createdById: membershipId,
+    });
+
+    const payUrl = publicPayUrl(intent.token!);
+    const amount = `${intent.currency} ${Number(intent.amount).toLocaleString()}`;
+    const text =
+      `Payment request${intent.description ? ` — ${intent.description}` : ''}\n` +
+      `${amount}\n${payUrl}\nReference ${intent.reference}`;
+
+    // Best-effort: the request exists whether or not the channel accepts the
+    // message, and an agent can always copy the link out of the response.
+    let delivered = true;
+    try {
+      await this.sendMessage(conversationId, text, null, 'AGENT');
+    } catch (err) {
+      delivered = false;
+      logger.warn(
+        { err: (err as Error).message, conversationId },
+        'payment request raised but the message could not be delivered'
+      );
+    }
+
+    return {
+      reference: intent.reference,
+      amount: Number(intent.amount),
+      currency: intent.currency,
+      description: intent.description,
+      status: intent.status,
+      expiresAt: intent.expiresAt,
+      payUrl,
+      delivered,
+    };
+  },
 };
