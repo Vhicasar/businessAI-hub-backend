@@ -1,8 +1,8 @@
-import { randomBytes } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 
 import { prismaUnscoped } from '../../infrastructure/database/prisma';
+import { paymentIntentService } from './payment-intent.service';
 import { env } from '../../shared/config/env';
 import { requestContext } from '../../shared/context';
 import { AppError, ForbiddenError, NotFoundError, ValidationError } from '../../shared/errors';
@@ -196,66 +196,39 @@ export const documentPayment = {
     if (payable.dead) return off('This record is cancelled, so there is nothing to pay.');
     if (!payable.outstanding.greaterThan(0)) return off('This is settled — nothing left to pay.');
 
-    // Reuse an open link rather than minting a second one: reprinting a bill
-    // must not leave two live codes against the same debt.
-    const existing = await prismaUnscoped.paymentLink.findFirst({
-      where: {
-        organizationId: orgId,
-        resourceType,
-        resourceId,
-        status: { in: ['PENDING', 'PARTIALLY_PAID'] },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
-
-    if (existing) {
-      const stale = existing.expiresAt !== null && existing.expiresAt.getTime() < Date.now();
-      const amountChanged = !existing.amount.equals(payable.outstanding.plus(existing.amountPaid));
-      if (!stale && !amountChanged) {
-        return {
-          enabled: true,
-          payload: publicUrl(existing.token),
-          token: existing.token,
-          amount: money(payable.outstanding),
-          currency: existing.currency,
-          description: existing.description ?? payable.description,
-          reason: null,
-        };
-      }
-      // The bill has changed or the code has aged out. Close the old one so a
-      // previously printed copy stops working rather than sitting alongside a
-      // new code for a different amount.
-      await prismaUnscoped.paymentLink.update({
-        where: { id: existing.id },
-        data: { status: 'CANCELLED' },
-      });
-    }
-
-    const link = await prismaUnscoped.paymentLink.create({
-      data: {
-        organizationId: orgId,
-        resourceType,
-        resourceId,
-        customerId: payable.customerId,
-        token: newToken(),
-        // The resource's own balance, never anything from the request.
-        amount: payable.outstanding,
-        currency: payable.currency,
-        description: payable.description,
-        // Part payment is allowed: someone paying a large bill in instalments
-        // should not be forced to the full amount by the printed code.
-        allowPartial: true,
-        expiresAt: new Date(Date.now() + PRINTED_CODE_TTL_DAYS * 86_400_000),
-      },
+    // Reuse an open intent rather than minting a second one: reprinting a bill
+    // must not leave two live codes against the same debt. `create` handles the
+    // reuse, including standing down a stale one whose amount has moved.
+    //
+    // A Payment Intent, not a payment link — the /pay/<token> page resolves
+    // intents, so a code backed by anything else scans to "payment not found".
+    const intent = await paymentIntentService.create({
+      organizationId: orgId,
+      resourceType: resourceType === 'ORDER' ? 'ORDER' : 'INVOICE',
+      resourceId,
+      customerId: payable.customerId,
+      orderId: resourceType === 'ORDER' ? resourceId : null,
+      invoiceId: resourceType === 'INVOICE' ? resourceId : null,
+      // The resource's own balance, never anything from the request.
+      amount: Number(payable.outstanding),
+      currency: payable.currency,
+      description: payable.description,
+      // Part payment is allowed: someone paying a large bill in instalments
+      // should not be forced to the full amount by the printed code.
+      allowPartial: true,
+      channel: 'QR',
+      // Paper outlives a screen, so a printed code is given a long life — but
+      // not an unlimited one.
+      expiryMinutes: PRINTED_CODE_TTL_DAYS * 24 * 60,
     });
 
     return {
       enabled: true,
-      payload: publicUrl(link.token),
-      token: link.token,
+      payload: publicUrl(intent.token!),
+      token: intent.token,
       amount: money(payable.outstanding),
-      currency: link.currency,
-      description: link.description,
+      currency: intent.currency,
+      description: intent.description,
       reason: null,
     };
   },
@@ -307,12 +280,7 @@ export const documentPayment = {
   },
 };
 
-/**
- * Unguessable link token. 32 random bytes: the token *is* the credential that
- * lets a bearer settle a bill, so it has to be far beyond enumeration.
- */
-function newToken(): string {
-  return randomBytes(32).toString('base64url');
-}
+// Tokens are minted by the intent service now — one place decides what a
+// bearer credential looks like.
 
 export { AppError, ForbiddenError };

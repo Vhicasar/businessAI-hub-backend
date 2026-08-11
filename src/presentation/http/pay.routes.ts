@@ -7,6 +7,7 @@ import {
   publicReceipt,
 } from '../../application/payments/payment-public.service';
 import { validate } from './middleware/validate';
+import { NotFoundError } from '../../shared/errors';
 
 /**
  * Public payment-link API for the /pay/<token> page. No auth — possession of
@@ -40,7 +41,16 @@ const wrap =
 payRoutes.get(
   '/:token',
   wrap(async (req, res) => {
-    res.json({ success: true, data: await publicPaymentView(req.params.token as string) });
+    const token = req.params.token as string;
+    try {
+      res.json({ success: true, data: await publicPaymentView(token) });
+    } catch (error) {
+      // Invoice/order QR codes and the existing payment-link dialog still mint
+      // PaymentLink rows. Keep those already-shared tokens payable while the
+      // newer PaymentIntent flow is rolled out.
+      if (!(error instanceof NotFoundError)) throw error;
+      res.json({ success: true, data: await paymentLinksService.publicView(token) });
+    }
   }),
 );
 
@@ -77,6 +87,12 @@ payRoutes.get(
 payRoutes.get(
   '/:token/receipt',
   wrap(async (req, res) => {
-    res.json({ success: true, data: await publicReceipt(req.params.token as string) });
+    const token = req.params.token as string;
+    try {
+      res.json({ success: true, data: await publicReceipt(token) });
+    } catch (error) {
+      if (!(error instanceof NotFoundError)) throw error;
+      res.json({ success: true, data: await paymentLinksService.receipt(token) });
+    }
   }),
 );
