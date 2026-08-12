@@ -327,9 +327,15 @@ appPayRoutes.get(
 appPayRoutes.get(
   '/payment-links/:token',
   wrap(async (req, res) => {
-    const { paymentLinksService } = await import('../../../application/payments/payment-links.service');
-    const link = await paymentLinksService.publicView(req.params.token as string);
-    res.json({ success: true, data: link });
+    // Resolved as a Payment Intent, not a payment link. Codes issued now are
+    // backed by intents, and links were migrated onto intents keeping their
+    // token — so this one path serves a QR printed this morning and a link
+    // emailed last year. Reading the old table meant every freshly printed
+    // code scanned to "payment not found".
+    const { publicPaymentView } = await import(
+      '../../../application/payments/payment-public.service'
+    );
+    res.json({ success: true, data: await publicPaymentView(req.params.token as string) });
   })
 );
 

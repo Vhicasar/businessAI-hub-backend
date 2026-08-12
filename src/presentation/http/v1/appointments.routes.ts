@@ -9,6 +9,8 @@ import {
   appointmentConfigSchema,
   bookAppointmentSchema,
 } from '../../../application/appointments/appointments.service';
+import { calendarSync } from '../../../application/integrations/calendar-sync.service';
+import { currentOrgId } from '../../../application/billing/entitlements';
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<void>): RequestHandler =>
@@ -38,6 +40,43 @@ appointmentsRoutes.get(
   wrap(async (req, res) => { res.json({ success: true, data: await appointmentsService.list(req.query as never) }); }),
 );
 
+/**
+ * Bookings for the calendar view, with customer, assignee, service and property
+ * resolved. Literal path, declared before any `/:id`, so it is not shadowed.
+ */
+appointmentsRoutes.get(
+  '/calendar',
+  requirePermission('appointments.read'),
+  validate({
+    query: z.object({
+      from: z.string().optional(),
+      to: z.string().optional(),
+      status: z.string().optional(),
+      assigneeId: z.string().optional(),
+    }),
+  }),
+  wrap(async (req, res) => { res.json({ success: true, data: await appointmentsService.calendar(req.query as never) }); }),
+);
+
+/**
+ * Pull anything new from a connected Calendly account into the calendar.
+ *
+ * This creates bookings, so it needs the permission to create them — reading
+ * the calendar is not licence to write to it.
+ */
+appointmentsRoutes.post(
+  '/calendar/sync',
+  requirePermission('appointments.create'),
+  wrap(async (_req, res) => {
+    const organizationId = currentOrgId();
+    const providers = await calendarSync.connectedProviders(organizationId);
+    const result = providers.includes('calendly')
+      ? await calendarSync.pullFromCalendly(organizationId)
+      : { imported: 0, updated: 0 };
+    res.json({ success: true, data: { ...result, providers } });
+  }),
+);
+
 /** Slots for staff-side booking (own org from context). */
 appointmentsRoutes.get(
   '/slots',
@@ -63,4 +102,14 @@ appointmentsRoutes.post(
   '/:id/cancel',
   requirePermission('appointments.cancel'),
   wrap(async (req, res) => { res.json({ success: true, data: await appointmentsService.cancel(req.params.id as string) }); }),
+);
+
+/**
+ * One booking in full. Declared last so the literal paths above — /config,
+ * /calendar, /slots — are matched first rather than being read as an id.
+ */
+appointmentsRoutes.get(
+  '/:id',
+  requirePermission('appointments.read'),
+  wrap(async (req, res) => { res.json({ success: true, data: await appointmentsService.detail(req.params.id as string) }); }),
 );

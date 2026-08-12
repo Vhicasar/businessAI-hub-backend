@@ -216,7 +216,7 @@ export const knowledgeService = {
     question: string,
     history: AiMessage[] = [],
   ): Promise<{ answer: string | null; sources: { title: string; url: string | null }[]; grounded: boolean }> {
-    const provider = getAiProvider();
+    const provider = getAiProvider('knowledge');
     if (!provider) return { answer: null, sources: [], grounded: false };
 
     const hits = await this.search(orgId, question, 5);

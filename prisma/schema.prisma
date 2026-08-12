@@ -554,6 +554,8 @@ model Organization {
   subscriptions   Subscription[]
   apiKeys         ApiKey[]
   usageCounters   UsageCounter[]
+  aiUsageEvents   AiUsageEvent[]
+  aiCreditGrants  AiCreditGrant[]
   smsWallet       SmsWallet?
   addOnPurchases  AddOnPurchase[]
   customerLinks   CustomerLink[] // Vhicasar ID ↔ Customer associations
@@ -1281,6 +1283,14 @@ model Meeting {
   bookingToken   String?     @unique
   /// Set once a reminder has been emailed, so the sweep never double-sends.
   reminderSentAt DateTime?
+  /// Which calendar this booking is mirrored to/from: google_calendar | calendly.
+  externalProvider String?
+  /// The provider's id for the event, so an update edits rather than duplicates.
+  externalEventId  String?
+  /// The provider's own link to the event, shown on the booking details.
+  externalUrl      String?
+  /// Last successful mirror, for spotting a sync that has stopped working.
+  externalSyncedAt DateTime?
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
   deletedAt      DateTime?
@@ -1289,6 +1299,8 @@ model Meeting {
   @@index([entityType, entityId])
   @@index([customerId])
   @@index([status, startAt])
+  /// An event imported twice must land on the same row, not a duplicate.
+  @@unique([organizationId, externalProvider, externalEventId])
 }
 
 model Note {
@@ -5842,4 +5854,59 @@ model AiReplySuggestion {
   createdAt         DateTime  @default(now())
 
   @@index([organizationId, conversationId, createdAt])
+}
+
+/// One AI provider call, measured.
+///
+/// The existing UsageCounter counts *responses*, which is enough to enforce a
+/// plan quota and useless for understanding cost: a one-line reply and a long
+/// document summary both counted as one. This records what was actually
+/// consumed, so an operator can see which businesses are expensive and why.
+model AiUsageEvent {
+  id             String   @id @default(cuid())
+  organizationId String
+  /// Adapter key — "anthropic", "openai", "openrouter", …
+  provider       String
+  model          String
+  /// What asked for it: chat reply, insights, suggestions, summary.
+  feature        String
+  promptTokens   Int      @default(0)
+  completionTokens Int    @default(0)
+  totalTokens    Int      @default(0)
+  /// Credits drawn from the organisation's allowance for this call.
+  credits        Int      @default(0)
+  /// True when the business used its own API key, so the platform bore no cost
+  /// and no credit was drawn.
+  ownKey         Boolean  @default(false)
+  /// Set when a call failed, so failures are visible rather than missing.
+  failed         Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, createdAt])
+  @@index([provider, createdAt])
+  @@index([createdAt])
+}
+
+/// An operator's adjustment to an organisation's AI credit balance.
+///
+/// Kept as a ledger of grants rather than a mutable number: "why does this
+/// business have 5,000 extra credits?" is a question that gets asked, and a
+/// single figure cannot answer it. Negative values claw credit back.
+model AiCreditGrant {
+  id             String   @id @default(cuid())
+  organizationId String
+  /// Positive grants credit, negative removes it.
+  credits        Int
+  reason         String
+  /// Admin user who made the adjustment.
+  grantedById    String?
+  /// Null means it never lapses; otherwise it stops counting after this date.
+  expiresAt      DateTime?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, createdAt])
 }

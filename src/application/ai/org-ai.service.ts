@@ -3,7 +3,7 @@ import { prisma, prismaUnscoped } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { encrypt, decrypt } from '../../shared/crypto';
 import { logger } from '../../shared/logger';
-import { getAiProvider, buildAiProvider } from '../../infrastructure/ai';
+import { getAiProvider, buildAiProvider, meterProvider } from '../../infrastructure/ai';
 import { AppError } from '../../shared/errors';
 import type { AiProvider } from './ai-provider';
 
@@ -120,7 +120,10 @@ export const orgAiAccountService = {
  * in public flows too. Falls back to the platform provider when the org hasn't
  * connected/enabled its own.
  */
-export async function resolveOrgAi(organizationId?: string): Promise<{ provider: AiProvider | null; ownKey: boolean }> {
+export async function resolveOrgAi(
+  organizationId?: string,
+  feature = 'assistant'
+): Promise<{ provider: AiProvider | null; ownKey: boolean }> {
   const id = organizationId ?? requestContext.get()?.organizationId ?? null;
   if (id) {
     const org = await prismaUnscoped.organization.findUnique({ where: { id }, select: { settings: true } });
@@ -129,32 +132,34 @@ export async function resolveOrgAi(organizationId?: string): Promise<{ provider:
       const apiKey = safeDecrypt(acct.apiKeyEnc);
       if (apiKey || acct.baseUrl) {
         const provider = buildAiProvider({ provider: acct.provider === 'azure' ? 'custom' : acct.provider, model: acct.model, apiKey: apiKey || null, baseUrl: acct.baseUrl || null });
-        if (provider) return { provider, ownKey: true };
+        if (provider) {
+          return {
+            provider: meterProvider(provider, feature, { organizationId: id, ownKey: true }),
+            ownKey: true,
+          };
+        }
       }
     }
   }
-  return { provider: getAiProvider(), ownKey: false };
+  // Already metered by getAiProvider; the feature label is what it needs.
+  return { provider: getAiProvider(feature), ownKey: false };
 }
 
-/** Whether the current org draws AI from its own key (used to skip plan quota). */
-export async function orgUsesOwnAi(organizationId?: string): Promise<boolean> {
-  const id = organizationId ?? requestContext.get()?.organizationId ?? null;
-  if (!id) return false;
-  const org = await prismaUnscoped.organization.findUnique({ where: { id }, select: { settings: true } });
-  const acct = readAccount(org?.settings);
-  return Boolean(acct?.enabled && (acct.apiKeyEnc || acct.baseUrl));
-}
-
-/** Throwing resolver for metered AI features. */
-export async function resolveAi(): Promise<{ provider: AiProvider; ownKey: boolean }> {
-  const { provider, ownKey } = await resolveOrgAi();
+/** Resolver for AI a caller cannot proceed without. */
+export async function resolveAi(feature = 'assistant'): Promise<{ provider: AiProvider; ownKey: boolean }> {
+  const { provider, ownKey } = await resolveOrgAi(undefined, feature);
   if (!provider) {
-    throw new AppError('AI_DISABLED', 503, 'AI is not configured. Connect your own AI provider in Settings, or contact the administrator.');
+    throw new AppError(
+      'AI_DISABLED',
+      503,
+      'AI is not configured. Connect your own AI provider in Settings, or contact the administrator.'
+    );
   }
   return { provider, ownKey };
 }
 
 /** Non-throwing resolver for best-effort AI (summaries, insights). */
-export async function resolveAiOptional(): Promise<{ provider: AiProvider | null; ownKey: boolean }> {
-  return resolveOrgAi();
+export async function resolveAiOptional(feature = 'assistant'): Promise<{ provider: AiProvider | null; ownKey: boolean }> {
+  return resolveOrgAi(undefined, feature);
 }
+

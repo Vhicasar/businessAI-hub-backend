@@ -1,5 +1,6 @@
 import type { AiProvider } from '../../application/ai/ai-provider';
 import { env } from '../../shared/config/env';
+import { requestContext } from '../../shared/context';
 import { logger } from '../../shared/logger';
 import { AnthropicProvider } from './anthropic.provider';
 import { OpenAiCompatibleProvider } from './openai.provider';
@@ -10,6 +11,95 @@ export interface AiConfigSource {
   model: string;
   apiKey: string | null;
   baseUrl: string | null;
+}
+
+/**
+ * How a provider call gets recorded.
+ *
+ * Registered by the application layer at startup rather than imported, so
+ * infrastructure does not depend on application code. Metering lives here
+ * because this is the single point every AI call passes through — wrapping at
+ * the feature level meant the seven services calling `getAiProvider()` directly
+ * were never measured, and the next one added would not be either.
+ */
+export type AiUsageRecorder = (usage: {
+  organizationId: string;
+  provider: string;
+  model: string;
+  feature: string;
+  promptTokens?: number;
+  completionTokens?: number;
+  ownKey?: boolean;
+  failed?: boolean;
+}) => void;
+
+let recordUsage: AiUsageRecorder | null = null;
+
+export function setAiUsageRecorder(recorder: AiUsageRecorder | null): void {
+  recordUsage = recorder;
+}
+
+/**
+ * Wrap a provider so its calls are measured and attributed to the business
+ * that made them.
+ *
+ * Transparent: returns what the provider returned, rethrows what it threw, and
+ * silently does nothing when no recorder is registered or there is no tenant in
+ * context (a platform-level call belongs to nobody).
+ */
+export function meterProvider(
+  provider: AiProvider,
+  feature: string,
+  opts: { organizationId?: string; ownKey?: boolean } = {}
+): AiProvider {
+  /**
+   * Measuring must never be able to break what it measures — including in the
+   * failure branch, where a throwing recorder would replace the provider's real
+   * error with its own and hide why the call actually failed.
+   */
+  const safely = (fn: () => void) => {
+    try { fn(); } catch { /* a lost usage row is a reporting gap, not an outage */ }
+  };
+  return {
+    name: provider.name,
+    model: provider.model,
+    get lastUsage() {
+      return provider.lastUsage ?? null;
+    },
+    async complete(messages, completionOpts) {
+      const organizationId = opts.organizationId ?? requestContext.get()?.organizationId;
+      try {
+        const text = await provider.complete(messages, completionOpts);
+        if (recordUsage && organizationId) {
+          const usage = provider.lastUsage;
+          safely(() => recordUsage!({
+            organizationId,
+            provider: provider.name,
+            model: provider.model ?? 'unknown',
+            feature,
+            promptTokens: usage?.promptTokens ?? 0,
+            completionTokens: usage?.completionTokens ?? 0,
+            ownKey: opts.ownKey,
+          }));
+        }
+        return text;
+      } catch (err) {
+        // A failed call still consumed a provider request, and a spike in
+        // failures is something an operator needs to see.
+        if (recordUsage && organizationId) {
+          safely(() => recordUsage!({
+            organizationId,
+            provider: provider.name,
+            model: provider.model ?? 'unknown',
+            feature,
+            ownKey: opts.ownKey,
+            failed: true,
+          }));
+        }
+        throw err;
+      }
+    },
+  };
 }
 
 let provider: AiProvider | null | undefined;
@@ -54,8 +144,19 @@ function build(src: AiConfigSource): AiProvider | null {
   }
 }
 
-/** Returns the configured provider, or null when AI is disabled. */
-export function getAiProvider(): AiProvider | null {
+/**
+ * The configured provider, metered, or null when AI is disabled.
+ *
+ * `feature` names what is asking, which is what makes the admin's per-feature
+ * breakdown meaningful — without it every call reads as "other".
+ */
+export function getAiProvider(feature = 'other'): AiProvider | null {
+  const raw = rawProvider();
+  return raw ? meterProvider(raw, feature) : null;
+}
+
+/** The unwrapped provider — used by the status check and by the meter itself. */
+function rawProvider(): AiProvider | null {
   if (provider !== undefined) return provider;
   const src: AiConfigSource = override ?? {
     provider: env.AI_PROVIDER,
@@ -69,7 +170,7 @@ export function getAiProvider(): AiProvider | null {
 }
 
 export function aiEnabled(): boolean {
-  return getAiProvider() !== null;
+  return rawProvider() !== null;
 }
 
 /** What the app is actually running on — and whether it came from the admin. */

@@ -93,6 +93,14 @@ const envSchema = z
     /** Flutterwave webhook "Secret hash" (dashboard → Settings → Webhooks). */
     FLUTTERWAVE_SECRET_HASH: z.string().optional().or(z.literal('')),
     STRIPE_SECRET_KEY: z.string().optional().or(z.literal('')),
+    // OAuth apps for calendar integrations. Registered once by the platform;
+    // each business authorises its own account against them.
+    GOOGLE_OAUTH_CLIENT_ID: z.string().optional().or(z.literal('')),
+    GOOGLE_OAUTH_CLIENT_SECRET: z.string().optional().or(z.literal('')),
+    CALENDLY_OAUTH_CLIENT_ID: z.string().optional().or(z.literal('')),
+    CALENDLY_OAUTH_CLIENT_SECRET: z.string().optional().or(z.literal('')),
+    /** Where providers send the user back. Must match the app registration. */
+    OAUTH_REDIRECT_BASE_URL: z.string().optional().or(z.literal('')),
     STRIPE_PUBLIC_KEY: z.string().optional().or(z.literal('')),
     /** Stripe webhook signing secret (whsec_…), for signature verification. */
     STRIPE_WEBHOOK_SECRET: z.string().optional().or(z.literal('')),
@@ -207,6 +215,21 @@ export const env = {
       .filter(Boolean),
     /** Pull active provider + keys from the admin (needs the service key). */
     adminSync: raw.ADMIN_PAYMENT_SYNC && Boolean(raw.SERVICE_API_KEY),
+  },
+  oauth: {
+    /** Providers send the user here; the path is added per provider. */
+    redirectBase: (raw.OAUTH_REDIRECT_BASE_URL || raw.API_BASE_URL).replace(/\/+$/, ''),
+    google: {
+      clientId: raw.GOOGLE_OAUTH_CLIENT_ID || '',
+      clientSecret: raw.GOOGLE_OAUTH_CLIENT_SECRET || '',
+      /** Without an app registered, the connect button must say so honestly. */
+      configured: Boolean(raw.GOOGLE_OAUTH_CLIENT_ID && raw.GOOGLE_OAUTH_CLIENT_SECRET),
+    },
+    calendly: {
+      clientId: raw.CALENDLY_OAUTH_CLIENT_ID || '',
+      clientSecret: raw.CALENDLY_OAUTH_CLIENT_SECRET || '',
+      configured: Boolean(raw.CALENDLY_OAUTH_CLIENT_ID && raw.CALENDLY_OAUTH_CLIENT_SECRET),
+    },
   },
   fx: {
     providerUrl: raw.FX_PROVIDER_URL.replace(/\/+$/, ''),

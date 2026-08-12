@@ -6,6 +6,7 @@ import { connectDatabase, disconnectDatabase } from './infrastructure/database/p
 import { getRedis, QUEUE_NAMES } from './infrastructure/queue/queue';
 import { workflowService, type Payload, type Target, type Trigger } from './application/crm/workflow.service';
 import { campaignService } from './application/messaging/campaign.service';
+import { installAiMetering } from './application/ai/ai-usage.service';
 
 /**
  * Async job worker. Runs as a separate process from the API. Each job carries
@@ -33,6 +34,7 @@ async function bootstrap(): Promise<void> {
     process.exit(1);
   }
   await connectDatabase();
+  installAiMetering(); // jobs run in their own process and make AI calls too
 
   const workflowWorker = new Worker(
     QUEUE_NAMES.workflow,

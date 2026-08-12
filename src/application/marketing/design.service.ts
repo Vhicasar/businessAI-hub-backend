@@ -102,7 +102,7 @@ export const designService = {
 
   /** Generate a poster layout (headline, subheading, CTA + colors) from a brief. */
   async aiGenerate(id: string, prompt: string) {
-    const provider = getAiProvider();
+    const provider = getAiProvider('design');
     const design = await this.get(id);
     if (!provider) throw new ValidationError('AI is not configured for this workspace');
     const raw = await provider.complete(

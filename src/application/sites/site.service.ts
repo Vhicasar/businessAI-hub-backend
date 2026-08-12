@@ -298,7 +298,7 @@ export const siteService = {
   /** Generate homepage blocks from a business description using the AI engine. */
   async aiGenerate(prompt: string) {
     const site = await this.ensureSite();
-    const provider = getAiProvider();
+    const provider = getAiProvider('website');
     const home = site.pages.find((p) => p.slug === '') ?? site.pages[0];
     if (!provider || !home) return { generated: false };
 

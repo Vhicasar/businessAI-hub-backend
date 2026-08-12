@@ -1,6 +1,7 @@
 import { Router, type Request, type RequestHandler, type Response } from 'express';
 import { authenticate, requireTenant } from '../middleware/authenticate';
 import { requirePermission } from '../middleware/require-permission';
+import { requireFeature } from '../middleware/plan-guard';
 import { prisma } from '../../../infrastructure/database/prisma';
 import { analyticsService } from '../../../application/analytics/analytics.service';
 import { productIntelligenceService } from '../../../application/analytics/product-intelligence.service';
@@ -43,6 +44,9 @@ analyticsRoutes.get(
 analyticsRoutes.get(
   '/ai-insights',
   requirePermission('analytics.view', 'dashboard.view'),
+  // Not on the free plan. Enforced here as well as hidden in the menu — the
+  // endpoint is callable directly, and it is expensive to serve.
+  requireFeature('ai_insights'),
   wrap(async (req, res) => {
     res.json({ success: true, data: await aiInsightsService.dashboard(resolveDateRange(req.query)) });
   })

@@ -9,7 +9,9 @@ import {
 } from './infrastructure/channels/email.poller';
 import { startPlanSync } from './application/billing/plan-sync';
 import { startAiConfigSync } from './application/ai/ai-sync';
+import { installAiMetering } from './application/ai/ai-usage.service';
 import { startPaymentConfigSync } from './application/billing/payment-config-sync';
+import { startOAuthConfigSync } from './application/integrations/oauth-config-sync';
 import { startEmailRetrySweep } from './application/auth/email-retry.service';
 import { startWorkspaceConfigSync } from './application/settings/workspace-config-sync';
 import { startAppointmentReminderSweep } from './application/appointments/appointments.service';
@@ -32,9 +34,11 @@ import { createApp } from './app';
 async function bootstrap(): Promise<void> {
   await connectDatabase();
   await reconcileSystemRolePermissions(); // grant newly-added permissions to existing system roles
+  installAiMetering(); // measure every provider call, whichever feature makes it
   await startAiConfigSync(); // establish the admin-managed provider before serving AI traffic
   await startPaymentConfigSync(); // resolve the active payment gateway before serving checkouts
   await startWorkspaceConfigSync(); // pull admin-managed feature flags / comms / storage config
+  await startOAuthConfigSync(); // pull the admin-managed Google/Calendly OAuth apps
 
   const app = createApp();
   const httpServer = createServer(app);

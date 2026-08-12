@@ -235,7 +235,7 @@ export const productIntelligenceService = {
     const dash = await this.productDashboard(productId, range);
     const heuristics = heuristicInsights(dash);
 
-    const provider = getAiProvider();
+    const provider = getAiProvider('product-intelligence');
     if (!provider) return { source: 'heuristic' as const, ...heuristics };
 
     try {

@@ -147,4 +147,6 @@ export const TENANT_MODELS: ReadonlySet<string> = new Set([
   'SettlementAccountChange',
   'SettlementRule',
   'AiReplySuggestion',
+  'AiUsageEvent',
+  'AiCreditGrant',
 ]);

@@ -4,7 +4,9 @@ import { prisma, prismaUnscoped } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { env } from '../../shared/config/env';
 import { logger } from '../../shared/logger';
+import { messagingService } from '../messaging/messaging.service';
 import { NotFoundError, ValidationError } from '../../shared/errors';
+import { calendarSync } from '../integrations/calendar-sync.service';
 import { activityService } from '../crm/activity.service';
 import { workflowService } from '../crm/workflow.service';
 import { mailer } from '../../infrastructure/mail/mailer';
@@ -151,13 +153,36 @@ async function computeSlots(organizationId: string, cfg: AppointmentConfig, type
 // ── customer matching ───────────────────────────────────────────────────────
 
 async function matchOrCreateCustomer(input: { email?: string; name?: string; phone?: string; visitorId?: string }): Promise<string> {
+  // Any channel, not just the website widget. A customer booking over WhatsApp
+  // arrives with their WhatsApp id, and looking only at WEB_CHAT meant they
+  // were treated as a stranger and a duplicate record was created every time.
   if (input.visitorId) {
-    const identity = await prisma.customerIdentity.findFirst({ where: { channelType: 'WEB_CHAT', externalId: input.visitorId }, select: { customerId: true } });
+    const identity = await prisma.customerIdentity.findFirst({
+      where: { externalId: input.visitorId },
+      select: { customerId: true },
+    });
     if (identity) return identity.customerId;
   }
   if (input.email) {
     const existing = await prisma.customer.findFirst({ where: { email: input.email, deletedAt: null }, select: { id: true } });
     if (existing) return existing.id;
+  }
+  // Phone is the identifier most messaging channels actually carry, and for a
+  // WhatsApp or SMS booking it is often the only one.
+  if (input.phone) {
+    const digits = input.phone.replace(/\D/g, '');
+    if (digits.length >= 7) {
+      const byPhone = await prisma.customer.findFirst({
+        where: { phone: { endsWith: digits.slice(-9) }, deletedAt: null },
+        select: { id: true },
+      });
+      if (byPhone) return byPhone.id;
+      const byIdentity = await prisma.customerIdentity.findFirst({
+        where: { externalId: { endsWith: digits.slice(-9) } },
+        select: { customerId: true },
+      });
+      if (byIdentity) return byIdentity.customerId;
+    }
   }
   const [firstName, ...rest] = (input.name ?? 'Guest').trim().split(/\s+/);
   const created = await prisma.customer.create({
@@ -290,6 +315,10 @@ export const appointmentsService = {
       select: { id: true, title: true, description: true, location: true, startAt: true, endAt: true, bookingToken: true },
     });
 
+    // Mirror onto the business's own calendar where they've connected one.
+    // Fire-and-forget: a booking must not fail because Google is slow or down.
+    void calendarSync.pushToGoogle(meeting.id);
+
     // Real-estate: also create a property viewing linked to the agent (#12).
     if (dto.propertyId) {
       await prisma.propertyBooking
@@ -313,7 +342,7 @@ export const appointmentsService = {
       also: dto.propertyId ? [{ entityType: 'CUSTOMER', entityId: customerId }] : undefined,
     });
 
-    void this.sendConfirmation(meeting, dto.email, cfg.timezone).catch(() => undefined);
+    void this.sendConfirmation(meeting, dto.email, cfg.timezone, customerId).catch(() => undefined);
 
     await workflowService.dispatch(
       'appointment.booked',
@@ -340,12 +369,20 @@ export const appointmentsService = {
     return buildIcs({ id: m.id, title: m.title, description: m.description, location: m.location, start: m.startAt, end: m.endAt });
   },
 
+  /**
+   * Confirm the booking wherever the customer can actually be reached.
+   *
+   * Email only was the real reason booking "worked on the website" and nowhere
+   * else: someone who booked over WhatsApp or SMS, and never gave an email
+   * address, was told nothing at all. Their messaging channel is tried first,
+   * because that is the conversation they are already in.
+   */
   async sendConfirmation(
     meeting: { id: string; title: string; description: string | null; location: string | null; startAt: Date; endAt: Date; bookingToken: string | null },
     email: string | undefined,
     timezone: string,
+    customerId?: string,
   ) {
-    if (!email) return;
     const links = calendarLinks({ title: meeting.title, description: meeting.description, location: meeting.location, start: meeting.startAt, end: meeting.endAt });
     const when = new Intl.DateTimeFormat('en-US', { timeZone: timezone, dateStyle: 'full', timeStyle: 'short' }).format(meeting.startAt);
     const manageUrl = `${env.WEB_APP_URL.replace(/\/+$/, '')}/appointments/${meeting.bookingToken}`;
@@ -354,8 +391,40 @@ export const appointmentsService = {
       (meeting.location ? `<p>Location: ${meeting.location}</p>` : '') +
       `<p><a href="${links.google}">Add to Google Calendar</a> · <a href="${links.outlook}">Add to Outlook</a></p>` +
       `<p style="font-size:12px;color:#6b778c">Need to change it? <a href="${manageUrl}">Manage your appointment</a>.</p>`;
-    const text = `Appointment confirmed for ${when} (${timezone}). Add to calendar: ${links.google}`;
-    await mailer.sendNotice(email, `Appointment confirmed — ${when}`, meeting.title, bodyHtml, text);
+    const text =
+      `Appointment confirmed for ${when} (${timezone}).` +
+      (meeting.location ? `\nLocation: ${meeting.location}` : '') +
+      `\nManage it here: ${manageUrl}`;
+
+    // Whichever channels this customer is reachable on. Each is independent —
+    // a customer with no WhatsApp still gets the email, and vice versa.
+    if (customerId) {
+      const identities = await prisma.customerIdentity.findMany({
+        where: { customerId },
+        select: { channelType: true },
+      });
+      const channels = [...new Set(identities.map((i) => i.channelType))].filter(
+        (c) => c !== 'EMAIL',
+      );
+      for (const channel of channels) {
+        await messagingService
+          .sendToCustomer(customerId, channel, text, { subject: `Appointment confirmed — ${when}` })
+          .catch((err) =>
+            logger.warn(
+              { err: (err as Error).message, channel, meetingId: meeting.id },
+              'appointment confirmation channel failed',
+            ),
+          );
+      }
+    }
+
+    if (email) {
+      await mailer
+        .sendNotice(email, `Appointment confirmed — ${when}`, meeting.title, bodyHtml, text)
+        .catch((err) =>
+          logger.warn({ err: (err as Error).message, meetingId: meeting.id }, 'appointment email failed'),
+        );
+    }
   },
 
   // ── authed management ─────────────────────────────────────────────────────
@@ -371,10 +440,135 @@ export const appointmentsService = {
     });
   },
 
+  /**
+   * Bookings in a date range, with the names behind the ids.
+   *
+   * The calendar shows people and places, not foreign keys: resolving customer,
+   * assigned staff, appointment type and property here means the client renders
+   * one payload instead of fanning out a request per booking.
+   */
+  async calendar(dto: { from?: string; to?: string; status?: string; assigneeId?: string }) {
+    const from = dto.from ? new Date(dto.from) : new Date();
+    const to = dto.to ? new Date(dto.to) : new Date(Date.now() + 30 * DAY_MS);
+
+    const meetings = await prisma.meeting.findMany({
+      // Overlap, not containment: a booking that starts before the window and
+      // runs into it still belongs on the day the user is looking at.
+      where: {
+        deletedAt: null,
+        startAt: { lt: to },
+        endAt: { gt: from },
+        ...(dto.status ? { status: dto.status } : {}),
+        ...(dto.assigneeId ? { organizerId: dto.assigneeId } : {}),
+      },
+      orderBy: { startAt: 'asc' },
+      take: 500,
+      select: {
+        id: true, title: true, description: true, startAt: true, endAt: true, status: true,
+        location: true, meetingUrl: true, customerId: true, typeId: true, source: true,
+        organizerId: true, entityType: true, entityId: true, bookingToken: true,
+        externalProvider: true, externalUrl: true, externalSyncedAt: true,
+      },
+    });
+    if (meetings.length === 0) return [];
+
+    const config = await this.getConfig().catch(() => null);
+    const typeById = new Map(
+      (config?.types ?? []).map((type: { id: string; name: string }) => [type.id, type.name]),
+    );
+
+    const customerIds = [...new Set(meetings.map((m) => m.customerId).filter((v): v is string => Boolean(v)))];
+    const organizerIds = [...new Set(meetings.map((m) => m.organizerId).filter((v): v is string => Boolean(v)))];
+    const propertyIds = [...new Set(
+      meetings.filter((m) => m.entityType === 'PROPERTY').map((m) => m.entityId).filter((v): v is string => Boolean(v)),
+    )];
+
+    const [customers, organizers, properties] = await Promise.all([
+      customerIds.length
+        ? prisma.customer.findMany({
+            where: { id: { in: customerIds } },
+            select: { id: true, firstName: true, lastName: true, displayName: true, email: true, phone: true },
+          })
+        : [],
+      organizerIds.length
+        ? prisma.membership.findMany({
+            where: { id: { in: organizerIds } },
+            select: { id: true, jobTitle: true, user: { select: { firstName: true, lastName: true, email: true } } },
+          })
+        : [],
+      propertyIds.length
+        ? prisma.property.findMany({
+            where: { id: { in: propertyIds } },
+            select: { id: true, title: true, reference: true },
+          })
+        : [],
+    ]);
+
+    const customerById = new Map(customers.map((c) => [c.id, c]));
+    const organizerById = new Map(organizers.map((o) => [o.id, o]));
+    const propertyById = new Map(properties.map((p) => [p.id, p]));
+
+    return meetings.map((m) => {
+      const customer = m.customerId ? customerById.get(m.customerId) : null;
+      const organizer = m.organizerId ? organizerById.get(m.organizerId) : null;
+      const property = m.entityType === 'PROPERTY' && m.entityId ? propertyById.get(m.entityId) : null;
+      return {
+        id: m.id,
+        title: m.title,
+        description: m.description,
+        startAt: m.startAt,
+        endAt: m.endAt,
+        status: m.status,
+        location: m.location,
+        meetingUrl: m.meetingUrl,
+        source: m.source,
+        service: m.typeId ? typeById.get(m.typeId) ?? null : null,
+        customer: customer
+          ? {
+              id: customer.id,
+              name: customer.displayName || [customer.firstName, customer.lastName].filter(Boolean).join(' '),
+              email: customer.email,
+              phone: customer.phone,
+            }
+          : null,
+        assignee: organizer
+          ? {
+              id: organizer.id,
+              name: [organizer.user.firstName, organizer.user.lastName].filter(Boolean).join(' ') || organizer.user.email,
+              email: organizer.user.email,
+              jobTitle: organizer.jobTitle,
+            }
+          : null,
+        property: property ? { id: property.id, title: property.title, reference: property.reference } : null,
+        externalProvider: m.externalProvider,
+        externalUrl: m.externalUrl,
+        externalSyncedAt: m.externalSyncedAt,
+      };
+    });
+  },
+
+  /** One booking, in the same shape the calendar uses. */
+  async detail(id: string) {
+    const meeting = await prisma.meeting.findFirst({ where: { id, deletedAt: null }, select: { startAt: true, endAt: true } });
+    if (!meeting) throw new NotFoundError('Appointment');
+    // Reuse the enrichment rather than duplicating it; the window is the
+    // booking itself, so exactly one row comes back.
+    const rows = await this.calendar({
+      from: new Date(meeting.startAt.getTime() - 1000).toISOString(),
+      to: new Date(meeting.endAt.getTime() + 1000).toISOString(),
+    });
+    const found = rows.find((row) => row.id === id);
+    if (!found) throw new NotFoundError('Appointment');
+    return found;
+  },
+
   async cancel(id: string) {
     const meeting = await prisma.meeting.findFirst({ where: { id, deletedAt: null } });
     if (!meeting) throw new NotFoundError('Appointment');
     const updated = await prisma.meeting.update({ where: { id }, data: { status: 'CANCELLED' } });
+    // A cancelled booking that stays "confirmed" on the business's calendar is
+    // worse than no sync at all — they would keep the slot blocked.
+    void calendarSync.pushToGoogle(id);
     await activityService.record({
       type: 'STATUS_CHANGE',
       entityType: (meeting.entityType ?? 'CUSTOMER') as 'CUSTOMER' | 'PROPERTY',
@@ -389,6 +583,7 @@ export const appointmentsService = {
     const meeting = await prismaUnscoped.meeting.findUnique({ where: { bookingToken: token } });
     if (!meeting || meeting.deletedAt) throw new NotFoundError('Appointment');
     await prismaUnscoped.meeting.update({ where: { id: meeting.id }, data: { status: 'CANCELLED' } });
+    void calendarSync.pushToGoogle(meeting.id);
     return { id: meeting.id, status: 'CANCELLED' };
   },
 

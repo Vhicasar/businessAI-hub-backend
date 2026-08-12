@@ -31,7 +31,7 @@ async function summarizeClose(
   context: { title: string; outcome: string; reason: string; description?: string; internalNotes?: string; outcomeSummary: string },
 ): Promise<string> {
   const fallback = context.outcomeSummary;
-  const provider = getAiProvider();
+  const provider = getAiProvider('crm');
   if (!provider) return fallback;
   try {
     const summary = (

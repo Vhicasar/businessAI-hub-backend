@@ -113,7 +113,7 @@ export const aiInsightsService = {
   async dashboard(range: DateRange) {
     const snapshot = await this.snapshot(range);
     const heuristics = heuristicNarrative(snapshot);
-    const provider = getAiProvider();
+    const provider = getAiProvider('insights');
 
     let narrative = { source: 'heuristic' as 'heuristic' | 'ai', ...heuristics };
     if (provider) {

@@ -3,11 +3,16 @@ import { AppError } from '../../shared/errors';
 
 /** Anthropic Messages API via fetch — no SDK dependency. */
 export class AnthropicProvider implements AiProvider {
+  private usage: { promptTokens: number; completionTokens: number } | null = null;
+  get lastUsage() {
+    return this.usage;
+  }
+
   readonly name = 'anthropic';
 
   constructor(
     private readonly apiKey: string,
-    private readonly model: string
+    readonly model: string
   ) {}
 
   async complete(messages: AiMessage[], opts: AiCompletionOptions = {}): Promise<string> {
@@ -37,8 +42,15 @@ export class AnthropicProvider implements AiProvider {
 
     const json = (await res.json()) as {
       content?: { type: string; text?: string }[];
+      usage?: { input_tokens?: number; output_tokens?: number };
       error?: { message?: string };
     };
+    this.usage = json.usage
+      ? {
+          promptTokens: json.usage.input_tokens ?? 0,
+          completionTokens: json.usage.output_tokens ?? 0,
+        }
+      : null;
     if (!res.ok) {
       throw new AppError('AI_PROVIDER_ERROR', 502, `Anthropic: ${json.error?.message ?? res.status}`);
     }

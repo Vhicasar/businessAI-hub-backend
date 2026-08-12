@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { authenticate, requireTenant } from '../middleware/authenticate';
 import { requirePermission } from '../middleware/require-permission';
 import { validate } from '../middleware/validate';
+import { requireFeature } from '../middleware/plan-guard';
 import { apiKeysService, API_SCOPES } from '../../../application/api-keys/api-keys.service';
 import { webhooksService, WEBHOOK_EVENTS } from '../../../application/api-keys/webhooks.service';
 import { webhookDelivery } from '../../../application/api-keys/webhook-delivery.service';
@@ -15,7 +16,10 @@ const wrap =
 
 /** Developer portal management API (session-authenticated). */
 export const developerRoutes = Router();
-developerRoutes.use(authenticate, requireTenant);
+// API keys and webhooks are a paid capability, so the whole module is gated
+// here rather than per route: hiding the menu item is presentation, not
+// access control, and the endpoints are reachable without the UI.
+developerRoutes.use(authenticate, requireTenant, requireFeature('api'));
 
 /** The scopes and webhook events available, for building the portal UI. */
 developerRoutes.get(

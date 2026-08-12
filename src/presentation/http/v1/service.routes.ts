@@ -813,3 +813,96 @@ serviceRoutes.get(
     res.json({ success: true, data: rows });
   })
 );
+
+// ---- AI usage, credit and balance ----
+
+/**
+ * Platform-wide AI consumption.
+ *
+ * The plan quota only ever counted *responses*, which says nothing about cost:
+ * a one-line reply and a long summary counted the same. This reports tokens,
+ * and breaks them down by provider, by feature and by business, so an operator
+ * can see where the spend actually goes.
+ */
+serviceRoutes.get(
+  '/ai/usage',
+  validate({ query: z.object({ days: z.coerce.number().int().min(1).max(365).default(30) }) }),
+  wrap(async (req, res) => {
+    const { aiUsageService } = await import('../../../application/ai/ai-usage.service');
+    const days = Number((req.query as { days?: number }).days ?? 30);
+    res.json({ success: true, data: await aiUsageService.platformSummary(days) });
+  })
+);
+
+/** Where one organisation stands: allowance, grants, consumption, remaining. */
+serviceRoutes.get(
+  '/ai/usage/:organizationId',
+  wrap(async (req, res) => {
+    const { aiUsageService } = await import('../../../application/ai/ai-usage.service');
+    const organizationId = req.params.organizationId as string;
+    const [balance, grants, recent] = await Promise.all([
+      aiUsageService.balance(organizationId),
+      aiUsageService.grantsFor(organizationId),
+      prismaUnscoped.aiUsageEvent.findMany({
+        where: { organizationId },
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+        select: {
+          id: true, provider: true, model: true, feature: true,
+          promptTokens: true, completionTokens: true, totalTokens: true,
+          credits: true, ownKey: true, failed: true, createdAt: true,
+        },
+      }),
+    ]);
+    res.json({ success: true, data: { balance, grants, recent } });
+  })
+);
+
+/**
+ * Adjust an organisation's AI credit.
+ *
+ * Recorded as a grant rather than by overwriting a number: "why does this
+ * business have five thousand extra credits?" is a question that gets asked,
+ * and a single figure cannot answer it. A negative value claws credit back.
+ */
+serviceRoutes.post(
+  '/ai/usage/:organizationId/grant',
+  validate({
+    body: z.object({
+      credits: z.number().int().refine((n) => n !== 0, 'A grant of zero changes nothing'),
+      reason: z.string().trim().min(3).max(300),
+      expiresAt: z.string().datetime().optional(),
+      grantedById: z.string().trim().max(60).optional(),
+    }),
+  }),
+  wrap(async (req, res) => {
+    const { aiUsageService } = await import('../../../application/ai/ai-usage.service');
+    const body = req.body as {
+      credits: number; reason: string; expiresAt?: string; grantedById?: string;
+    };
+    const organizationId = req.params.organizationId as string;
+
+    const org = await prismaUnscoped.organization.findUnique({
+      where: { id: organizationId },
+      select: { id: true },
+    });
+    if (!org) throw new NotFoundError('Organization');
+
+    await aiUsageService.grant({
+      organizationId,
+      credits: body.credits,
+      reason: body.reason,
+      grantedById: body.grantedById ?? null,
+      expiresAt: body.expiresAt ? new Date(body.expiresAt) : null,
+    });
+
+    res.status(201).json({
+      success: true,
+      message:
+        body.credits > 0
+          ? `Granted ${body.credits} AI credits.`
+          : `Removed ${Math.abs(body.credits)} AI credits.`,
+      data: await aiUsageService.balance(organizationId),
+    });
+  })
+);

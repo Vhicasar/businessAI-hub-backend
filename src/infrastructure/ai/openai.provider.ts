@@ -16,14 +16,21 @@ interface SendResult {
   status: number;
   content: string;
   errorMessage?: string;
+  usage?: { promptTokens: number; completionTokens: number } | null;
 }
 
 export class OpenAiCompatibleProvider implements AiProvider {
   readonly name = 'openai';
 
+  private usage: { promptTokens: number; completionTokens: number } | null = null;
+  get lastUsage() {
+    return this.usage;
+  }
+
+
   constructor(
     private readonly apiKey: string,
-    private readonly model: string,
+    readonly model: string,
     baseUrl?: string
   ) {
     this.baseUrl = (baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '');
@@ -46,6 +53,7 @@ export class OpenAiCompatibleProvider implements AiProvider {
       result = await this.send({ ...base, max_completion_tokens: maxTokens });
     }
 
+    this.usage = result.usage ?? null;
     if (!result.ok) {
       throw new AppError('AI_PROVIDER_ERROR', 502, `AI provider: ${result.errorMessage ?? result.status}`);
     }
@@ -63,6 +71,7 @@ export class OpenAiCompatibleProvider implements AiProvider {
     });
     const json = (await res.json()) as {
       choices?: { message?: { content?: string } }[];
+      usage?: { prompt_tokens?: number; completion_tokens?: number };
       error?: { message?: string };
     };
     return {
@@ -70,6 +79,12 @@ export class OpenAiCompatibleProvider implements AiProvider {
       status: res.status,
       content: json.choices?.[0]?.message?.content ?? '',
       errorMessage: json.error?.message,
+      usage: json.usage
+        ? {
+            promptTokens: json.usage.prompt_tokens ?? 0,
+            completionTokens: json.usage.completion_tokens ?? 0,
+          }
+        : null,
     };
   }
 }

@@ -824,15 +824,24 @@ export const vhicasarPayService = {
       priority?: ('AVAILABLE' | 'LOCKED' | 'REWARD' | 'CASHBACK')[];
     }
   ) {
-    const { paymentLinksService } = await import('./payment-links.service');
     const { walletBuckets } = await import('./wallet-buckets.service');
+    const { paymentIntentService } = await import('./payment-intent.service');
 
-    const link = await prismaUnscoped.paymentLink.findUnique({ where: { token } });
-    if (!link) throw new NotFoundError('Payment link');
-    if (link.status === 'PAID') throw new AppError('LINK_ALREADY_PAID', 409, 'This payment has already been made.');
-    if (link.status === 'CANCELLED') throw new AppError('LINK_CANCELLED', 409, 'This payment link was cancelled.');
-    if (link.expiresAt && link.expiresAt.getTime() < Date.now()) {
-      throw new AppError('LINK_EXPIRED', 409, 'This payment link has expired.');
+    // A Payment Intent, whatever produced the code: a QR printed on a bill, a
+    // link shared in chat, or an old payment link carried over by the
+    // migration keeping its token. Looking in the old table meant anything
+    // issued after the move scanned to "payment not found".
+    const link = await prismaUnscoped.paymentIntent.findUnique({ where: { token } });
+    if (!link) throw new NotFoundError('Payment');
+    if (link.status === 'PAID' || link.status === 'OVERPAID') {
+      throw new AppError('LINK_ALREADY_PAID', 409, 'This payment has already been made.');
+    }
+    if (link.status === 'CANCELLED') {
+      throw new AppError('LINK_CANCELLED', 409, 'This payment request was cancelled.');
+    }
+    if (link.status === 'EXPIRED' ||
+        (link.expiresAt && link.expiresAt.getTime() < Date.now())) {
+      throw new AppError('LINK_EXPIRED', 409, 'This payment request has expired.');
     }
     // Enforced at payment time as well as at issue time: a printed code can be
     // scanned long after it was made, and a business suspended in between must
@@ -876,9 +885,12 @@ export const vhicasarPayService = {
       amount: outstanding,
       organizationId: link.organizationId,
       initiatorVhicasarId: vhicasarId,
-      description: link.description ?? 'Payment link',
-      reference: link.token,
-      idempotencyKey: `paylink:${link.id}`,
+      description: link.description ?? 'Payment',
+      // The customer-facing reference, which is what they see on a receipt
+      // and quote to support. An intent always has one; the token is only
+      // the access credential and is nullable.
+      reference: link.reference,
+      idempotencyKey: `payintent:${link.id}`,
       legs: [
         ...plan.map((p) => ({
           walletId: customerWallet.id,
@@ -890,9 +902,25 @@ export const vhicasarPayService = {
       ],
     });
 
-    // Settle the link through its own service so orders/invoices react exactly
-    // as they would for a gateway payment.
-    await paymentLinksService.settleFromWallet(link.id, outstanding, txn.id, vhicasarId);
+    // Booked as a transaction against the intent, then fanned out — the same
+    // two calls a gateway webhook makes. The wallet is just another way the
+    // money arrived; everything downstream must not be able to tell.
+    const applied = await paymentIntentService.applyTransaction({
+      organizationId: link.organizationId,
+      paymentIntentId: link.id,
+      provider: 'vhicasar-wallet',
+      // The ledger transaction is the trusted reference, and it is unique, so
+      // a retried request books once.
+      providerRef: txn.id,
+      method: 'WALLET',
+      amount: Number(outstanding.toFixed(2)),
+      currency: link.currency,
+      status: 'SUCCESS',
+    });
+    if (applied.applied) {
+      const { settlePaymentIntent } = await import('./payment-settlement.service');
+      await settlePaymentIntent(link.id, { becamePaid: applied.becamePaid });
+    }
 
     const fresh = await walletBuckets.breakdown(vhicasarId, link.currency);
     return {
