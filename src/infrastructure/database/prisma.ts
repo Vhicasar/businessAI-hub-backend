@@ -40,7 +40,26 @@ export const prisma = base.$extends({
   name: 'tenantScope',
   query: {
     $allModels: {
-      async $allOperations({ model, operation, args, query }) {
+      /**
+       * Parameters are annotated rather than inferred.
+       *
+       * Letting TypeScript infer them makes it build a union over every model
+       * × every operation, which crossed its complexity limit (TS2590) as the
+       * schema grew — failing the build for reasons unrelated to whatever
+       * change happened to add the next model. The runtime contract is exactly
+       * this: a model name, an operation name, the args, and a continuation.
+       */
+      async $allOperations({
+        model,
+        operation,
+        args,
+        query,
+      }: {
+        model?: string;
+        operation: string;
+        args: unknown;
+        query: (args: unknown) => Promise<unknown>;
+      }) {
         if (!model || !TENANT_MODELS.has(model)) return query(args);
         const orgId = currentOrgId();
         if (!orgId) return query(args);

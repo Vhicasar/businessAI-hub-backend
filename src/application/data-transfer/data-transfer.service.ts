@@ -419,7 +419,10 @@ function importerFor(entity: Entity, ctx: Ctx): RowImporter {
           firstName: first, lastName: last ?? null, email: email ?? null, phone: phone ?? null,
           source: val(row, 'source') ?? 'IMPORT',
           estimatedValue: num(val(row, 'estimatedValue')),
-        } as never);
+        } as never,
+        // A spreadsheet row that matches an existing lead updates it rather
+        // than duplicating, but must not fire an owner notification per row.
+        { onDuplicate: 'reengage', notifyOnReengage: false });
 
         // Apply the fields createLead doesn't take, preserving what the source had.
         const statusRaw = (val(row, 'status') ?? '').toUpperCase().replace(/[\s-]/g, '_');

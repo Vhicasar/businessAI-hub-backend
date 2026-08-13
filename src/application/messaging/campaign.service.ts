@@ -10,6 +10,7 @@ import { resolveEntitlements } from '../billing/entitlements';
 import { usageService } from '../billing/usage.service';
 import { USAGE_METRICS } from '../billing/usage.service';
 import { AppError } from '../../shared/errors';
+import { pickChannelFor } from '../inbox/channel-allowance.service';
 import { smsWalletService } from '../billing/sms-wallet.service';
 
 function orgId(): string {
@@ -121,10 +122,10 @@ export const campaignService = {
     const channel = channelFor(type);
     const [customers, account] = await Promise.all([
       this.reachableCustomers(channel),
-      prisma.channelAccount.findFirst({
-        where: { channelType: channel, isActive: true, deletedAt: null },
-        select: { id: true, name: true },
-      }),
+      // A marketing blast should go out of the channel the business set aside
+      // for marketing, not whichever instance happens to be oldest — the
+      // support inbox answering a campaign reply is not what anyone wants.
+      pickChannelFor({ purpose: 'MARKETING', channelTypes: [channel] }).then((p) => p.recommended),
     ]);
     const ent = await resolveEntitlements(orgId());
     const plan = await prisma.plan.findUnique({ where: { id: ent.planId }, select: { maxMarketingReach: true } });
@@ -189,10 +190,10 @@ export const campaignService = {
     const [customers, ent, account] = await Promise.all([
       this.reachableCustomers(channel, selectedIds),
       resolveEntitlements(orgId()),
-      prisma.channelAccount.findFirst({
-        where: { channelType: channel, isActive: true, deletedAt: null },
-        select: { id: true, name: true },
-      }),
+      // A marketing blast should go out of the channel the business set aside
+      // for marketing, not whichever instance happens to be oldest — the
+      // support inbox answering a campaign reply is not what anyone wants.
+      pickChannelFor({ purpose: 'MARKETING', channelTypes: [channel] }).then((p) => p.recommended),
     ]);
     if (!account) {
       throw new AppError(

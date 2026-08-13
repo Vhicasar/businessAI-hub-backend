@@ -17,7 +17,7 @@ type ActivityType = 'CALL' | 'EMAIL' | 'MEETING' | 'TASK' | 'NOTE' | 'SMS' | 'WH
 type EntityType =
   | 'CUSTOMER' | 'LEAD' | 'DEAL' | 'COMPANY' | 'ORDER' | 'PRODUCT' | 'INVOICE' | 'TICKET'
   | 'PROPERTY' | 'CONVERSATION' | 'QUOTATION' | 'CONTRACT' | 'EMPLOYEE' | 'PURCHASE_ORDER'
-  | 'LEASE' | 'MAINTENANCE_REQUEST' | 'CAMPAIGN' | 'MEETING';
+  | 'LEASE' | 'MAINTENANCE_REQUEST' | 'CAMPAIGN' | 'MEETING' | 'CHANNEL';
 
 export interface RecordActivityInput {
   type: ActivityType;

@@ -9,7 +9,9 @@ import { NotFoundError, ValidationError } from '../../shared/errors';
 import { calendarSync } from '../integrations/calendar-sync.service';
 import { activityService } from '../crm/activity.service';
 import { workflowService } from '../crm/workflow.service';
-import { mailer } from '../../infrastructure/mail/mailer';
+import { pickChannelFor } from '../inbox/channel-allowance.service';
+import { sendEmailViaChannel } from '../messaging/channel-email.service';
+import { CONNECT_CHANNEL_HINT } from '../messaging/sender-policy';
 
 /**
  * Appointment booking (spec #12). Backed by the Meeting model. Availability is
@@ -419,11 +421,32 @@ export const appointmentsService = {
     }
 
     if (email) {
-      await mailer
-        .sendNotice(email, `Appointment confirmed — ${when}`, meeting.title, bodyHtml, text)
-        .catch((err) =>
-          logger.warn({ err: (err as Error).message, meetingId: meeting.id }, 'appointment email failed'),
+      /*
+       * From the business's own mailbox, not ours.
+       *
+       * A confirmation is the business speaking to its customer, so it goes out
+       * of a channel the business connected (see `sender-policy`). With none
+       * connected it is not sent from Vhicasar instead — that would put an
+       * unfamiliar address in front of the customer — and the failure is logged
+       * loudly rather than passing as a success.
+       */
+      const { recommended } = await pickChannelFor({ purpose: 'ORDERS', channelTypes: ['EMAIL'] });
+      if (recommended) {
+        const outcome = await sendEmailViaChannel(recommended.id, {
+          to: email,
+          subject: `Appointment confirmed — ${when}`,
+          html: bodyHtml,
+          text,
+        });
+        if (!outcome.ok) {
+          logger.warn({ meetingId: meeting.id, error: outcome.error }, 'appointment confirmation not sent');
+        }
+      } else {
+        logger.warn(
+          { meetingId: meeting.id },
+          `Appointment confirmed but no email channel is connected to send it from. ${CONNECT_CHANNEL_HINT}`,
         );
+      }
     }
   },
 
@@ -605,10 +628,26 @@ export const appointmentsService = {
       if (attendee?.email) {
         const cfg = await readConfig(m.organizationId);
         const when = new Intl.DateTimeFormat('en-US', { timeZone: cfg.timezone, dateStyle: 'medium', timeStyle: 'short' }).format(m.startAt);
-        await mailer
-          .sendNotice(attendee.email, `Reminder: ${m.title}`, m.title, `<p>This is a reminder for your appointment on <b>${when}</b>.</p>${m.location ? `<p>Location: ${m.location}</p>` : ''}`, `Reminder: your appointment is on ${when}.`)
-          .catch(() => undefined);
-        sent++;
+        // Same rule as the confirmation: the business's channel, or not at all.
+        const { recommended } = await requestContext.run(
+          { organizationId: m.organizationId } as never,
+          () => pickChannelFor({ purpose: 'ORDERS', channelTypes: ['EMAIL'] }),
+        );
+        if (recommended) {
+          const outcome = await sendEmailViaChannel(recommended.id, {
+            to: attendee.email,
+            subject: `Reminder: ${m.title}`,
+            html: `<p>This is a reminder for your appointment on <b>${when}</b>.</p>${m.location ? `<p>Location: ${m.location}</p>` : ''}`,
+            text: `Reminder: your appointment is on ${when}.`,
+          });
+          if (outcome.ok) sent++;
+          else logger.warn({ meetingId: m.id, error: outcome.error }, 'appointment reminder not sent');
+        } else {
+          logger.warn(
+            { meetingId: m.id, organizationId: m.organizationId },
+            `Appointment reminder due but no email channel is connected. ${CONNECT_CHANNEL_HINT}`,
+          );
+        }
       }
       await prismaUnscoped.meeting.update({ where: { id: m.id }, data: { reminderSentAt: new Date() } });
     }

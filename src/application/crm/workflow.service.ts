@@ -2,7 +2,10 @@ import { z } from 'zod';
 import { prisma } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { logger } from '../../shared/logger';
+import { ValidationError } from '../../shared/errors';
 import { activityService } from './activity.service';
+import { validateLeadCondition } from './lead-fields.service';
+import { announceAssignment } from './assignment-notify.service';
 import { messagingService } from '../messaging/messaging.service';
 import { enqueue } from '../../infrastructure/queue/queue';
 
@@ -34,12 +37,23 @@ export type Trigger = (typeof TRIGGERS)[number];
 type EntityType = 'CUSTOMER' | 'LEAD' | 'DEAL' | 'ORDER' | 'INVOICE' | 'EMPLOYEE';
 
 const conditionSchema = z.object({
-  field: z.string().trim().min(1).max(60),
-  op: z.enum(['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'contains']),
-  value: z.string().max(200),
+  // Validated against the Lead field catalog on save; the enum here only keeps
+  // the shape sane. `customFields.x` is a legal path.
+  field: z.string().trim().min(1).max(120),
+  op: z.enum([
+    'eq', 'ne', 'gt', 'gte', 'lt', 'lte',
+    'contains', 'not_contains', 'starts_with', 'is_true', 'is_false',
+  ]),
+  // Boolean operators carry no operand, so this may be blank.
+  value: z.string().max(200).default(''),
 });
 const actionSchema = z.object({
-  type: z.enum(['create_task', 'add_note', 'notify', 'send_email', 'send_whatsapp', 'send_sms']),
+  type: z.enum([
+    'create_task', 'add_note', 'notify', 'send_email', 'send_whatsapp', 'send_sms',
+    // Handing work to someone is an action in its own right — previously the
+    // only way to route a lead was to change the owner by hand.
+    'assign_lead', 'assign_deal',
+  ]),
   params: z.record(z.string(), z.string()).default({}),
 });
 export const workflowSchema = z.object({
@@ -76,19 +90,68 @@ async function readWorkflows(): Promise<WorkflowRule[]> {
   return Array.isArray(list) ? (list as WorkflowRule[]) : [];
 }
 
+/** Follow a dotted path so `customFields.industry` reads the nested value. */
+function readField(payload: Payload, path: string): unknown {
+  if (!path.includes('.')) return payload[path];
+  return path.split('.').reduce<unknown>((value, key) => {
+    if (value === null || value === undefined || typeof value !== 'object') return undefined;
+    return (value as Record<string, unknown>)[key];
+  }, payload);
+}
+
+/** ISO-ish strings compare as dates; anything else is not a date comparison. */
+function asDate(value: unknown): number | null {
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value)) {
+    const t = Date.parse(value);
+    return Number.isNaN(t) ? null : t;
+  }
+  return null;
+}
+
 function evalCondition(payload: Payload, c: z.infer<typeof conditionSchema>): boolean {
-  const raw = payload[c.field];
+  const raw = readField(payload, c.field);
+
+  // Booleans are about presence and truthiness, so they are judged before the
+  // null guard — "is false" must match a field that is absent or false.
+  if (c.op === 'is_true') return raw === true || String(raw).toLowerCase() === 'true';
+  if (c.op === 'is_false') return raw === false || String(raw).toLowerCase() === 'false' || raw === undefined || raw === null;
+
   if (raw === undefined || raw === null) return false;
+
+  const left = String(raw).toLowerCase();
+  const right = c.value.toLowerCase();
+
+  // Dates first: "2026-01-02" > "2026-01-10" is true as a string and wrong.
+  const leftDate = asDate(raw);
+  const rightDate = asDate(c.value);
+  if (leftDate !== null && rightDate !== null) {
+    switch (c.op) {
+      case 'eq': return leftDate === rightDate;
+      case 'ne': return leftDate !== rightDate;
+      case 'gt': return leftDate > rightDate;
+      case 'gte': return leftDate >= rightDate;
+      case 'lt': return leftDate < rightDate;
+      case 'lte': return leftDate <= rightDate;
+      default: break;
+    }
+  }
+
   const asNum = Number(raw);
   const cmpNum = Number(c.value);
-  const numeric = !Number.isNaN(asNum) && !Number.isNaN(cmpNum);
+  const numeric = c.value !== '' && !Number.isNaN(asNum) && !Number.isNaN(cmpNum);
+
   switch (c.op) {
     case 'eq':
-      return String(raw).toLowerCase() === c.value.toLowerCase();
+      return numeric ? asNum === cmpNum : left === right;
     case 'ne':
-      return String(raw).toLowerCase() !== c.value.toLowerCase();
+      return numeric ? asNum !== cmpNum : left !== right;
     case 'contains':
-      return String(raw).toLowerCase().includes(c.value.toLowerCase());
+      return left.includes(right);
+    case 'not_contains':
+      return !left.includes(right);
+    case 'starts_with':
+      return left.startsWith(right);
     case 'gt':
       return numeric && asNum > cmpNum;
     case 'gte':
@@ -148,6 +211,44 @@ async function runAction(
       title: interpolate(p.message || 'Automation notification', payload),
       also: target.customerId ? [{ entityType: 'CUSTOMER', entityId: target.customerId }] : undefined,
     });
+  } else if (action.type === 'assign_lead' || action.type === 'assign_deal') {
+    const wanted = action.type === 'assign_lead' ? 'lead' : 'deal';
+    if (target.entityType !== (wanted === 'lead' ? 'LEAD' : 'DEAL')) {
+      // A lead rule cannot assign a deal. Say so rather than doing nothing.
+      throw new Error(`This rule runs on a ${target.entityType.toLowerCase()}, so it cannot ${action.type.replace('_', ' ')}`);
+    }
+    const ownerId = (p.ownerId ?? '').trim();
+    if (!ownerId) throw new Error('No user selected to assign to');
+
+    const member = await prisma.membership.findFirst({
+      where: { id: ownerId, isActive: true, deletedAt: null },
+      select: { id: true },
+    });
+    if (!member) throw new Error('The selected user is no longer an active member');
+
+    // Written here rather than through crmService.assign, which would make the
+    // import circular. `announceAssignment` is the shared part that matters:
+    // the new owner is notified and the hand-off reaches the timeline exactly
+    // as it would from a manual assignment.
+    const previousOwnerId =
+      wanted === 'lead'
+        ? (await prisma.lead.findFirst({ where: { id: target.entityId }, select: { ownerId: true } }))?.ownerId ?? null
+        : (await prisma.deal.findFirst({ where: { id: target.entityId }, select: { ownerId: true } }))?.ownerId ?? null;
+
+    if (previousOwnerId === ownerId) return; // already theirs; not a hand-off
+
+    if (wanted === 'lead') {
+      await prisma.lead.update({ where: { id: target.entityId }, data: { ownerId } });
+    } else {
+      await prisma.deal.update({ where: { id: target.entityId }, data: { ownerId } });
+    }
+    await announceAssignment({
+      entity: wanted,
+      entityId: target.entityId,
+      previousOwnerId,
+      newOwnerId: ownerId,
+      source: 'AUTOMATION',
+    });
   } else if (action.type === 'send_email' || action.type === 'send_whatsapp' || action.type === 'send_sms') {
     // Deliver to the customer tied to this event (leads without a customer are skipped).
     const customerId = target.customerId ?? (target.entityType === 'CUSTOMER' ? target.entityId : null);
@@ -177,6 +278,19 @@ export const workflowService = {
   },
 
   async saveWorkflows(workflows: WorkflowRule[]) {
+    // The dropdown is presentation; this endpoint is reachable without it. A
+    // rule naming a field that does not exist would sit there looking correct
+    // and never match anything, so it is refused at the door.
+    for (const rule of workflows) {
+      if (!rule.trigger.startsWith('lead.')) continue;
+      for (const condition of rule.conditions) {
+        const check = await validateLeadCondition(condition.field, condition.op);
+        if (!check.ok) {
+          throw new ValidationError(`Automation “${rule.name}”: ${check.reason}`);
+        }
+      }
+    }
+
     const org = await prisma.organization.findUniqueOrThrow({
       where: { id: orgId() },
       select: { settings: true },
@@ -211,18 +325,39 @@ export const workflowService = {
       for (const rule of rules) {
         const matches = rule.conditions.every((c) => evalCondition(payload, c));
         if (!matches) continue;
+        // Every action's outcome is recorded, successful or not: an automation
+        // that quietly stopped working is worse than one that visibly failed.
+        const results: { action: string; ok: boolean; error?: string }[] = [];
         for (const action of rule.actions) {
           try {
             await runAction(action, payload, target);
+            results.push({ action: action.type, ok: true });
           } catch (err) {
+            const message = (err as Error).message;
             logger.error({ err, rule: rule.name, action: action.type }, 'workflow action failed');
+            results.push({ action: action.type, ok: false, error: message });
           }
         }
+
+        const failed = results.filter((r) => !r.ok);
         await activityService.record({
           type: 'SYSTEM',
           entityType: target.entityType,
           entityId: target.entityId,
-          title: `⚙️ Automation ran — ${rule.name}`,
+          title: failed.length
+            ? `⚙️ Automation ran with errors — ${rule.name}`
+            : `⚙️ Automation ran — ${rule.name}`,
+          body: results
+            .map((r) => `${r.action}: ${r.ok ? 'SUCCESS' : `FAILED — ${r.error}`}`)
+            .join('\n'),
+          metadata: {
+            automation: rule.name,
+            automationId: rule.id,
+            trigger,
+            results,
+            failedCount: failed.length,
+            ranAt: new Date().toISOString(),
+          },
         });
       }
     } catch (err) {

@@ -8,7 +8,19 @@ export interface CatalogAddOn {
   enabled: boolean;
   billingType: 'ONE_TIME' | 'MONTHLY';
   prices: Record<string, { amount: number }>;
-  entitlements: { aiCredits?: number; maxUsers?: number; maxChannels?: number; features: string[] };
+  entitlements: {
+    aiCredits?: number;
+    maxUsers?: number;
+    /** Total extra channels, whatever the type. Kept for existing add-ons. */
+    maxChannels?: number;
+    /**
+     * Extra instances of a specific channel type, e.g. `{ EMAIL: 1 }`. This is
+     * what a business actually buys: another *email inbox*, not another
+     * unspecified channel — the allowance is enforced per type.
+     */
+    channelsByType?: Record<string, number>;
+    features: string[];
+  };
 }
 
 export interface CatalogIntegration {
@@ -39,7 +51,14 @@ export interface SiteCatalog {
   integrations: CatalogIntegration[];
 }
 
-const FALLBACK: SiteCatalog = {
+/**
+ * What the product ships with when the admin has defined no catalog.
+ *
+ * Exported so the shipped defaults can be asserted on: once the admin defines
+ * add-ons its list wins entirely, which is the point — pricing is an operator
+ * decision, not a code constant.
+ */
+export const FALLBACK: SiteCatalog = {
   supportEmail: 'support@vhicasar.com',
   socialLinks: {},
   addOns: [
@@ -47,7 +66,9 @@ const FALLBACK: SiteCatalog = {
     { id: 'ai_responses_5000', title: '5,000 Additional AI Responses', description: 'Adds 5,000 AI responses to each billing period.', enabled: true, billingType: 'MONTHLY', prices: { NGN: { amount: 2000 } }, entitlements: { aiCredits: 5000, features: [] } },
     { id: 'ai_responses_20000', title: '20,000 Additional AI Responses', description: 'Adds 20,000 AI responses to each billing period.', enabled: true, billingType: 'MONTHLY', prices: { NGN: { amount: 6500 } }, entitlements: { aiCredits: 20000, features: [] } },
     { id: 'ai_responses_100000', title: '100,000 Additional AI Responses', description: 'Adds 100,000 AI responses to each billing period.', enabled: true, billingType: 'MONTHLY', prices: { NGN: { amount: 22000 } }, entitlements: { aiCredits: 100000, features: [] } },
-    { id: 'whatsapp_number', title: 'Additional WhatsApp Number', description: 'Adds one more connected channel allowance.', enabled: true, billingType: 'MONTHLY', prices: { NGN: { amount: 2000 } }, entitlements: { maxChannels: 1, features: [] } },
+    { id: 'channel_whatsapp', title: 'Additional WhatsApp Channel', description: 'Adds one more WhatsApp channel — run a separate number for sales, support or orders.', enabled: true, billingType: 'MONTHLY', prices: { NGN: { amount: 2000 } }, entitlements: { maxChannels: 1, channelsByType: { WHATSAPP: 1 }, features: [] } },
+    { id: 'channel_email', title: 'Additional Email Channel', description: 'Adds one more email inbox — keep invoices separate from support.', enabled: true, billingType: 'MONTHLY', prices: { NGN: { amount: 1500 } }, entitlements: { maxChannels: 1, channelsByType: { EMAIL: 1 }, features: [] } },
+    { id: 'channel_sms', title: 'Additional SMS Channel', description: 'Adds one more SMS sender.', enabled: true, billingType: 'MONTHLY', prices: { NGN: { amount: 1500 } }, entitlements: { maxChannels: 1, channelsByType: { SMS: 1 }, features: [] } },
     { id: 'team_member', title: 'Extra Team Member', description: 'Adds one team seat.', enabled: true, billingType: 'MONTHLY', prices: { NGN: { amount: 1000 } }, entitlements: { maxUsers: 1, features: [] } },
     { id: 'ai_voice', title: 'AI Voice Assistant', description: 'Enables AI voice assistant access.', enabled: true, billingType: 'MONTHLY', prices: { NGN: { amount: 8000 } }, entitlements: { features: ['ai_voice'] } },
     { id: 'white_label', title: 'White Label', description: 'Enables customer-facing white-label controls.', enabled: true, billingType: 'ONE_TIME', prices: { NGN: { amount: 150000 } }, entitlements: { features: ['white_label'] } },

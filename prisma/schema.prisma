@@ -131,7 +131,11 @@ enum CallDirection {
 enum LeadStatus {
   NEW
   CONTACTED
+  /// Actively in conversation — past first contact, not yet judged.
+  ENGAGED
   QUALIFIED
+  /// Qualified but not ready; kept warm rather than closed off.
+  NURTURING
   UNQUALIFIED
   CONVERTED
   LOST
@@ -502,6 +506,9 @@ enum EntityType {
   MAINTENANCE_REQUEST
   CAMPAIGN
   MEETING
+  /// A communication channel instance — connecting, repurposing or
+  /// disconnecting one changes what reaches customers, so it has a timeline.
+  CHANNEL
 }
 
 enum StorageDriver {
@@ -962,6 +969,13 @@ model ChannelAccount {
   organizationId String
   channelType    ChannelType
   name           String // "Main WhatsApp", "Support Page"
+  /// What this instance is for: SUPPORT | INVOICES | SALES | ORDERS |
+  /// MARKETING | GENERAL. Drives which channel the system reaches for, so an
+  /// invoice does not go out of the support inbox.
+  purpose        String      @default("GENERAL")
+  /// Per instance, never global: a business can want auto-replies on its
+  /// support address and silence on the one that sends invoices.
+  autoReply      Boolean     @default(true)
   externalId     String // phone number id, page id, bot id…
   credentialsEnc String?     @db.Text // AES-256-GCM encrypted provider credentials
   webhookSecret  String?
@@ -1136,6 +1150,15 @@ model Lead {
   aiScoreReason  String?    @db.Text
   estimatedValue Decimal?   @db.Decimal(14, 2)
   convertedAt    DateTime?
+  /// Membership that performed the conversion — "converted by", for the record.
+  convertedById  String?
+  /// The deal this lead became. The deals relation can hold several over a
+  /// lead's life; this is the one the conversion produced.
+  convertedDealId String?
+  /// Last time a new inquiry was matched to this lead and the user chose to
+  /// re-engage it rather than open a second lead.
+  reengagedAt    DateTime?
+  reengagementCount Int      @default(0)
   customFields   Json?
   createdAt      DateTime   @default(now())
   updatedAt      DateTime   @updatedAt
@@ -1173,11 +1196,40 @@ model PipelineStage {
   probability Int     @default(0) // 0-100
   isWonStage  Boolean @default(false)
   isLostStage Boolean @default(false)
+  /// A retired stage: deals already in it stay put and stay visible, but no
+  /// deal can be created in or moved into it. Disabling rather than deleting is
+  /// what lets a business stop using a step without rewriting its history.
+  isActive    Boolean @default(true)
 
   pipeline Pipeline @relation(fields: [pipelineId], references: [id])
   deals    Deal[]
 
   @@unique([pipelineId, position])
+}
+
+/// One change to a deal's value, with the reason someone gave for it.
+///
+/// A negotiated discount or an added service is a financial fact the business
+/// may be asked to justify later, so the previous figure is never overwritten
+/// without a row here recording what it was and why it moved.
+model DealValueChange {
+  id             String   @id @default(cuid())
+  organizationId String
+  dealId         String
+  previousValue  Decimal  @db.Decimal(14, 2)
+  newValue       Decimal  @db.Decimal(14, 2)
+  /// newValue - previousValue. Stored rather than derived so history stays
+  /// readable even if rounding rules change.
+  difference     Decimal  @db.Decimal(14, 2)
+  currency       String   @db.Char(3)
+  reason         String   @db.Text
+  /// Membership that made the change.
+  changedById    String?
+  createdAt      DateTime @default(now())
+
+  deal Deal @relation(fields: [dealId], references: [id], onDelete: Cascade)
+
+  @@index([dealId, createdAt])
 }
 
 model Deal {
@@ -1192,6 +1244,10 @@ model Deal {
   ownerId          String? // Membership id
   status           DealStatus @default(OPEN)
   value            Decimal    @default(0) @db.Decimal(14, 2)
+  /// What the deal was worth when it was opened. Kept so a negotiated deal can
+  /// still show what it started at — `value` alone loses that the moment it
+  /// changes.
+  originalValue    Decimal?   @db.Decimal(14, 2)
   currency         String     @default("USD") @db.Char(3)
   expectedCloseAt  DateTime?
   closedAt         DateTime?
@@ -1211,6 +1267,7 @@ model Deal {
   contracts  Contract[]
   invoices   Invoice[]
   paymentIntents PaymentIntent[]
+  valueChanges DealValueChange[]
 
   @@index([organizationId, status])
   @@index([pipelineId, stageId])
@@ -2266,6 +2323,14 @@ model Invoice {
   paidAt         DateTime?
   pdfFileId      String?
   notes          String?       @db.Text
+  /// When a renegotiated deal produces a fresh invoice, the old one is voided
+  /// and points here. The chain is how a business answers "what happened to
+  /// INV-1001?" without either invoice being deleted.
+  replacedByInvoiceId String?  @unique
+  /// The invoice this one supersedes — the other end of the same link.
+  replacesInvoiceId   String?
+  voidedAt       DateTime?
+  voidReason     String?       @db.Text
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
   deletedAt      DateTime?

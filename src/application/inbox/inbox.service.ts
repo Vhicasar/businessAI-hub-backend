@@ -294,8 +294,10 @@ export const inboxService = {
    */
   async tryAutoReply(accountId: string, conversationId: string, inboundMessageId: string) {
     const account = await prisma.channelAccount.findFirst({ where: { id: accountId } });
-    const autoReply = (account?.metadata as { autoReply?: boolean } | null)?.autoReply;
-    if (!account || !autoReply) return;
+    // Read from the channel's own setting: auto-reply is per instance, so the
+    // support inbox answering by itself must not make the invoices one do the
+    // same.
+    if (!account || !account.autoReply) return;
 
     const conversation = await prisma.conversation.findFirst({ where: { id: conversationId } });
     if (!conversation || conversation.status !== 'OPEN' || conversation.assignedToId) return;

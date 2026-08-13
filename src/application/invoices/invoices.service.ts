@@ -420,8 +420,10 @@ export const invoicesService = {
         number,
         customerId: deal.customerId as string,
         dealId: deal.id,
-        status: 'SENT' as const,
-        issuedAt: new Date(),
+        // Created, not sent. Whether the customer is contacted — and through
+        // which channel — is the user's decision, taken right after this.
+        status: 'DRAFT' as const,
+        issuedAt: null,
         dueAt,
       };
 
@@ -643,19 +645,119 @@ export const invoicesService = {
     );
   },
 
-  async voidInvoice(id: string) {
+  /**
+   * Void an invoice.
+   *
+   * An invoice that has taken money is not a clerical mistake to be undone: the
+   * payment still exists and still has to reconcile. Voiding one is therefore
+   * refused unless the caller both holds the permission and says explicitly
+   * that they accept it — and even then the payment records are left untouched.
+   */
+  async voidInvoice(id: string, opts: { reason?: string; allowPaid?: boolean } = {}) {
     const invoice = await prisma.invoice.findFirst({ where: { id, deletedAt: null } });
     if (!invoice) throw new NotFoundError('Invoice');
-    if (Number(invoice.amountPaid) > 0) {
-      throw new ConflictError('Cannot void an invoice with recorded payments');
+    if (invoice.status === 'VOID') throw new ConflictError('This invoice is already void');
+
+    const amountPaid = Number(invoice.amountPaid);
+    if (amountPaid > 0 && !opts.allowPaid) {
+      throw new ConflictError(
+        `This invoice has already received ${invoice.currency} ${amountPaid.toLocaleString()}. ` +
+          'Review the payment, refund or reconciliation before voiding it.',
+        { amountPaid, invoiceId: id, requiresOverride: true },
+      );
     }
+
     const updated = await prisma.invoice.update({
       where: { id },
-      data: { status: 'VOID' },
+      data: { status: 'VOID', voidedAt: new Date(), voidReason: opts.reason?.trim() || null },
       select: invoiceSelect,
     });
     const result = withDerivedStatus(updated);
-    await recordInvoiceActivity(result, `Invoice ${result.number} voided`);
+    await recordInvoiceActivity(
+      result,
+      `Invoice ${result.number} voided`,
+      [
+        opts.reason?.trim() ? `Reason: ${opts.reason.trim()}` : null,
+        amountPaid > 0
+          ? `Note: ${invoice.currency} ${amountPaid.toLocaleString()} had already been paid against this invoice. Payment records are unchanged.`
+          : null,
+      ].filter(Boolean).join('\n') || undefined,
+    );
     return result;
+  },
+
+  /**
+   * What a deal's existing invoice situation is, so the user can be asked
+   * rather than have one silently overwritten.
+   */
+  async dealInvoiceStatus(dealId: string) {
+    const deal = await prisma.deal.findFirst({
+      where: { id: dealId, deletedAt: null },
+      select: { id: true, value: true, currency: true },
+    });
+    if (!deal) throw new NotFoundError('Deal');
+
+    const invoices = await prisma.invoice.findMany({
+      where: { dealId, deletedAt: null },
+      select: {
+        id: true, number: true, status: true, total: true, amountPaid: true,
+        currency: true, replacedByInvoiceId: true, voidedAt: true, createdAt: true,
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    const existing = invoices.find((i) => i.status !== 'VOID') ?? null;
+
+    return {
+      dealId: deal.id,
+      dealValue: Number(deal.value),
+      currency: deal.currency,
+      hasExisting: existing !== null,
+      existing,
+      // The difference is what makes the question worth asking at all.
+      valueDiffers: existing ? Math.abs(Number(existing.total) - Number(deal.value)) >= 0.005 : false,
+      existingIsPaid: existing ? Number(existing.amountPaid) > 0 : false,
+      invoices,
+    };
+  },
+
+  /**
+   * Replace a deal's invoice with one reflecting the current deal value.
+   *
+   * The old invoice is voided and kept, not deleted, and the two are linked in
+   * both directions — the business can always show what was billed first and
+   * what superseded it.
+   */
+  async replaceDealInvoice(
+    dealId: string,
+    opts: { reason?: string; allowPaid?: boolean; dueInDays?: number } = {},
+  ) {
+    const status = await this.dealInvoiceStatus(dealId);
+    if (!status.existing) throw new ValidationError('This deal has no invoice to replace');
+
+    const oldId = status.existing.id;
+    const voided = await this.voidInvoice(oldId, {
+      reason: opts.reason?.trim() || `Replaced after the deal value changed`,
+      allowPaid: opts.allowPaid,
+    });
+
+    const created = await this.createFromDeal(dealId, opts.dueInDays);
+
+    // Link both ways, so either invoice leads to the other.
+    await prisma.$transaction([
+      prisma.invoice.update({ where: { id: oldId }, data: { replacedByInvoiceId: created.id } }),
+      prisma.invoice.update({ where: { id: created.id }, data: { replacesInvoiceId: oldId } }),
+    ]);
+
+    await recordInvoiceActivity(
+      created,
+      `Invoice ${created.number} replaces ${voided.number}`,
+      [
+        `${voided.number} (${voided.currency} ${Number(voided.total).toLocaleString()}) was voided and kept in history.`,
+        `${created.number} was created for ${created.currency} ${Number(created.total).toLocaleString()}.`,
+        opts.reason?.trim() ? `Reason: ${opts.reason.trim()}` : null,
+      ].filter(Boolean).join('\n'),
+    );
+
+    return { voided, created };
   },
 };

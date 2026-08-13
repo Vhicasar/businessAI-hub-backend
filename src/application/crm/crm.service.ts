@@ -1,9 +1,11 @@
 import { z } from 'zod';
-import { ConflictError, NotFoundError, ValidationError } from '../../shared/errors';
-import { prisma } from '../../infrastructure/database/prisma';
+import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../../shared/errors';
+import { prisma, prismaUnscoped } from '../../infrastructure/database/prisma';
 import { logger } from '../../shared/logger';
 import { requestContext } from '../../shared/context';
 import { activityService } from './activity.service';
+import { findLeadMatches, reengageLead, DuplicateLeadError } from './lead-matching.service';
+import { announceAssignment, type AssignmentSource } from './assignment-notify.service';
 import { workflowService } from './workflow.service';
 import { invoicesService } from '../invoices/invoices.service';
 import { exchangeRates } from '../../shared/exchange-rates';
@@ -172,6 +174,10 @@ export const leadStatusSchema = z.object({
 export const dealSchema = z.object({
   title: z.string().trim().min(1).max(200),
   customerId: z.string().nullable().optional(),
+  companyId: z.string().nullable().optional(),
+  /// Defaults to whoever is acting; set explicitly so a converted deal can
+  /// stay with the person who was already working the lead.
+  ownerId: z.string().nullable().optional(),
   leadId: z.string().nullable().optional(),
   value: z.coerce.number().nonnegative().default(0),
   expectedCloseAt: z.coerce.date().nullable().optional(),
@@ -179,11 +185,25 @@ export const dealSchema = z.object({
   stageId: z.string().optional(), // defaults to first open stage
 });
 
+/**
+ * What the user may adjust while confirming a conversion. Every field is
+ * optional: the defaults come from the lead, so a plain confirm still works.
+ */
+export const convertLeadSchema = z.object({
+  title: z.string().trim().max(200).optional(),
+  value: z.coerce.number().nonnegative().optional(),
+  pipelineId: z.string().optional(),
+  ownerId: z.string().optional(),
+});
+export type ConvertLeadDto = z.infer<typeof convertLeadSchema>;
+
 export const stageInputSchema = z.object({
   name: z.string().trim().min(1).max(60),
   probability: z.coerce.number().int().min(0).max(100).default(0),
   isWonStage: z.boolean().optional(),
   isLostStage: z.boolean().optional(),
+  /// Retiring a stage rather than deleting it keeps the deals already in it.
+  isActive: z.boolean().optional(),
 });
 export const createPipelineSchema = z.object({
   name: z.string().trim().min(1).max(80),
@@ -320,6 +340,8 @@ const dealSelect = {
   title: true,
   status: true,
   value: true,
+  // Sent alongside `value` so a renegotiated deal can show what it opened at.
+  originalValue: true,
   currency: true,
   expectedCloseAt: true,
   closedAt: true,
@@ -395,11 +417,32 @@ export const crmService = {
       where: { id: orgId() },
       select: { currency: true },
     });
+    // Notes are surfaced on the board rather than hidden behind a detail view,
+    // so a deal carrying context shows it wherever it sits. Fetched in one
+    // grouped query instead of per card.
+    const dealIds = deals.map((d) => d.id);
+    const notes = dealIds.length
+      ? await prisma.note.findMany({
+          where: { entityType: 'DEAL', entityId: { in: dealIds }, deletedAt: null },
+          select: { entityId: true, body: true, createdAt: true },
+          orderBy: { createdAt: 'desc' },
+        })
+      : [];
+    const noteCounts = new Map<string, number>();
+    const latestNotes = new Map<string, string>();
+    for (const note of notes) {
+      noteCounts.set(note.entityId, (noteCounts.get(note.entityId) ?? 0) + 1);
+      if (!latestNotes.has(note.entityId)) latestNotes.set(note.entityId, note.body);
+    }
+
     const displayDeals = await Promise.all(deals.map(async (deal) => ({
       ...deal,
       value: (await exchangeRates.convert(Number(deal.value), deal.currency, org.currency)).amount,
       sourceCurrency: deal.currency,
       currency: org.currency,
+      noteCount: noteCounts.get(deal.id) ?? 0,
+      // Trimmed: this is a tooltip, not the note itself.
+      latestNote: (latestNotes.get(deal.id) ?? '').slice(0, 160) || null,
     })));
     const columns = pipeline.stages.map((stage) => {
       const stageDeals = displayDeals.filter((d) => d.stage.id === stage.id);
@@ -428,8 +471,13 @@ export const crmService = {
       : await this.ensureDefaultPipeline();
     const stage = dto.stageId
       ? pipeline.stages.find((s) => s.id === dto.stageId)
-      : pipeline.stages.find((s) => !s.isWonStage && !s.isLostStage);
+      : // Skip retired stages when picking the opening one, or every new deal
+        // would land in a step the business has stopped using.
+        pipeline.stages.find((s) => !s.isWonStage && !s.isLostStage && s.isActive);
     if (!stage) throw new NotFoundError('Stage');
+    if (!stage.isActive) {
+      throw new ConflictError(`“${stage.name}” is disabled, so a deal cannot be created in it`);
+    }
 
     if (dto.customerId) {
       const customer = await prisma.customer.findFirst({
@@ -451,7 +499,11 @@ export const crmService = {
         stageId: stage.id,
         customerId: dto.customerId ?? null,
         leadId: dto.leadId ?? null,
-        ownerId: actorMembershipId(),
+        companyId: dto.companyId ?? null,
+        // Captured at creation: once a deal is negotiated, `value` no longer
+        // says what it was originally worth.
+        originalValue: dto.value,
+        ownerId: dto.ownerId ?? actorMembershipId(),
         value: dto.value,
         currency: org.currency,
         expectedCloseAt: dto.expectedCloseAt ?? null,
@@ -474,6 +526,139 @@ export const crmService = {
     return deal;
   },
 
+  /**
+   * Change what a deal is worth, with the reason on the record.
+   *
+   * A negotiated discount or an added service is a financial fact someone may
+   * be asked to justify, so the previous figure is never quietly overwritten —
+   * every change keeps what it was, what it became, the difference and why.
+   */
+  async changeDealValue(dealId: string, newValue: number, reason: string) {
+    const deal = await prisma.deal.findFirst({ where: { id: dealId, deletedAt: null } });
+    if (!deal) throw new NotFoundError('Deal');
+    if (deal.status !== 'OPEN') throw new ConflictError('A closed deal’s value cannot be changed');
+
+    const previous = Number(deal.value);
+    if (Math.abs(previous - newValue) < 0.005) {
+      throw new ValidationError('The new value is the same as the current one');
+    }
+    if (!reason.trim()) {
+      throw new ValidationError('A reason is required when changing a deal’s value');
+    }
+
+    const difference = Number((newValue - previous).toFixed(2));
+    const actorId = actorMembershipId();
+
+    const [updated] = await prisma.$transaction([
+      prisma.deal.update({
+        where: { id: dealId },
+        data: {
+          value: newValue,
+          // Fill the opening figure for deals that predate this being recorded,
+          // so their history is not silently rewritten to the new number.
+          originalValue: deal.originalValue ?? previous,
+        },
+        select: dealSelect,
+      }),
+      prisma.dealValueChange.create({
+        data: {
+          organizationId: deal.organizationId,
+          dealId,
+          previousValue: previous,
+          newValue,
+          difference,
+          currency: deal.currency,
+          reason: reason.trim(),
+          changedById: actorId,
+        },
+      }),
+    ]);
+
+    const sign = difference > 0 ? '+' : '';
+    await activityService.record({
+      type: 'SYSTEM',
+      entityType: 'DEAL',
+      entityId: dealId,
+      title: `Deal value changed — ${deal.currency} ${newValue.toLocaleString()}`,
+      body: [
+        `From ${deal.currency} ${previous.toLocaleString()} to ${deal.currency} ${newValue.toLocaleString()}`,
+        `Difference: ${sign}${deal.currency} ${difference.toLocaleString()}`,
+        `Reason: ${reason.trim()}`,
+      ].join('\n'),
+      metadata: {
+        previous: { value: previous },
+        next: { value: newValue },
+        difference,
+        reason: reason.trim(),
+        currency: deal.currency,
+        actorMembershipId: actorId,
+      },
+    });
+
+    return updated;
+  },
+
+  /** Every value change on a deal, newest first. */
+  async dealValueHistory(dealId: string) {
+    const changes = await prisma.dealValueChange.findMany({
+      where: { dealId },
+      orderBy: { createdAt: 'desc' },
+    });
+    const memberIds = [...new Set(changes.map((c) => c.changedById).filter((id): id is string => !!id))];
+    const members = memberIds.length
+      ? await prisma.membership.findMany({
+          where: { id: { in: memberIds } },
+          select: { id: true, user: { select: { firstName: true, lastName: true } } },
+        })
+      : [];
+    const nameById = new Map(members.map((m) => [m.id, `${m.user.firstName} ${m.user.lastName ?? ''}`.trim()]));
+    return changes.map((c) => ({
+      ...c,
+      changedByName: c.changedById ? nameById.get(c.changedById) ?? null : null,
+    }));
+  },
+
+  /**
+   * What a deal is worth, has been invoiced for, and has been paid.
+   *
+   * Derived on read rather than stored: invoices and payments change from
+   * several directions, and a cached total is a total that goes wrong.
+   */
+  async dealFinancials(dealId: string) {
+    const deal = await prisma.deal.findFirst({
+      where: { id: dealId, deletedAt: null },
+      select: { id: true, value: true, originalValue: true, currency: true },
+    });
+    if (!deal) throw new NotFoundError('Deal');
+
+    const invoices = await prisma.invoice.findMany({
+      where: { dealId, deletedAt: null },
+      select: {
+        id: true, number: true, status: true, total: true, amountPaid: true,
+        issuedAt: true, createdAt: true, replacedByInvoiceId: true,
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    // A void invoice is history: it is shown, but it is not owed and not counted.
+    const live = invoices.filter((i) => i.status !== 'VOID');
+    const totalInvoiced = live.reduce((sum, i) => sum + Number(i.total), 0);
+    const totalPaid = invoices.reduce((sum, i) => sum + Number(i.amountPaid), 0);
+
+    return {
+      dealId: deal.id,
+      currency: deal.currency,
+      originalValue: Number(deal.originalValue ?? deal.value),
+      currentValue: Number(deal.value),
+      valueChange: Number(deal.value) - Number(deal.originalValue ?? deal.value),
+      totalInvoiced,
+      totalPaid,
+      outstanding: Number((totalInvoiced - totalPaid).toFixed(2)),
+      activeInvoice: live.find((i) => i.status !== 'PAID') ?? live[live.length - 1] ?? null,
+      invoices,
+    };
+  },
+
   async moveDeal(dealId: string, stageId: string) {
     const deal = await prisma.deal.findFirst({ where: { id: dealId, deletedAt: null } });
     if (!deal) throw new NotFoundError('Deal');
@@ -482,6 +667,12 @@ export const crmService = {
       where: { id: stageId, pipelineId: deal.pipelineId },
     });
     if (!stage) throw new NotFoundError('Stage');
+    // A retired stage is enforced here, not just hidden in the UI: the endpoint
+    // is reachable without the board, and a disabled step that still accepts
+    // deals is a toggle that does nothing.
+    if (!stage.isActive) {
+      throw new ConflictError(`“${stage.name}” is disabled, so deals cannot be moved into it`);
+    }
     // Closing a deal must go through the documented-outcome flow (spec #4), not
     // a silent drag onto a won/lost stage.
     if (stage.isWonStage || stage.isLostStage) {
@@ -489,6 +680,13 @@ export const crmService = {
         `Use the close flow to mark a deal ${stage.isWonStage ? 'won' : 'lost'} — an outcome reason and summary are required`,
       );
     }
+
+    // Read the stage it is leaving before the write, so the record can say what
+    // actually changed rather than only where it ended up.
+    const fromStage = await prisma.pipelineStage.findFirst({
+      where: { id: deal.stageId },
+      select: { id: true, name: true },
+    });
 
     const updated = await prisma.deal.update({
       where: { id: dealId },
@@ -500,6 +698,12 @@ export const crmService = {
       entityType: 'DEAL',
       entityId: dealId,
       title: `Deal moved to “${stage.name}”`,
+      body: fromStage ? `From “${fromStage.name}” to “${stage.name}”.` : undefined,
+      metadata: {
+        previous: { stageId: fromStage?.id ?? null, stage: fromStage?.name ?? null },
+        next: { stageId: stage.id, stage: stage.name },
+        actorMembershipId: actorMembershipId(),
+      },
       also: updated.customer ? [{ entityType: 'CUSTOMER', entityId: updated.customer.id }] : undefined,
     });
     const wfTarget = {
@@ -669,16 +873,46 @@ export const crmService = {
   },
 
   async updateStage(stageId: string, dto: z.infer<typeof stageInputSchema>) {
-    await prisma.pipelineStage.findFirstOrThrow({ where: { id: stageId } });
-    return prisma.pipelineStage.update({
+    const before = await prisma.pipelineStage.findFirstOrThrow({ where: { id: stageId } });
+
+    // Refusing to disable the last usable stage: a pipeline with nowhere to put
+    // a new deal cannot accept one at all.
+    if (dto.isActive === false && before.isActive) {
+      const remaining = await prisma.pipelineStage.count({
+        where: {
+          pipelineId: before.pipelineId,
+          isActive: true,
+          isWonStage: false,
+          isLostStage: false,
+          id: { not: stageId },
+        },
+      });
+      if (remaining === 0) {
+        throw new ConflictError(
+          'This is the only open stage left in the pipeline, so it cannot be disabled',
+        );
+      }
+    }
+
+    const updated = await prisma.pipelineStage.update({
       where: { id: stageId },
       data: {
         name: dto.name,
         probability: dto.probability,
         ...(dto.isWonStage !== undefined ? { isWonStage: dto.isWonStage } : {}),
         ...(dto.isLostStage !== undefined ? { isLostStage: dto.isLostStage } : {}),
+        ...(dto.isActive !== undefined ? { isActive: dto.isActive } : {}),
       },
     });
+
+    if (dto.isActive !== undefined && dto.isActive !== before.isActive) {
+      const held = await prisma.deal.count({ where: { stageId, deletedAt: null, status: 'OPEN' } });
+      logger.info(
+        { stageId, isActive: dto.isActive, dealsInStage: held },
+        dto.isActive ? 'pipeline stage re-enabled' : 'pipeline stage disabled',
+      );
+    }
+    return updated;
   },
 
   async deleteStage(stageId: string) {
@@ -835,42 +1069,84 @@ export const crmService = {
     return { items, nextCursor: hasMore ? items[items.length - 1]?.id ?? null : null };
   },
 
-  async createLead(dto: LeadDto, opts: { forceAutoAssign?: boolean } = {}) {
+  /**
+   * Create a lead, or say what it collided with.
+   *
+   * `onDuplicate` decides what happens when the prospect is already known:
+   *  - `ask` (default) raises DuplicateLeadError carrying the matches, so the
+   *    caller can show them and let the user choose. Silently folding the
+   *    inquiry into an existing lead is what this replaces.
+   *  - `reengage` attaches the inquiry to the matched lead, visibly.
+   *  - `create` opens a second lead deliberately.
+   *
+   * Automated capture (website chat, API) passes `reengage`: there is nobody at
+   * a keyboard to ask, and a duplicate lead per inbound message is worse than a
+   * re-engagement — but it is now recorded and the owner is notified.
+   */
+  /** One lead, with what it became — for opening a record directly. */
+  async getLead(leadId: string) {
+    const lead = await prisma.lead.findFirst({
+      where: { id: leadId, deletedAt: null },
+      include: {
+        company: { select: { id: true, name: true } },
+        customer: { select: { id: true, firstName: true, lastName: true } },
+        // A converted lead should be able to show the deal it became.
+        deals: {
+          where: { deletedAt: null },
+          select: { id: true, title: true, status: true, value: true, currency: true },
+          orderBy: { createdAt: 'asc' },
+        },
+      },
+    });
+    if (!lead) throw new NotFoundError('Lead');
+    return lead;
+  },
+
+  async createLead(
+    dto: LeadDto,
+    opts: {
+      forceAutoAssign?: boolean;
+      onDuplicate?: 'ask' | 'reengage' | 'create';
+      matchedLeadId?: string;
+      /** False for bulk imports, which must not notify per row. */
+      notifyOnReengage?: boolean;
+    } = {},
+  ) {
     if (!dto.email && !dto.phone) {
       throw new ValidationError('Provide at least an email or a phone number');
     }
-    // Dedupe: never create a second open lead for the same email/phone.
-    const duplicate = await prisma.lead.findFirst({
-      where: {
-        deletedAt: null,
-        status: { not: 'CONVERTED' },
-        OR: [
-          ...(dto.email ? [{ email: dto.email }] : []),
-          ...(dto.phone ? [{ phone: dto.phone }] : []),
-        ],
-      },
-      orderBy: { createdAt: 'asc' },
-    });
-    if (duplicate) {
-      // Enrich the existing lead with any newly-provided details rather than duplicating.
-      const enriched = await prisma.lead.update({
-        where: { id: duplicate.id },
-        data: {
-          lastName: duplicate.lastName ?? dto.lastName ?? null,
-          email: duplicate.email ?? dto.email ?? null,
-          phone: duplicate.phone ?? dto.phone ?? null,
-          estimatedValue: duplicate.estimatedValue ?? dto.estimatedValue ?? null,
-        },
+
+    const onDuplicate = opts.onDuplicate ?? 'ask';
+    if (onDuplicate !== 'create') {
+      const matches = await findLeadMatches({
+        firstName: dto.firstName,
+        lastName: dto.lastName ?? null,
+        email: dto.email ?? null,
+        phone: dto.phone ?? null,
       });
-      await activityService.record({
-        type: 'SYSTEM',
-        entityType: 'LEAD',
-        entityId: duplicate.id,
-        title: `Re-engaged — new inquiry matched this lead`,
-        body: dto.source ? `Source: ${dto.source}` : undefined,
-        metadata: { source: dto.source ?? 'MANUAL', deduped: true },
-      });
-      return enriched;
+      // Only a near-certain match short-circuits creation. A shared company is
+      // worth showing a person, but must never redirect an automated capture.
+      const strong = matches.filter((m) => m.confidence === 'EXACT');
+      const target = opts.matchedLeadId
+        ? matches.find((m) => m.leadId === opts.matchedLeadId)
+        : strong[0];
+
+      if (target && onDuplicate === 'reengage') {
+        return reengageLead({
+          leadId: target.leadId,
+          source: dto.source ?? null,
+          notify: opts.notifyOnReengage,
+          details: {
+            lastName: dto.lastName ?? null,
+            email: dto.email ?? null,
+            phone: dto.phone ?? null,
+            estimatedValue: dto.estimatedValue ?? null,
+          },
+        });
+      }
+      if (matches.length && onDuplicate === 'ask') {
+        throw new DuplicateLeadError(matches);
+      }
     }
 
     // Integration/website capture routes through the assignment rules; a person
@@ -898,6 +1174,24 @@ export const crmService = {
       body: lead.source ? `Source: ${lead.source}` : undefined,
       metadata: { source: lead.source ?? 'MANUAL', autoAssigned: !actorMembershipId() && !!ownerId },
     });
+    // A lead handed out by the rota lands on someone who was not watching, so
+    // they are told. Assigning yourself a lead you just typed in is not news,
+    // and `announceAssignment` drops that case.
+    if (ownerId) {
+      const conf = await readAssignment();
+      await announceAssignment({
+        entity: 'lead',
+        entityId: lead.id,
+        previousOwnerId: null,
+        newOwnerId: ownerId,
+        source:
+          actorMembershipId() === ownerId
+            ? 'MANUAL'
+            : conf.strategy === 'LOAD_BALANCED'
+              ? 'LOAD_BALANCER'
+              : 'ROUND_ROBIN',
+      });
+    }
     await workflowService.dispatch(
       'lead.created',
       {
@@ -1018,34 +1312,67 @@ export const crmService = {
     return updated;
   },
 
-  /** Assign (or unassign) an owner to a lead or deal. */
-  async assign(entity: 'lead' | 'deal', id: string, ownerId: string | null) {
+  /**
+   * Assign (or unassign) an owner to a lead or deal.
+   *
+   * The single place ownership changes, whoever decided it. `announceAssignment`
+   * writes the timeline entry and tells the new owner — changing the column
+   * without that is how work used to land on someone silently.
+   */
+  async assign(
+    entity: 'lead' | 'deal',
+    id: string,
+    ownerId: string | null,
+    source: AssignmentSource = 'MANUAL',
+  ) {
     if (entity === 'lead') {
       const lead = await prisma.lead.findFirst({ where: { id, deletedAt: null } });
       if (!lead) throw new NotFoundError('Lead');
+      // Nothing changed — do not announce a hand-off that did not happen.
+      if (lead.ownerId === ownerId) return lead;
       const updated = await prisma.lead.update({ where: { id }, data: { ownerId } });
-      await activityService.record({
-        type: 'SYSTEM', entityType: 'LEAD', entityId: id,
-        title: ownerId ? 'Lead reassigned' : 'Lead unassigned',
+      await announceAssignment({
+        entity: 'lead', entityId: id,
+        previousOwnerId: lead.ownerId, newOwnerId: ownerId, source,
       });
       return updated;
     }
     const deal = await prisma.deal.findFirst({ where: { id, deletedAt: null } });
     if (!deal) throw new NotFoundError('Deal');
+    if (deal.ownerId === ownerId) {
+      return prisma.deal.findFirstOrThrow({ where: { id }, select: dealSelect });
+    }
     const updated = await prisma.deal.update({ where: { id }, data: { ownerId }, select: dealSelect });
-    await activityService.record({
-      type: 'SYSTEM', entityType: 'DEAL', entityId: id,
-      title: ownerId ? 'Deal reassigned' : 'Deal unassigned',
+    await announceAssignment({
+      entity: 'deal', entityId: id,
+      previousOwnerId: deal.ownerId, newOwnerId: ownerId, source,
     });
     return updated;
   },
 
-  /** Converts a lead into a customer (reusing an existing match by email/phone). */
-  async convertLead(leadId: string) {
+  /**
+   * Turns a lead into a deal.
+   *
+   * Conversion means an opportunity now exists, so it creates one: previously
+   * this only made a Customer and flipped the status, and the deal appeared
+   * solely when an off-by-default automation toggle was on — which is why
+   * pressing Convert looked like it did nothing.
+   *
+   * The lead itself is never deleted or emptied. It keeps its source, dates,
+   * activities, notes, owner, tags and custom fields, and gains the record of
+   * what it became and who decided that.
+   */
+  async convertLead(leadId: string, dto: ConvertLeadDto = {}) {
     const lead = await prisma.lead.findFirst({ where: { id: leadId, deletedAt: null } });
     if (!lead) throw new NotFoundError('Lead');
     if (lead.status === 'CONVERTED') throw new ConflictError('Lead is already converted');
 
+    const auto = await this.getDealAutomation();
+    const pipelineId = dto.pipelineId ?? auto.pipelineId ?? undefined;
+    const actorId = actorMembershipId();
+
+    // Customer and lead move together: a lead marked converted with no customer
+    // behind it is a broken record, not a partial success.
     const result = await prisma.$transaction(async (tx) => {
       let customer = await tx.customer.findFirst({
         where: {
@@ -1067,25 +1394,65 @@ export const crmService = {
       });
       const updated = await tx.lead.update({
         where: { id: leadId },
-        data: { status: 'CONVERTED', customerId: customer.id, convertedAt: new Date() },
+        data: {
+          status: 'CONVERTED',
+          customerId: customer.id,
+          convertedAt: new Date(),
+          convertedById: actorId,
+        },
       });
       return { lead: updated, customerId: customer.id };
     });
+
+    // An existing open deal on this lead is the opportunity — converting again
+    // must not stack a second one beside it.
+    const existing = await prisma.deal.findFirst({
+      where: { leadId, deletedAt: null, status: 'OPEN' },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const deal =
+      existing ??
+      (await this.createDeal({
+        title: dto.title?.trim() || `${fullName(lead.firstName, lead.lastName)} — opportunity`,
+        leadId,
+        customerId: result.customerId,
+        companyId: lead.companyId ?? undefined,
+        ownerId: dto.ownerId ?? lead.ownerId ?? undefined,
+        value: dto.value ?? (lead.estimatedValue ? Number(lead.estimatedValue) : 0),
+        pipelineId,
+      }));
+
+    // Point the lead at what it became, so the record reads both ways.
+    const linked = await prisma.lead.update({
+      where: { id: leadId },
+      data: { convertedDealId: deal.id },
+    });
+
     await activityService.record({
       type: 'SYSTEM',
       entityType: 'LEAD',
       entityId: leadId,
-      title: `Lead converted to customer`,
-      also: [{ entityType: 'CUSTOMER', entityId: result.customerId }],
+      title: `Lead converted to deal — ${deal.title}`,
+      body: [
+        `Deal: ${deal.title}`,
+        existing ? 'Linked to the deal already open on this lead.' : 'New deal created.',
+        `Customer: ${fullName(lead.firstName, lead.lastName)}`,
+      ].join('\n'),
+      metadata: {
+        previous: { status: lead.status },
+        next: { status: 'CONVERTED' },
+        dealId: deal.id,
+        customerId: result.customerId,
+        source: lead.source ?? null,
+      },
+      also: [
+        { entityType: 'CUSTOMER', entityId: result.customerId },
+        { entityType: 'DEAL', entityId: deal.id },
+      ],
     });
-    // After the commit, so the deal links to the customer the conversion just
-    // created. Best-effort: a failed automation must not undo the conversion.
-    try {
-      await this.maybeAutoCreateDeal({ ...result.lead, customerId: result.customerId }, 'converted');
-    } catch (e) {
-      logger.error({ err: e, leadId }, 'auto deal creation failed after lead conversion');
-    }
-    return result;
+
+    return { lead: linked, customerId: result.customerId, deal, dealCreated: !existing };
   },
 
   /** Members eligible for lead/deal ownership (active memberships). */
@@ -1168,11 +1535,12 @@ export const crmService = {
       const next = await resolveAssignee(cfg);
       if (!next || next === lead.ownerId) continue;
       await prisma.lead.update({ where: { id: lead.id }, data: { ownerId: next } });
-      await activityService.record({
-        type: 'SYSTEM',
-        entityType: 'LEAD',
+      await announceAssignment({
+        entity: 'lead',
         entityId: lead.id,
-        title: 'Reassigned — SLA breach (no response in time)',
+        previousOwnerId: lead.ownerId,
+        newOwnerId: next,
+        source: 'SLA_REASSIGN',
       });
       reassigned += 1;
     }
@@ -1202,10 +1570,81 @@ export const crmService = {
   },
 
   async listNotes(dto: ListNotesDto) {
-    return prisma.note.findMany({
+    const notes = await prisma.note.findMany({
       where: { deletedAt: null, entityType: dto.entityType, entityId: dto.entityId },
       orderBy: [{ isPinned: 'desc' }, { createdAt: 'desc' }],
     });
+
+    // "Sarah" reads better than a user id, and the note list is the one place
+    // authorship actually matters.
+    const authorIds = [...new Set(notes.map((n) => n.authorUserId).filter((id): id is string => !!id))];
+    const authors = authorIds.length
+      ? await prismaUnscoped.user.findMany({
+          where: { id: { in: authorIds } },
+          select: { id: true, firstName: true, lastName: true },
+        })
+      : [];
+    const nameById = new Map(authors.map((a) => [a.id, `${a.firstName} ${a.lastName ?? ''}`.trim()]));
+
+    const viewerId = requestContext.get()?.userId ?? null;
+    return notes.map((note) => ({
+      ...note,
+      authorName: note.authorUserId ? nameById.get(note.authorUserId) ?? null : null,
+      /** Whether this note has been edited since it was written. */
+      edited: note.updatedAt.getTime() - note.createdAt.getTime() > 1000,
+      isOwn: Boolean(viewerId && note.authorUserId === viewerId),
+    }));
+  },
+
+  /**
+   * Edit a note.
+   *
+   * Anyone may correct their own; changing someone else's is a separate
+   * permission, checked here rather than only at the route, because a note is
+   * a record of what a colleague observed.
+   */
+  async updateNote(noteId: string, body: string, canEditOthers = false) {
+    const note = await prisma.note.findFirst({ where: { id: noteId, deletedAt: null } });
+    if (!note) throw new NotFoundError('Note');
+
+    const viewerId = requestContext.get()?.userId ?? null;
+    const isOwn = Boolean(viewerId && note.authorUserId === viewerId);
+    if (!isOwn && !canEditOthers) {
+      throw new ForbiddenError('You can only edit your own notes');
+    }
+
+    const updated = await prisma.note.update({ where: { id: noteId }, data: { body } });
+    await activityService.record({
+      type: 'NOTE',
+      entityType: note.entityType,
+      entityId: note.entityId,
+      title: 'Note edited',
+      body,
+      metadata: { noteId, previous: { body: note.body }, next: { body } },
+    });
+    return updated;
+  },
+
+  /** Soft-delete a note, so the timeline still shows that it existed. */
+  async deleteNote(noteId: string, canDeleteOthers = false) {
+    const note = await prisma.note.findFirst({ where: { id: noteId, deletedAt: null } });
+    if (!note) throw new NotFoundError('Note');
+
+    const viewerId = requestContext.get()?.userId ?? null;
+    const isOwn = Boolean(viewerId && note.authorUserId === viewerId);
+    if (!isOwn && !canDeleteOthers) {
+      throw new ForbiddenError('You can only delete your own notes');
+    }
+
+    await prisma.note.update({ where: { id: noteId }, data: { deletedAt: new Date() } });
+    await activityService.record({
+      type: 'NOTE',
+      entityType: note.entityType,
+      entityId: note.entityId,
+      title: 'Note deleted',
+      metadata: { noteId, previous: { body: note.body } },
+    });
+    return { ok: true };
   },
 
   // ------------------------------------------------------------------ tasks

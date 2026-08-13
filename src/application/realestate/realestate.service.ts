@@ -434,7 +434,10 @@ export const realestateService = {
         source: 'PROPERTY_INQUIRY',
         estimatedValue: property.price ? Number(property.price) : null,
       },
-      { forceAutoAssign: true },
+      // A website inquiry has nobody to ask, so a repeat enquirer re-engages
+      // their existing lead rather than opening a second one — recorded and
+      // with the owner notified, not silently.
+      { forceAutoAssign: true, onDuplicate: 'reengage' },
     );
     await crmService.createNote({
       entityType: 'LEAD',

@@ -11,6 +11,7 @@ import {
 } from '../../../application/inbox/inbox.service';
 import {
   channelsService,
+  updateChannelSchema,
   connectChannelSchema,
 } from '../../../application/inbox/channels.service';
 
@@ -137,8 +138,8 @@ inboxRoutes.post(
 inboxRoutes.get(
   '/channels',
   requirePermission('inbox.read', 'settings.manage_integrations'),
-  wrap(async (_req, res) => {
-    res.json({ success: true, data: await channelsService.list() });
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await channelsService.list(req.auth!.organizationId!) });
   })
 );
 
@@ -155,12 +156,26 @@ inboxRoutes.post(
 
 inboxRoutes.patch(
   '/channels/:id/auto-reply',
-  requirePermission('inbox.manage_channels', 'settings.manage_integrations'),
+  // Deciding what answers a customer unattended is its own trust level.
+  requirePermission('inbox.configure_auto_reply', 'inbox.manage_channels', 'settings.manage_integrations'),
   validate({ body: z.object({ enabled: z.boolean() }) }),
   wrap(async (req, res) => {
     res.json({
       success: true,
       data: await channelsService.setAutoReply(req.params.id as string, req.body.enabled),
+    });
+  })
+);
+
+/** Rename an instance, or change what it is used for. */
+inboxRoutes.patch(
+  '/channels/:id',
+  requirePermission('inbox.manage_channels', 'settings.manage_integrations'),
+  validate({ body: updateChannelSchema }),
+  wrap(async (req, res) => {
+    res.json({
+      success: true,
+      data: await channelsService.update(req.params.id as string, req.body),
     });
   })
 );

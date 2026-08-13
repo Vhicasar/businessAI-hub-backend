@@ -28,7 +28,41 @@ export interface WorkspaceConfig {
   limits: Record<string, number>;
   /** { [integrationId]: { enabled } } — admin can disable an integration. */
   integrations: Record<string, { enabled: boolean }>;
+  /**
+   * How many instances of each channel type a business may run, and what it
+   * costs to run more. Per type rather than a single total, because "you may
+   * have three inboxes" is a different product decision for email than for
+   * WhatsApp, and the price differs too.
+   */
+  channels: Record<string, ChannelPolicy>;
 }
+
+export interface ChannelPolicy {
+  /** Off hides the type entirely — not offered, not connectable. */
+  available: boolean;
+  /** Instances included at no extra cost. */
+  defaultQuantity: number;
+  /** Ceiling however many add-ons are bought. 0 means no ceiling. */
+  maxQuantity: number;
+  /** Catalog add-on that grants another instance. Null = cannot buy more. */
+  addOnId: string | null;
+  /** Plan feature required before the type can be used at all. */
+  requiresFeature: string | null;
+}
+
+/**
+ * What a channel type does by default: one instance, more purchasable.
+ *
+ * Deliberately not hardcoded per type here — the admin's config is the source
+ * of truth and this is only the fallback when it has said nothing.
+ */
+export const DEFAULT_CHANNEL_POLICY: ChannelPolicy = {
+  available: true,
+  defaultQuantity: 1,
+  maxQuantity: 0,
+  addOnId: null,
+  requiresFeature: null,
+};
 
 const DEFAULTS: WorkspaceConfig = {
   featureFlags: {},
@@ -42,6 +76,7 @@ const DEFAULTS: WorkspaceConfig = {
   storage: { maxUploadMb: 25, totalStorageGb: null, allowedTypes: [] },
   limits: {},
   integrations: {},
+  channels: {},
 };
 
 /** Raw override shape from the admin (all keys optional/partial). */
@@ -51,6 +86,7 @@ export interface WorkspaceConfigOverride {
   storage?: Partial<WorkspaceConfig['storage']>;
   limits?: Record<string, number>;
   integrations?: Record<string, { enabled: boolean }>;
+  channels?: Record<string, Partial<ChannelPolicy>>;
 }
 
 let override: WorkspaceConfigOverride | null = null;
@@ -69,7 +105,20 @@ export function getWorkspaceConfig(): WorkspaceConfig {
     storage: { ...DEFAULTS.storage, ...(override.storage ?? {}) },
     limits: { ...DEFAULTS.limits, ...(override.limits ?? {}) },
     integrations: { ...DEFAULTS.integrations, ...(override.integrations ?? {}) },
+    // Each type is merged over the default individually, so the admin can set
+    // just a price or just a ceiling without restating the whole policy.
+    channels: Object.fromEntries(
+      Object.entries(override.channels ?? {}).map(([type, policy]) => [
+        type,
+        { ...DEFAULT_CHANNEL_POLICY, ...policy },
+      ]),
+    ),
   };
+}
+
+/** The policy for one channel type, falling back to the default. */
+export function channelPolicy(channelType: string): ChannelPolicy {
+  return getWorkspaceConfig().channels[channelType] ?? DEFAULT_CHANNEL_POLICY;
 }
 
 /** Is a centrally-controlled feature flag on? Unknown flags default to `fallback`. */

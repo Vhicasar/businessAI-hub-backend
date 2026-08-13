@@ -83,15 +83,28 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * and surface accurate delivery status without failing the surrounding action.
  * Every attempt is logged for troubleshooting.
  */
+export interface MailAttachment {
+  filename: string;
+  content: Buffer;
+  contentType: string;
+}
+
 async function send(
   to: string,
   subject: string,
   html: string,
   text: string,
-  opts: { retries?: number; context?: EmailContext } = {},
+  opts: { retries?: number; context?: EmailContext; attachments?: MailAttachment[] } = {},
 ): Promise<MailResult> {
   const retries = opts.retries ?? 3;
-  const message = { from: env.MAIL_FROM, to, subject, html, text };
+  const message = {
+    from: env.MAIL_FROM,
+    to,
+    subject,
+    html,
+    text,
+    ...(opts.attachments?.length ? { attachments: opts.attachments } : {}),
+  };
   let lastErr: unknown;
 
   for (let attempt = 1; attempt <= retries; attempt++) {
@@ -154,6 +167,34 @@ const layout = async (title: string, bodyHtml: string) => {
 };
 
 export const mailer = {
+  /**
+   * Whether mail can actually leave the building.
+   *
+   * Without SMTP configured the transport logs instead of sending, so callers
+   * that offer emailing as a choice need to know not to offer it.
+   */
+  isConfigured(): boolean {
+    return Boolean(env.SMTP_HOST);
+  },
+
+  /**
+   * Send a document — an invoice, a receipt — with its file attached.
+   *
+   * Separate from `sendNotice` because the body is the document itself and
+   * must not be wrapped in the notification layout, which would put a
+   * platform header above a business's own invoice.
+   */
+  async sendDocument(
+    to: string,
+    subject: string,
+    html: string,
+    text: string,
+    attachments: MailAttachment[],
+    context?: EmailContext,
+  ): Promise<MailResult> {
+    return send(to, subject, html, text, { attachments, context });
+  },
+
   async sendEmailVerification(to: string, token: string, userId?: string | null): Promise<MailResult> {
     const url = `${env.WEB_APP_URL}/auth/verify-email?token=${token}`;
     return send(

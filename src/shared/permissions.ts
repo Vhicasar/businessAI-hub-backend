@@ -8,10 +8,25 @@
 
 export const PERMISSION_MODULES = {
   dashboard: ['view'],
-  inbox: ['read', 'reply', 'assign', 'resolve', 'delete', 'manage_channels'],
+  // `manage_channels` covers connecting and configuring a channel;
+  // `purchase_channels` is the money decision of buying another instance, and
+  // `configure_auto_reply` is separable because deciding what answers a
+  // customer unattended is not the same trust as adding an inbox.
+  inbox: ['read', 'reply', 'assign', 'resolve', 'delete', 'manage_channels', 'purchase_channels', 'configure_auto_reply'],
   customers: ['read', 'create', 'update', 'delete', 'export', 'merge'],
   companies: ['read', 'create', 'update', 'delete'],
-  crm: ['read', 'create', 'update', 'delete', 'manage_pipelines'],
+  // `convert` and `reengage` are split out from `update`: turning a lead into
+  // an opportunity and re-opening one against a prospect are pipeline
+  // decisions, not edits to a record.
+  // Notes are split out because editing or removing a colleague's written
+  // observation is a different trust level from adding your own — `note_create`
+  // is routine, the other two are not. `change_value` is separate for the same
+  // reason: it rewrites what a deal is worth.
+  crm: [
+    'read', 'create', 'update', 'delete', 'manage_pipelines',
+    'convert', 'reengage', 'change_stage', 'change_value', 'assign',
+    'note_create', 'note_update', 'note_delete',
+  ],
   quotations: ['read', 'create', 'update', 'delete', 'send'],
   contracts: ['read', 'create', 'update', 'delete'],
   catalog: ['read', 'create', 'update', 'delete', 'manage_pricing'],
@@ -143,7 +158,9 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, { description: string; permis
     description: 'Unified inbox, tickets and knowledge base',
     permissions: [
       'dashboard.view',
-      ...keysFor('inbox', 'support', 'kb'),
+      // Everything about running the inbox, except spending money on another
+      // channel — that is the business owner's call, not the agent's.
+      ...keysFor('inbox', 'support', 'kb').filter((k) => k !== 'inbox.purchase_channels'),
       'customers.read', 'customers.update',
       'orders.read', 'invoices.read', 'delivery.read', 'promotions.read',
       // §10: an agent settles "how do I pay?" inside the conversation.
