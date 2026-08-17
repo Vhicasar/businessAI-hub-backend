@@ -249,6 +249,130 @@ serviceRoutes.patch(
 );
 
 /**
+ * Manually verify and activate an organisation.
+ *
+ * For the case support actually hits: a business signed up, the verification
+ * email never arrived — wrong address, a spam filter, a dead mailbox — and they
+ * cannot get in. The operator confirms who they are out of band and lets them
+ * through, rather than the business being stuck behind an email nobody can
+ * resend to a working inbox.
+ *
+ * Deliberately narrow. It marks members' email addresses verified and puts the
+ * organisation back to ACTIVE; it does not touch passwords, roles or anything
+ * a support agent should never be able to change. Suspended and deleted users
+ * are skipped — being unable to receive an email is not a reason to reinstate
+ * someone who was suspended on purpose.
+ */
+serviceRoutes.post(
+  '/organizations/:id/activate',
+  validate({
+    body: z.object({
+      /** Who asked for this and why — recorded on both sides. */
+      reason: z.string().trim().min(3).max(500),
+      performedBy: z.string().trim().max(160).optional(),
+    }),
+  }),
+  wrap(async (req, res) => {
+    const id = req.params.id as string;
+    const organization = await prismaUnscoped.organization.findFirst({
+      where: { id, deletedAt: null },
+      select: {
+        id: true, name: true, status: true,
+        memberships: {
+          where: { deletedAt: null },
+          select: {
+            isActive: true,
+            user: { select: { id: true, email: true, status: true, emailVerifiedAt: true, deletedAt: true } },
+          },
+        },
+      },
+    });
+    if (!organization) throw new NotFoundError('Organization');
+
+    // Someone suspended on purpose stays suspended.
+    const eligible = organization.memberships
+      .filter((m) => m.isActive && !m.user.deletedAt && m.user.status !== 'SUSPENDED')
+      .map((m) => m.user);
+    const unverified = eligible.filter((u) => !u.emailVerifiedAt);
+
+    /*
+     * Only lift a status that actually blocks sign-in.
+     *
+     * Login refuses SUSPENDED and CANCELLED organisations; TRIAL signs in
+     * perfectly well. Forcing everything to ACTIVE would quietly end a trial
+     * and misstate the business's billing state to fix an email problem.
+     */
+    const blocking: string[] = ['SUSPENDED', 'CANCELLED'];
+    const liftStatus = blocking.includes(organization.status);
+
+    const verifiedAt = new Date();
+    const [, updatedOrg] = await prismaUnscoped.$transaction([
+      prismaUnscoped.user.updateMany({
+        where: { id: { in: unverified.map((u) => u.id) } },
+        data: { emailVerifiedAt: verifiedAt },
+      }),
+      prismaUnscoped.organization.update({
+        where: { id },
+        data: liftStatus ? { status: 'ACTIVE' } : {},
+        select: { id: true, name: true, status: true, updatedAt: true },
+      }),
+    ]);
+
+    logger.info(
+      {
+        organizationId: id,
+        previousStatus: organization.status,
+        verifiedUsers: unverified.length,
+        performedBy: req.body.performedBy ?? 'admin',
+      },
+      'service API: organization manually verified and activated',
+    );
+
+    /*
+     * Recorded in the business's own audit log, not only in the admin's.
+     *
+     * Bypassing email verification is exactly the kind of action that has to be
+     * answerable from the affected account's own history — an operator letting
+     * someone in should be visible to the business, not just to the platform.
+     */
+    await prismaUnscoped.auditLog
+      .create({
+        data: {
+          organizationId: id,
+          actorType: 'SYSTEM',
+          action: 'organization.manual_activation',
+          entityType: 'Organization',
+          entityId: id,
+          before: { status: organization.status, unverifiedMembers: unverified.length },
+          after: {
+            status: updatedOrg.status,
+            unverifiedMembers: 0,
+            // The whole point of requiring a reason is that it survives.
+            reason: req.body.reason,
+            performedBy: req.body.performedBy ?? 'Vhicasar admin',
+            verifiedEmails: unverified.map((u) => u.email),
+          },
+        },
+      })
+      .catch((error: unknown) =>
+        logger.warn({ error, organizationId: id }, 'manual activation not written to the audit log'),
+      );
+
+    res.json({
+      success: true,
+      data: {
+        organization: updatedOrg,
+        previousStatus: organization.status,
+        statusChanged: liftStatus,
+        verifiedUsers: unverified.map((u) => u.email),
+        alreadyVerified: eligible.length - unverified.length,
+        skipped: organization.memberships.length - eligible.length,
+      },
+    });
+  }),
+);
+
+/**
  * Soft-delete an organisation. Memberships are disabled and billable
  * subscriptions cancelled, while tenant data remains recoverable in storage.
  */
