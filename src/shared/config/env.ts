@@ -207,7 +207,17 @@ export const env = {
     stripePublicKey: raw.STRIPE_PUBLIC_KEY || '',
     stripeWebhookSecret: raw.STRIPE_WEBHOOK_SECRET || '',
     stripeEnabled: Boolean(raw.STRIPE_SECRET_KEY),
-    callbackUrl: raw.BILLING_CALLBACK_URL || `${raw.WEB_APP_URL}/settings/billing`,
+    /*
+     * Where the gateway returns the customer after paying.
+     *
+     * `/billing` is the page itself. `/settings/billing` is an alias that
+     * redirects to it, and a redirect is the wrong thing to hand a payment
+     * gateway: the reference arrives as a query parameter, and forwarding a
+     * customer to a bare path drops it. Deployments that already point at the
+     * alias still work — the alias forwards its query now — but new ones
+     * should land on the page directly.
+     */
+    callbackUrl: raw.BILLING_CALLBACK_URL || `${raw.WEB_APP_URL}/billing`,
     /** Currencies the merchant can settle; defaults to the settlement currency. */
     chargeCurrencies: (raw.PAYSTACK_CHARGE_CURRENCIES || raw.BILLING_CURRENCY)
       .split(',')

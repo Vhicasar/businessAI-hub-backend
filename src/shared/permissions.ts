@@ -30,7 +30,13 @@ export const PERMISSION_MODULES = {
   quotations: ['read', 'create', 'update', 'delete', 'send'],
   contracts: ['read', 'create', 'update', 'delete'],
   catalog: ['read', 'create', 'update', 'delete', 'manage_pricing'],
-  inventory: ['read', 'adjust', 'transfer', 'manage_warehouses', 'set_reorder_levels'],
+  // Requisitions are split from `transfer` because asking, agreeing and
+  // physically sending are done by different people: a branch raises the
+  // request, the source warehouse decides, and only then does stock move.
+  inventory: [
+    'read', 'adjust', 'transfer', 'manage_warehouses', 'set_reorder_levels',
+    'requisition_create', 'requisition_approve', 'requisition_dispatch', 'requisition_receive',
+  ],
   // Who you buy from. Separate from `purchasing` because maintaining the
   // supplier book is a different job from raising and receiving orders — a
   // buyer needs both, a warehouse hand only needs to read.

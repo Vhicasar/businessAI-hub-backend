@@ -7,6 +7,7 @@ import { requestContext } from '../../shared/context';
 import { AppError, ConflictError, NotFoundError, ValidationError } from '../../shared/errors';
 import { auditService } from '../audit/audit.service';
 import { emitEvent } from '../../shared/domain-events';
+import { logger } from '../../shared/logger';
 import { broadcast } from '../../infrastructure/realtime/live-events';
 import { ZERO, money } from '../../shared/money';
 
@@ -53,9 +54,36 @@ export const listPurchaseOrdersSchema = z.object({
 export const receiveSchema = z.object({
   /** Omit to receive everything still outstanding. */
   items: z
-    .array(z.object({ itemId: z.string().min(1), quantity: z.coerce.number().positive() }))
+    .array(
+      z.object({
+        itemId: z.string().min(1),
+        quantity: z.coerce.number().positive(),
+        /// The supplier's batch or lot reference for what physically arrived.
+        batchNumber: z.string().trim().max(80).optional(),
+        /// When it goes out of date. Two deliveries against one order line can
+        /// carry different batches, so this belongs on the receipt.
+        expiryDate: z.coerce.date().optional(),
+      }),
+    )
     .optional(),
   note: z.string().trim().max(300).optional(),
+  /**
+   * Where the goods actually landed. Defaults to the order's warehouse; a
+   * delivery redirected on the day can name a different one.
+   */
+  warehouseId: z.string().min(1).optional(),
+  /**
+   * Client-generated, stable for one physical receipt.
+   *
+   * A warehouse tablet double-tapping, an offline queue replaying, or an HTTP
+   * retry must not book the same pallet twice — the second request returns the
+   * first result instead of adding stock again.
+   */
+  idempotencyKey: z.string().trim().min(8).max(120).optional(),
+  /** Required when a line exceeds what was ordered, if that is permitted. */
+  discrepancyNote: z.string().trim().max(500).optional(),
+  /** The receiver stating they mean to book in more than was ordered. */
+  allowOverReceive: z.boolean().optional(),
 });
 
 export type PurchaseOrderDto = z.infer<typeof purchaseOrderSchema>;
@@ -67,11 +95,37 @@ export type PurchaseOrderDto = z.infer<typeof purchaseOrderSchema>;
  */
 const TRANSITIONS: Record<PurchaseOrderStatus, PurchaseOrderStatus[]> = {
   DRAFT: ['ORDERED', 'CANCELLED'],
-  ORDERED: ['PARTIALLY_RECEIVED', 'RECEIVED', 'CANCELLED'],
-  PARTIALLY_RECEIVED: ['RECEIVED', 'CANCELLED'],
+  ORDERED: ['PARTIALLY_RECEIVED', 'RECEIVED', 'OVER_RECEIVED', 'CANCELLED', 'CLOSED'],
+  // Closing short is a buyer's decision that the rest will never arrive.
+  PARTIALLY_RECEIVED: ['RECEIVED', 'OVER_RECEIVED', 'CANCELLED', 'CLOSED'],
   RECEIVED: [],
+  OVER_RECEIVED: [],
   CANCELLED: [],
+  CLOSED: [],
 };
+
+/**
+ * Whether this business accepts more than it ordered.
+ *
+ * Off by default: a delivery larger than the order is usually a mistake worth
+ * stopping at the door, and a business that genuinely wants it can say so.
+ */
+async function receivingPolicy(organizationId: string): Promise<{ allowOverReceive: boolean }> {
+  try {
+    const org = await prismaUnscoped.organization.findUnique({
+      where: { id: organizationId },
+      select: { settings: true },
+    });
+    const receiving = ((org?.settings as Record<string, unknown>) ?? {}).receiving as
+      | { allowOverReceive?: boolean }
+      | undefined;
+    return { allowOverReceive: Boolean(receiving?.allowOverReceive) };
+  } catch {
+    // A settings read failing must not let stock in that the business may not
+    // want, so the safe answer is the restrictive one.
+    return { allowOverReceive: false };
+  }
+}
 
 const EDITABLE: PurchaseOrderStatus[] = ['DRAFT'];
 
@@ -468,6 +522,100 @@ export const purchaseOrdersService = {
    * is refused rather than silently absorbed — it is almost always a typo, and
    * the alternative is stock appearing from nowhere.
    */
+  /**
+   * Book a delivery in against an order.
+   *
+   * Idempotent when the caller supplies a key: a warehouse tablet that
+   * double-taps, an offline queue that replays, or an HTTP retry must not book
+   * the same pallet twice. The second request returns the first result rather
+   * than adding stock again.
+   */
+  /**
+   * Everything a warehouse needs on one screen to receive this order.
+   *
+   * Expected, already received, and what is still outstanding per line — plus
+   * the barcodes that identify each product, so scanning can match a physical
+   * item to a line without a second round trip per scan.
+   */
+  async receivingView(id: string) {
+    const po = await prisma.purchaseOrder.findFirst({
+      where: { id },
+      include: {
+        supplier: { select: { id: true, name: true } },
+        warehouse: { select: { id: true, name: true, code: true } },
+        items: {
+          include: {
+            variant: {
+              select: {
+                id: true, sku: true, barcode: true, name: true,
+                product: { select: { name: true, unit: true } },
+              },
+            },
+          },
+        },
+        receipts: {
+          orderBy: { createdAt: 'desc' },
+          include: { lines: true, warehouse: { select: { id: true, name: true } } },
+        },
+      },
+    });
+    if (!po) throw new NotFoundError('Purchase order');
+
+    const policy = await receivingPolicy(po.organizationId);
+    const warehouses = await prisma.warehouse.findMany({
+      where: { deletedAt: null, isActive: true },
+      select: { id: true, name: true, code: true, isDefault: true },
+      orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
+    });
+
+    return {
+      id: po.id,
+      number: po.number,
+      status: po.status,
+      currency: po.currency,
+      orderedAt: po.orderedAt,
+      expectedAt: po.expectedAt,
+      supplier: po.supplier,
+      warehouse: po.warehouse,
+      /** Where it may be received — a delivery can be redirected on the day. */
+      warehouses,
+      allowOverReceive: policy.allowOverReceive,
+      items: po.items.map((item) => {
+        const expected = Number(item.quantity);
+        const received = Number(item.receivedQty);
+        return {
+          itemId: item.id,
+          variantId: item.variantId,
+          sku: item.variant.sku,
+          // Both are matched on scan: a shelf label may carry either.
+          barcode: item.variant.barcode,
+          name: item.variant.name || item.variant.product.name,
+          /// How the product is counted — shown beside every quantity so a
+          /// warehouse knows whether "50" means bags or kilos.
+          unit: item.variant.product.unit,
+          unitCost: Number(item.unitCost),
+          expected,
+          previouslyReceived: received,
+          remaining: Math.max(0, Number((expected - received).toFixed(3))),
+          overReceived: received > expected,
+        };
+      }),
+      history: po.receipts.map((r) => ({
+        id: r.id,
+        receivedAt: r.createdAt,
+        warehouse: r.warehouse,
+        discrepancyNote: r.discrepancyNote,
+        lines: r.lines.map((l) => ({
+          itemId: l.itemId,
+          quantity: Number(l.quantity),
+          overReceived: l.overReceived,
+          batchNumber: l.batchNumber,
+          expiryDate: l.expiryDate,
+        })),
+      })),
+    };
+  },
+
   async receive(id: string, dto: z.infer<typeof receiveSchema>, actorUserId?: string) {
     const po = await prisma.purchaseOrder.findFirst({
       where: { id },
@@ -478,44 +626,125 @@ export const purchaseOrdersService = {
       throw new ConflictError('Place this order with the supplier before receiving against it.');
     }
     if (po.status === 'CANCELLED') throw new ConflictError('This order was cancelled.');
+    if (po.status === 'CLOSED') throw new ConflictError('This order was closed short and cannot take more stock.');
     if (po.status === 'RECEIVED') throw new ConflictError('This order has already been received in full.');
 
+    const organizationId = po.organizationId;
+
+    /*
+     * A replay returns what the first attempt produced.
+     *
+     * Checked before any validation so a retry cannot fail on a rule the
+     * original request already passed — by then the outstanding quantity has
+     * moved, and re-validating would reject the very receipt that succeeded.
+     */
+    if (dto.idempotencyKey) {
+      const seen = await prisma.purchaseOrderReceipt.findFirst({
+        where: { organizationId, idempotencyKey: dto.idempotencyKey },
+        select: { id: true, purchaseOrderId: true },
+      });
+      if (seen) {
+        logger.info(
+          { purchaseOrderId: id, idempotencyKey: dto.idempotencyKey },
+          'purchase order receipt replayed — returning the original result',
+        );
+        return prisma.purchaseOrder.findFirstOrThrow({ where: { id }, include: detailInclude });
+      }
+    }
+
+    // A delivery can be redirected on the day, so the receiving warehouse is
+    // the caller's choice — validated as one of this business's own.
+    const warehouseId = dto.warehouseId ?? po.warehouseId;
+    if (warehouseId !== po.warehouseId) {
+      const warehouse = await prisma.warehouse.findFirst({
+        where: { id: warehouseId, deletedAt: null, isActive: true },
+        select: { id: true },
+      });
+      if (!warehouse) throw new ValidationError('That receiving warehouse does not exist or is inactive.');
+    }
+
     // No explicit lines means "everything still outstanding".
-    const requested = dto.items
+    /*
+     * Receiving everything outstanding carries no batch information — nobody
+     * typed any. Shaped the same as an explicit line so the two paths cannot
+     * drift apart.
+     */
+    type ReceiveLine = {
+      itemId: string;
+      quantity: number;
+      batchNumber?: string;
+      expiryDate?: Date;
+    };
+    const requested: ReceiveLine[] = dto.items
       ?? po.items
         .filter((i) => money(i.quantity).greaterThan(i.receivedQty))
         .map((i) => ({ itemId: i.id, quantity: Number(money(i.quantity).sub(i.receivedQty)) }));
     if (requested.length === 0) throw new ConflictError('Nothing is outstanding on this order.');
+
+    const policy = await receivingPolicy(organizationId);
+    const overLines: string[] = [];
 
     for (const line of requested) {
       const item = po.items.find((i) => i.id === line.itemId);
       if (!item) throw new NotFoundError('Purchase order line');
       const outstanding = money(item.quantity).sub(item.receivedQty);
       if (money(line.quantity).greaterThan(outstanding)) {
-        throw new ValidationError(
-          `Cannot receive ${line.quantity} — only ${outstanding.toString()} of that line is outstanding.`
-        );
+        if (!policy.allowOverReceive) {
+          throw new ValidationError(
+            `Cannot receive ${line.quantity} — only ${outstanding.toString()} of that line is outstanding. ` +
+              'Enable over-receiving in settings if deliveries regularly exceed the order.'
+          );
+        }
+        if (!dto.allowOverReceive) {
+          throw new ValidationError(
+            `Receiving ${line.quantity} exceeds the ${outstanding.toString()} outstanding on that line. ` +
+              'Confirm the over-receipt to continue.'
+          );
+        }
+        if (!dto.discrepancyNote?.trim()) {
+          throw new ValidationError('Give a reason when receiving more than was ordered.');
+        }
+        overLines.push(line.itemId);
       }
     }
 
-    const organizationId = po.organizationId;
     const updated = await prisma.$transaction(async (tx) => {
+      const receipt = await tx.purchaseOrderReceipt.create({
+        data: {
+          organizationId,
+          purchaseOrderId: id,
+          warehouseId,
+          idempotencyKey: dto.idempotencyKey ?? null,
+          discrepancyNote: dto.discrepancyNote?.trim() || null,
+          receivedById: actorUserId ?? null,
+        },
+      });
+
       for (const line of requested) {
         const item = po.items.find((i) => i.id === line.itemId)!;
+        const outstanding = money(item.quantity).sub(item.receivedQty);
+
         await tx.purchaseOrderItem.update({
           where: { id: item.id },
           data: { receivedQty: money(item.receivedQty).add(line.quantity) },
         });
+        await tx.purchaseOrderReceiptLine.create({
+          data: {
+            receiptId: receipt.id,
+            itemId: item.id,
+            variantId: item.variantId,
+            quantity: money(line.quantity),
+            outstandingAtReceipt: outstanding,
+            overReceived: overLines.includes(line.itemId),
+            batchNumber: line.batchNumber?.trim() || null,
+            expiryDate: line.expiryDate ?? null,
+          },
+        });
 
         const level = await tx.stockLevel.upsert({
-          where: { warehouseId_variantId: { warehouseId: po.warehouseId, variantId: item.variantId } },
+          where: { warehouseId_variantId: { warehouseId, variantId: item.variantId } },
           update: {},
-          create: {
-            organizationId,
-            warehouseId: po.warehouseId,
-            variantId: item.variantId,
-            quantity: 0,
-          },
+          create: { organizationId, warehouseId, variantId: item.variantId, quantity: 0 },
         });
         await tx.stockLevel.update({
           where: { id: level.id },
@@ -524,7 +753,7 @@ export const purchaseOrdersService = {
         await tx.stockMovement.create({
           data: {
             organizationId,
-            warehouseId: po.warehouseId,
+            warehouseId,
             variantId: item.variantId,
             type: 'PURCHASE_RECEIPT',
             quantity: money(line.quantity),
@@ -532,17 +761,26 @@ export const purchaseOrdersService = {
             referenceId: po.id,
             reason: dto.note ?? `Received against ${po.number}`,
             actorUserId: actorUserId ?? null,
+            // Carried on the movement too, so traceability survives even if the
+            // receipt is later archived.
+            batchNumber: line.batchNumber?.trim() || null,
+            expiryDate: line.expiryDate ?? null,
           },
         });
       }
 
       const fresh = await tx.purchaseOrderItem.findMany({ where: { purchaseOrderId: id } });
       const complete = fresh.every((i) => money(i.receivedQty).greaterThanOrEqualTo(i.quantity));
+      const over = fresh.some((i) => money(i.receivedQty).greaterThan(i.quantity));
+      // Over-received is its own status: calling it RECEIVED would make a
+      // discrepancy look like a clean close.
+      const status = over ? 'OVER_RECEIVED' : complete ? 'RECEIVED' : 'PARTIALLY_RECEIVED';
+
       return tx.purchaseOrder.update({
         where: { id },
         data: {
-          status: complete ? 'RECEIVED' : 'PARTIALLY_RECEIVED',
-          ...(complete ? { receivedAt: new Date() } : {}),
+          status,
+          ...(complete || over ? { receivedAt: new Date() } : {}),
         },
         include: detailInclude,
       });

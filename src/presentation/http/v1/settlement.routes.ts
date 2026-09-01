@@ -38,6 +38,10 @@ settlementRoutes.get(
 
 settlementRoutes.get(
   '/accounts',
+  // Where the business's money lands. Adding one has always needed a
+  // permission; reading the list did not, so any member of the organization
+  // could see which banks it settles into and in whose name.
+  requirePermission('vhicasar_pay.read', 'vhicasar_pay.payout_account'),
   validate({ query: z.object({ branchId: z.string().trim().optional() }) }),
   wrap(async (req, res) => {
     res.json({ success: true, data: await settlementAccounts.list(req.query as { branchId?: string }) });
@@ -134,6 +138,7 @@ settlementRoutes.get(
 
 settlementRoutes.get(
   '/rules',
+  requirePermission('vhicasar_pay.read', 'vhicasar_pay.settle'),
   validate({
     query: z.object({
       branchId: z.string().trim().optional(),
@@ -179,6 +184,7 @@ settlementRoutes.put(
 /** The dashboard §12 describes. */
 settlementRoutes.get(
   '/dashboard',
+  requirePermission('vhicasar_pay.read', 'vhicasar_pay.settle'),
   validate({ query: z.object({ currency: z.string().trim().length(3).toUpperCase().default('NGN') }) }),
   wrap(async (req, res) => {
     const { currency } = req.query as unknown as { currency: string };

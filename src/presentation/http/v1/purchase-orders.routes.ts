@@ -123,6 +123,25 @@ purchaseOrdersRoutes.get(
   })
 );
 
+/** Expected vs received for a scanned order — a read, before anything moves. */
+purchaseOrdersRoutes.get(
+  '/scan/:token/receiving-view',
+  requirePermission('purchasing.receive', 'purchasing.read'),
+  wrap(async (req, res) => {
+    const po = await purchaseOrdersService.byScanToken(req.params.token as string);
+    res.json({ success: true, data: await purchaseOrdersService.receivingView(po.id) });
+  })
+);
+
+/** Everything the warehouse needs to receive this order, by id. */
+purchaseOrdersRoutes.get(
+  '/:id/receiving-view',
+  requirePermission('purchasing.receive', 'purchasing.read'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await purchaseOrdersService.receivingView(req.params.id as string) });
+  })
+);
+
 /** Receive a scanned order straight into stock. */
 purchaseOrdersRoutes.post(
   '/scan/:token/receive',

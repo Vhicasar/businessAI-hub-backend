@@ -1,0 +1,240 @@
+{
+  "employees": {
+    "items": [
+      {
+        "id": "cmtfra19a00023sqdkernblpm",
+        "employeeNumber": "EMP-1-1788091108262",
+        "firstName": "Oluwaseun",
+        "lastName": "Adebayo-Williams",
+        "email": "o.adebayo@example.com",
+        "phone": "+2348012345678",
+        "jobTitle": "Regional Operations Manager",
+        "departmentId": null,
+        "branchId": null,
+        "employmentType": "FULL_TIME",
+        "status": "ACTIVE",
+        "currency": "USD",
+        "hiredAt": "2024-02-01T00:00:00.000Z",
+        "terminatedAt": null,
+        "createdAt": "2026-08-30T11:58:28.318Z",
+        "avatarFileId": null,
+        "avatarUrl": null
+      },
+      {
+        "id": "cmtfra19a00033sqdv7ye3x6j",
+        "employeeNumber": "EMP-2-1788091108262",
+        "firstName": "Ngozi",
+        "lastName": "Eze",
+        "email": null,
+        "phone": null,
+        "jobTitle": "Cashier",
+        "departmentId": null,
+        "branchId": null,
+        "employmentType": "PART_TIME",
+        "status": "ON_LEAVE",
+        "currency": "USD",
+        "hiredAt": "2025-06-15T00:00:00.000Z",
+        "terminatedAt": null,
+        "createdAt": "2026-08-30T11:58:28.318Z",
+        "avatarFileId": null,
+        "avatarUrl": null
+      },
+      {
+        "id": "cmtfra19a00043sqdn92gj4nm",
+        "employeeNumber": "EMP-3-1788091108262",
+        "firstName": "Tunde",
+        "lastName": "Bello",
+        "email": null,
+        "phone": null,
+        "jobTitle": null,
+        "departmentId": null,
+        "branchId": null,
+        "employmentType": "CONTRACT",
+        "status": "TERMINATED",
+        "currency": "USD",
+        "hiredAt": "2023-01-05T00:00:00.000Z",
+        "terminatedAt": "2025-12-31T00:00:00.000Z",
+        "createdAt": "2026-08-30T11:58:28.318Z",
+        "avatarFileId": null,
+        "avatarUrl": null
+      }
+    ],
+    "nextCursor": null
+  },
+  "marketing": [
+    {
+      "id": "cmtfra19c00063sqdrq70rksf",
+      "name": "Loyalty members early access",
+      "type": "WHATSAPP",
+      "status": "SENT",
+      "subject": null,
+      "content": "Early access opens today.",
+      "stats": null,
+      "startedAt": "2026-08-20T00:00:00.000Z",
+      "completedAt": "2026-08-20T00:00:00.000Z",
+      "createdAt": "2026-08-30T11:58:28.320Z",
+      "_count": {
+        "recipients": 0
+      }
+    },
+    {
+      "id": "cmtfra19c00053sqdptrg201h",
+      "name": "End of year clearance — everything must go",
+      "type": "EMAIL",
+      "status": "SCHEDULED",
+      "subject": "Our biggest sale of the year starts tomorrow",
+      "content": "Everything reduced until Sunday.",
+      "stats": null,
+      "startedAt": null,
+      "completedAt": null,
+      "createdAt": "2026-08-30T11:58:28.320Z",
+      "_count": {
+        "recipients": 0
+      }
+    },
+    {
+      "id": "cmtfra19c00073sqdod66m56j",
+      "name": "Draft idea",
+      "type": "SMS",
+      "status": "DRAFT",
+      "subject": null,
+      "content": "TBC",
+      "stats": null,
+      "startedAt": null,
+      "completedAt": null,
+      "createdAt": "2026-08-30T11:58:28.320Z",
+      "_count": {
+        "recipients": 0
+      }
+    }
+  ],
+  "promotions": [
+    {
+      "id": "cmtfra19g00083sqdnbrf8au8",
+      "organizationId": "cmtfra19300003sqds3871xo8",
+      "name": "Buy two cartons get one free — August only",
+      "description": "Applies to all dairy lines while stocks last.",
+      "discountType": "PERCENTAGE",
+      "discountValue": "33.5",
+      "status": "ACTIVE",
+      "appliesTo": null,
+      "kind": "DISCOUNT",
+      "branchId": null,
+      "budget": null,
+      "budgetSpent": "0",
+      "audience": null,
+      "minSpend": null,
+      "maxRedemptions": null,
+      "maxPerCustomer": 1,
+      "redemptionCount": 0,
+      "schedule": null,
+      "notifyCustomers": true,
+      "notifyAt": null,
+      "notifiedAt": null,
+      "imageUrl": null,
+      "terms": null,
+      "startsAt": "2026-08-01T00:00:00.000Z",
+      "endsAt": "2026-08-31T00:00:00.000Z",
+      "createdAt": "2026-08-30T11:58:28.325Z",
+      "updatedAt": "2026-08-30T11:58:28.325Z"
+    },
+    {
+      "id": "cmtfra19g00093sqd2vhglizp",
+      "organizationId": "cmtfra19300003sqds3871xo8",
+      "name": "Flash sale",
+      "description": null,
+      "discountType": "FIXED_AMOUNT",
+      "discountValue": "500",
+      "status": "SCHEDULED",
+      "appliesTo": null,
+      "kind": "DISCOUNT",
+      "branchId": null,
+      "budget": null,
+      "budgetSpent": "0",
+      "audience": null,
+      "minSpend": null,
+      "maxRedemptions": null,
+      "maxPerCustomer": 1,
+      "redemptionCount": 0,
+      "schedule": null,
+      "notifyCustomers": true,
+      "notifyAt": null,
+      "notifiedAt": null,
+      "imageUrl": null,
+      "terms": null,
+      "startsAt": "2026-09-01T00:00:00.000Z",
+      "endsAt": "2026-09-02T00:00:00.000Z",
+      "createdAt": "2026-08-30T11:58:28.325Z",
+      "updatedAt": "2026-08-30T11:58:28.325Z"
+    }
+  ],
+  "loyalty": {
+    "program": {
+      "id": "cmtfra19j000a3sqds0bzbz81",
+      "organizationId": "cmtfra19300003sqds3871xo8",
+      "name": "Rewards Club",
+      "pointsPerAmount": "1.5",
+      "redeemRate": "0.02",
+      "expiryMonths": 12,
+      "isActive": true,
+      "createdAt": "2026-08-30T11:58:28.327Z",
+      "updatedAt": "2026-08-30T11:58:28.327Z"
+    },
+    "accounts": [
+      {
+        "id": "cmtfra19q000e3sqd642z1eeq",
+        "programId": "cmtfra19j000a3sqds0bzbz81",
+        "customerId": "cmtfra19l000b3sqdaofpfqss",
+        "balance": 48200,
+        "tier": null,
+        "updatedAt": "2026-08-30T11:58:28.335Z",
+        "customer": {
+          "id": "cmtfra19l000b3sqdaofpfqss",
+          "firstName": "Adaeze",
+          "lastName": "Okonkwo",
+          "email": "adaeze@example.com",
+          "phone": "+2348012345678"
+        },
+        "transactions": [
+          {
+            "id": "cmtfra19t000g3sqdqhu7g345",
+            "accountId": "cmtfra19q000e3sqd642z1eeq",
+            "type": "EARN",
+            "points": 48200,
+            "referenceType": null,
+            "referenceId": null,
+            "note": "Points earned from paid order",
+            "createdAt": "2026-08-30T11:58:28.337Z"
+          }
+        ]
+      },
+      {
+        "id": "cmtfra19v000i3sqdq5u1rygk",
+        "programId": "cmtfra19j000a3sqds0bzbz81",
+        "customerId": "cmtfra19p000c3sqd82yuhbqx",
+        "balance": 410,
+        "tier": null,
+        "updatedAt": "2026-08-30T11:58:28.340Z",
+        "customer": {
+          "id": "cmtfra19p000c3sqd82yuhbqx",
+          "firstName": "Chinedu",
+          "lastName": "Balogun",
+          "email": null,
+          "phone": "+2348090000000"
+        },
+        "transactions": [
+          {
+            "id": "cmtfra19w000k3sqdcol7tyuy",
+            "accountId": "cmtfra19v000i3sqdq5u1rygk",
+            "type": "EARN",
+            "points": 410,
+            "referenceType": null,
+            "referenceId": null,
+            "note": "Points earned from paid order",
+            "createdAt": "2026-08-30T11:58:28.341Z"
+          }
+        ]
+      }
+    ]
+  }
+}

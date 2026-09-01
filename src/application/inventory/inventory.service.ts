@@ -192,7 +192,9 @@ export const inventoryService = {
             barcode: true,
             name: true,
             price: true,
-            product: { select: { id: true, name: true } },
+            // The unit is what makes a quantity mean anything on a shelf: "12"
+            // is a different delivery in cartons than in bottles.
+            product: { select: { id: true, name: true, unit: true } },
           },
         },
       },
@@ -351,6 +353,61 @@ export const inventoryService = {
         select: { id: true, number: true, status: true, fromWarehouseId: true, toWarehouseId: true, createdAt: true },
       });
     });
+  },
+
+  /**
+   * Batches received, soonest to expire first.
+   *
+   * Read from the movements that recorded them rather than a separate batch
+   * ledger: those movements are the only place a batch is genuinely known to
+   * have entered the building, so nothing can drift out of step with them.
+   *
+   * Deliberately a record of what arrived, not a claim about what is still on
+   * the shelf — sales and transfers do not pick batches, so presenting this as
+   * remaining stock would be a number nobody could rely on.
+   */
+  async listBatches(dto: { warehouseId?: string; expiringWithinDays?: number; limit?: number }) {
+    const cutoff = dto.expiringWithinDays
+      ? new Date(Date.now() + dto.expiringWithinDays * 86_400_000)
+      : null;
+
+    const rows = await prisma.stockMovement.findMany({
+      where: {
+        batchNumber: { not: null },
+        ...(dto.warehouseId ? { warehouseId: dto.warehouseId } : {}),
+        ...(cutoff ? { expiryDate: { not: null, lte: cutoff } } : {}),
+      },
+      orderBy: [{ expiryDate: 'asc' }, { createdAt: 'desc' }],
+      take: dto.limit ?? 100,
+      select: {
+        id: true, batchNumber: true, expiryDate: true, quantity: true, createdAt: true,
+        referenceType: true, referenceId: true,
+        warehouse: { select: { id: true, name: true } },
+        variant: {
+          select: { id: true, sku: true, name: true, product: { select: { name: true, unit: true } } },
+        },
+      },
+    });
+
+    const now = Date.now();
+    return rows.map((r) => ({
+      id: r.id,
+      batchNumber: r.batchNumber,
+      expiryDate: r.expiryDate,
+      /// Negative once past — an operator scanning the list wants the overdue
+      /// ones to read as overdue, not as "0 days".
+      daysToExpiry: r.expiryDate
+        ? Math.ceil((r.expiryDate.getTime() - now) / 86_400_000)
+        : null,
+      expired: r.expiryDate ? r.expiryDate.getTime() < now : false,
+      quantityReceived: Number(r.quantity),
+      receivedAt: r.createdAt,
+      warehouse: r.warehouse,
+      sku: r.variant.sku,
+      name: r.variant.name || r.variant.product.name,
+      unit: r.variant.product.unit,
+      source: { type: r.referenceType, id: r.referenceId },
+    }));
   },
 
   // ── Movements (per-warehouse audit / report) ─────────────────────────────

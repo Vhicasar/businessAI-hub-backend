@@ -101,6 +101,22 @@ inventoryRoutes.get(
   })
 );
 
+/** Batches received, soonest to expire first. */
+inventoryRoutes.get(
+  '/batches',
+  requirePermission('inventory.read'),
+  validate({
+    query: z.object({
+      warehouseId: z.string().optional(),
+      expiringWithinDays: z.coerce.number().int().min(0).max(3650).optional(),
+      limit: z.coerce.number().int().min(1).max(200).optional(),
+    }),
+  }),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await inventoryService.listBatches(req.query as never) });
+  })
+);
+
 inventoryRoutes.post(
   '/stock/adjust',
   requirePermission('inventory.adjust'),

@@ -38,7 +38,7 @@ x-backend-env: &backend-env
   FLUTTERWAVE_SECRET_KEY: ${FLUTTERWAVE_SECRET_KEY:-}
   FLUTTERWAVE_PUBLIC_KEY: ${FLUTTERWAVE_PUBLIC_KEY:-}
   FLUTTERWAVE_SECRET_HASH: ${FLUTTERWAVE_SECRET_HASH:-}
-  BILLING_CALLBACK_URL: ${BILLING_CALLBACK_URL:-https://${APP_DOMAIN}/settings/billing}
+  BILLING_CALLBACK_URL: ${BILLING_CALLBACK_URL:-https://${APP_DOMAIN}/billing}
   # Transactional mail (registration verification, password reset, notices).
   SMTP_HOST: ${SMTP_HOST}
   SMTP_PORT: ${SMTP_PORT:-587}

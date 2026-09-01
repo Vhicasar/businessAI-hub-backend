@@ -42,6 +42,12 @@ export const createProductSchema = z.object({
   brandId: z.string().nullable().optional(),
   status: z.enum(['DRAFT', 'ACTIVE', 'ARCHIVED']).default('ACTIVE'),
   taxRate: z.coerce.number().min(0).max(100).default(0),
+  /**
+   * How this product is counted — "kg", "bag", "case". Free text, because a
+   * business's own vocabulary is what its warehouse staff read on the shelf.
+   * Readable since the batch/expiry work; this is what makes it settable.
+   */
+  unit: z.string().trim().max(24).nullable().optional(),
   /** Arbitrary extras — e.g. the source system's id when importing. */
   customFields: z.record(z.unknown()).optional(),
   variants: z.array(variantSchema).min(1),

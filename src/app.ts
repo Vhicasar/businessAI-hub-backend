@@ -22,6 +22,7 @@ import { catalogRoutes } from './presentation/http/v1/catalog.routes';
 import { inventoryRoutes } from './presentation/http/v1/inventory.routes';
 import { suppliersRoutes } from './presentation/http/v1/suppliers.routes';
 import { purchaseOrdersRoutes } from './presentation/http/v1/purchase-orders.routes';
+import { requisitionsRoutes } from './presentation/http/v1/requisitions.routes';
 import { deliveryRoutes } from './presentation/http/v1/delivery.routes';
 import { ordersRoutes } from './presentation/http/v1/orders.routes';
 import { invoicesRoutes } from './presentation/http/v1/invoices.routes';
@@ -148,6 +149,7 @@ export function createApp(): Express {
   v1.use('/inventory', inventoryRoutes);
   v1.use('/suppliers', suppliersRoutes);
   v1.use('/purchase-orders', purchaseOrdersRoutes);
+  v1.use('/requisitions', requisitionsRoutes);
   v1.use('/delivery', deliveryRoutes);
   v1.use('/orders', ordersRoutes);
   v1.use('/invoices', invoicesRoutes);

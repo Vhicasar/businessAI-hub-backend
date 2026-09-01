@@ -220,6 +220,25 @@ enum StockMovementType {
   PRODUCTION
 }
 
+/// Where an internal requisition has got to.
+///
+/// Deliberately longer than the transfer's own lifecycle: a requisition is a
+/// *request* that may be argued with before anything moves, and the distinction
+/// between asked-for, agreed, sent and arrived is the whole point — destination
+/// stock must not rise because someone asked for it.
+enum RequisitionStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+  /// Some lines sent, some still owed.
+  PARTIALLY_DISPATCHED
+  DISPATCHED
+  PARTIALLY_RECEIVED
+  COMPLETED
+  CANCELLED
+}
+
 enum TransferStatus {
   DRAFT
   IN_TRANSIT
@@ -232,7 +251,12 @@ enum PurchaseOrderStatus {
   ORDERED
   PARTIALLY_RECEIVED
   RECEIVED
+  /// More arrived than was ordered, and the business permits it. Distinct from
+  /// RECEIVED so the discrepancy stays visible rather than looking complete.
+  OVER_RECEIVED
   CANCELLED
+  /// Closed short: the buyer accepted that the rest will never arrive.
+  CLOSED
 }
 
 enum CartStatus {
@@ -1520,6 +1544,10 @@ model Product {
   categoryId     String?
   brandId        String?
   name           String
+  /// How this product is counted — "kg", "bag", "case", "each". Free text
+  /// because a business's own vocabulary is what its warehouse staff read on
+  /// the shelf, and a fixed list would not survive contact with one.
+  unit           String?
   slug           String
   description    String?       @db.Text
   status         ProductStatus @default(DRAFT)
@@ -1573,6 +1601,7 @@ model ProductVariant {
   cartItems          CartItem[]
   orderItems         OrderItem[]
   purchaseOrderItems PurchaseOrderItem[]
+  requisitionItems   InternalRequisitionItem[]
   transferItems      StockTransferItem[]
   priceListItems     PriceListItem[]
   quotationItems     QuotationItem[]
@@ -1766,6 +1795,9 @@ model Warehouse {
   movements      StockMovement[]
   transfersFrom  StockTransfer[] @relation("TransferFrom")
   transfersTo    StockTransfer[] @relation("TransferTo")
+  poReceipts     PurchaseOrderReceipt[]
+  requisitionsFrom InternalRequisition[] @relation("RequisitionFrom")
+  requisitionsTo   InternalRequisition[] @relation("RequisitionTo")
   purchaseOrders PurchaseOrder[]
   orders         Order[]
 
@@ -1803,6 +1835,10 @@ model StockMovement {
   referenceType  String? // ORDER | PURCHASE_ORDER | TRANSFER | ADJUSTMENT | RETURN
   referenceId    String?
   reason         String?
+  /// Carried on the movement so traceability survives even when the receipt or
+  /// transfer it came from is later archived.
+  batchNumber    String?
+  expiryDate     DateTime?
   actorUserId    String?
   createdAt      DateTime          @default(now())
 
@@ -1814,12 +1850,79 @@ model StockMovement {
   @@index([referenceType, referenceId])
 }
 
+/// One warehouse asking another for stock.
+///
+/// Not a purchase order: there is no supplier, no money and no external party.
+/// Kept as its own record rather than folded into StockTransfer because a
+/// transfer is the *movement*, while this is the conversation that may or may
+/// not produce one — a rejected requisition never becomes a transfer at all.
+model InternalRequisition {
+  id             String            @id @default(cuid())
+  organizationId String
+  number         String
+  /// Who needs the stock.
+  toWarehouseId  String
+  /// Who is being asked to supply it.
+  fromWarehouseId String
+  status         RequisitionStatus @default(DRAFT)
+  priority       String            @default("NORMAL")
+  /// Why the stock is needed — read by whoever approves it.
+  reason         String?           @db.Text
+  notes          String?           @db.Text
+  requestedById  String?
+  approvedById   String?
+  approvedAt     DateTime?
+  /// Required when rejected: a refusal without a reason cannot be acted on.
+  rejectionReason String?          @db.Text
+  submittedAt    DateTime?
+  completedAt    DateTime?
+  cancelledAt    DateTime?
+  /// Opaque token printed/displayed as a QR so the destination warehouse can
+  /// scan the paperwork open rather than search for a number.
+  scanToken      String?           @unique
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  fromWarehouse Warehouse                 @relation("RequisitionFrom", fields: [fromWarehouseId], references: [id])
+  toWarehouse   Warehouse                 @relation("RequisitionTo", fields: [toWarehouseId], references: [id])
+  items         InternalRequisitionItem[]
+  /// The movements this requisition produced. A partial fulfilment makes more
+  /// than one.
+  transfers     StockTransfer[]
+
+  @@unique([organizationId, number])
+  @@index([organizationId, status])
+}
+
+model InternalRequisitionItem {
+  id             String  @id @default(cuid())
+  requisitionId  String
+  variantId      String
+  /// What was asked for.
+  requestedQty   Decimal @db.Decimal(12, 3)
+  /// What the source agreed to send — may be less than requested.
+  approvedQty    Decimal? @db.Decimal(12, 3)
+  /// What has actually left the source warehouse.
+  dispatchedQty  Decimal @default(0) @db.Decimal(12, 3)
+  /// What has actually arrived at the destination.
+  receivedQty    Decimal @default(0) @db.Decimal(12, 3)
+
+  requisition InternalRequisition @relation(fields: [requisitionId], references: [id], onDelete: Cascade)
+  variant     ProductVariant      @relation(fields: [variantId], references: [id])
+
+  @@index([requisitionId])
+}
+
 model StockTransfer {
   id              String         @id @default(cuid())
   organizationId  String
   number          String
   fromWarehouseId String
   toWarehouseId   String
+  /// Set when this movement was raised to satisfy an internal requisition.
+  requisitionId   String?
+  /// Stable per dispatch, so a retried dispatch does not send stock twice.
+  idempotencyKey  String?
   status          TransferStatus @default(DRAFT)
   notes           String?        @db.Text
   createdById     String?
@@ -1828,11 +1931,13 @@ model StockTransfer {
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
 
-  fromWarehouse Warehouse           @relation("TransferFrom", fields: [fromWarehouseId], references: [id])
-  toWarehouse   Warehouse           @relation("TransferTo", fields: [toWarehouseId], references: [id])
+  fromWarehouse Warehouse            @relation("TransferFrom", fields: [fromWarehouseId], references: [id])
+  toWarehouse   Warehouse            @relation("TransferTo", fields: [toWarehouseId], references: [id])
+  requisition   InternalRequisition? @relation(fields: [requisitionId], references: [id])
   items         StockTransferItem[]
 
   @@unique([organizationId, number])
+  @@unique([organizationId, idempotencyKey])
   @@index([organizationId, status])
 }
 
@@ -1969,9 +2074,62 @@ model PurchaseOrder {
   supplier  Supplier            @relation(fields: [supplierId], references: [id])
   warehouse Warehouse           @relation(fields: [warehouseId], references: [id])
   items     PurchaseOrderItem[]
+  receipts  PurchaseOrderReceipt[]
 
   @@unique([organizationId, number])
   @@index([organizationId, status])
+}
+
+/// One receiving event against a purchase order.
+///
+/// Receiving is the moment stock appears, so it needs its own record rather
+/// than only a running total on the line: a warehouse has to be able to answer
+/// "what arrived on Tuesday, who signed for it, and why was it five short".
+/// The idempotency key is what makes a retried request — a double tap, an
+/// offline replay, a network retry — land once instead of twice.
+model PurchaseOrderReceipt {
+  id              String   @id @default(cuid())
+  organizationId  String
+  purchaseOrderId String
+  /// Where the goods actually went. Usually the order's warehouse, but a
+  /// delivery can be redirected on the day.
+  warehouseId     String
+  /// Supplied by the client; unique per organisation so a replay is ignored.
+  idempotencyKey  String?
+  /// Free text from the receiver explaining a short or over delivery.
+  discrepancyNote String?  @db.Text
+  receivedById    String?
+  createdAt       DateTime @default(now())
+
+  purchaseOrder PurchaseOrder              @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  warehouse     Warehouse                  @relation(fields: [warehouseId], references: [id])
+  lines         PurchaseOrderReceiptLine[]
+
+  @@unique([organizationId, idempotencyKey])
+  @@index([purchaseOrderId, createdAt])
+}
+
+model PurchaseOrderReceiptLine {
+  id        String  @id @default(cuid())
+  receiptId String
+  itemId    String
+  variantId String
+  quantity  Decimal @db.Decimal(12, 3)
+  /// What was still outstanding when this line was received, so the history
+  /// reads correctly even after the expected quantity is later amended.
+  outstandingAtReceipt Decimal @db.Decimal(12, 3)
+  /// True when this line took the order past its expected quantity.
+  overReceived Boolean @default(false)
+  /// The supplier's batch or lot reference for what arrived, and when it goes
+  /// out of date. Recorded against the receipt rather than the order line
+  /// because two deliveries against the same line can carry different batches.
+  batchNumber  String?
+  expiryDate   DateTime?
+
+  receipt PurchaseOrderReceipt @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+  item    PurchaseOrderItem    @relation(fields: [itemId], references: [id])
+
+  @@index([receiptId])
 }
 
 model PurchaseOrderItem {
@@ -1989,6 +2147,7 @@ model PurchaseOrderItem {
 
   purchaseOrder PurchaseOrder  @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
   variant       ProductVariant @relation(fields: [variantId], references: [id])
+  receiptLines  PurchaseOrderReceiptLine[]
 
   @@index([purchaseOrderId])
 }

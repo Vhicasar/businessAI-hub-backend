@@ -220,6 +220,7 @@ export const catalogService = {
           brandId: dto.brandId ?? null,
           status: dto.status,
           taxRate: dto.taxRate,
+          unit: dto.unit ?? null,
           customFields: dto.customFields ?? undefined,
           variants: {
             create: dto.variants.map((v, i) => ({
@@ -277,6 +278,7 @@ export const catalogService = {
       data: {
         ...(dto.name !== undefined ? { name: dto.name } : {}),
         ...(dto.description !== undefined ? { description: dto.description } : {}),
+        ...(dto.unit !== undefined ? { unit: dto.unit } : {}),
         ...(dto.categoryId !== undefined ? { categoryId: dto.categoryId } : {}),
         ...(dto.brandId !== undefined ? { brandId: dto.brandId } : {}),
         ...(dto.status !== undefined ? { status: dto.status } : {}),

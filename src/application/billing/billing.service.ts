@@ -86,6 +86,13 @@ function subscriptionDto(s: Subscription & { plan?: Plan }) {
   };
 }
 
+/**
+ * Subscription statuses that count as "the business has this plan right now".
+ * Mirrors the entitlements resolver — the two must not drift, or the app and
+ * the billing service disagree about what was bought.
+ */
+const ACTIVE_SUBSCRIPTION_STATUSES = ['TRIALING', 'ACTIVE', 'PAST_DUE'] as const;
+
 export const billingService = {
   /** Public plan catalog (ordered), for the pricing/upgrade UI. */
   async listPlans() {
@@ -294,9 +301,37 @@ export const billingService = {
    * SMS-wallet / add-on flows by the transaction metadata `kind`.
    */
   async verifyReference(reference: string) {
-    // Already processed?
-    const existing = await prismaUnscoped.billingRecord.findFirst({ where: { providerRef: reference } });
-    if (existing) return { activated: true, alreadyProcessed: true };
+    /*
+     * Already processed?
+     *
+     * A billing record used to be treated as proof on its own, so once one
+     * existed this reported success for ever — including in the one case that
+     * matters, where the money was recorded and the subscription was left on
+     * the old plan. The business then had a receipt, an unchanged plan, and a
+     * verify endpoint cheerfully agreeing that everything was fine.
+     *
+     * So the receipt is checked against the outcome: settled only when the
+     * subscription it belongs to is actually on an active paid plan. Add-ons
+     * and wallet top-ups keep their own idempotency keys and are unaffected.
+     */
+    const existing = await prismaUnscoped.billingRecord.findFirst({
+      where: { providerRef: reference },
+      include: {
+        subscription: { include: { plan: { select: { slug: true } } } },
+      },
+    });
+    if (existing) {
+      const sub = existing.subscription;
+      const settled =
+        sub !== null &&
+        sub.plan.slug !== 'starter' &&
+        (ACTIVE_SUBSCRIPTION_STATUSES as readonly string[]).includes(sub.status);
+      if (settled) return { activated: true, alreadyProcessed: true };
+      logger.warn(
+        { reference, subscriptionId: sub?.id, plan: sub?.plan.slug, status: sub?.status },
+        'Payment recorded but subscription is not on a paid plan — re-activating',
+      );
+    }
 
     const provider = getActivePaymentProvider();
     const txn = await provider.verifyTransaction(reference);
