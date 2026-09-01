@@ -17,6 +17,8 @@
  *   npx tsx scripts/diagnose-subscription.ts <org-slug-or-id>
  */
 import { prismaUnscoped as db } from '../src/infrastructure/database/prisma';
+import { syncPaymentConfigFromAdmin } from '../src/application/billing/payment-config-sync';
+import { getPaymentConfig } from '../src/infrastructure/payments/config';
 
 const ACTIVE = ['TRIALING', 'ACTIVE', 'PAST_DUE'] as const;
 
@@ -90,6 +92,28 @@ async function main() {
   }
 
   // ── The verdict ────────────────────────────────────────────────────────
+  /*
+   * Which gateway account this deployment actually talks to.
+   *
+   * The admin installs the provider and keys at runtime, so a script has to
+   * ask for them explicitly or it reads the local env instead — and then
+   * reports on the wrong Paystack account without saying so.
+   */
+  const fromAdmin = await syncPaymentConfigFromAdmin().catch(() => false);
+  const config = getPaymentConfig();
+  const mode = !config.secretKey
+    ? 'MISSING'
+    : config.secretKey.startsWith('sk_test_')
+      ? 'TEST'
+      : 'live';
+  console.log(
+    `\nGATEWAY  ${config.provider} · key ${mode} · from ${fromAdmin ? 'admin' : 'local env'}`,
+  );
+  if (mode !== 'live') {
+    console.log('  A charge made on the live account cannot be found with this key.');
+    console.log('  Check Admin → Products → payment configuration for this product.');
+  }
+
   console.log('\nVERDICT');
   const paidPlanSub = subs.find((s) => s.plan.slug !== 'starter' && (ACTIVE as readonly string[]).includes(s.status));
   const hasPayment = records.some((r) => r.status === 'PAID');
@@ -99,19 +123,25 @@ async function main() {
     console.log('  client is holding a stale session — sign out and in to re-read it.');
   } else if (hasPayment) {
     console.log('  Money was recorded but the subscription was never moved onto the');
-    console.log('  paid plan. That is a partial activation: re-run the reference');
-    console.log('  through activation with');
-    console.log(`    npx tsx scripts/reconcile-subscription.ts ${org.slug} --apply`);
+    console.log('  paid plan — a partial activation. Re-run the reference through');
+    console.log('  activation with');
+    console.log(`    npx tsx scripts/reconcile-subscription.ts ${org.slug} --find --apply`);
   } else {
     console.log('  No payment is recorded here at all. Either the customer never');
-    console.log('  completed the gateway checkout, or the payment succeeded at the');
-    console.log('  gateway and neither the webhook nor a browser callback ever told');
-    console.log('  us about it — which is what happens when the checkout was started');
-    console.log('  from the phone.');
+    console.log('  completed the gateway checkout, or it succeeded there and nothing');
+    console.log('  ever told this system about it.');
     console.log('');
-    console.log('  Confirm at the gateway: look for a successful charge whose');
-    console.log(`  reference begins "bh_${org.id.slice(0, 8)}_". If one exists, settle it with`);
-    console.log(`    npx tsx scripts/reconcile-subscription.ts ${org.slug} --reference <ref> --apply`);
+    console.log('  The second is what happened before the billing callback was fixed:');
+    console.log('  the gateway returned the customer to /settings/billing, an alias');
+    console.log('  that redirected to /billing and dropped the ?reference on the way,');
+    console.log('  so the page had nothing to verify. That left the webhook as the');
+    console.log('  only route to activation — and a payment made while it was not');
+    console.log('  firing was never recorded anywhere.');
+    console.log('');
+    console.log('  Deploying the fix does not settle a payment already in that state.');
+    console.log('  Ask the gateway what it has, and settle it:');
+    console.log(`    npx tsx scripts/reconcile-subscription.ts ${org.slug} --find`);
+    console.log(`    npx tsx scripts/reconcile-subscription.ts ${org.slug} --find --apply`);
   }
   console.log('');
 }
