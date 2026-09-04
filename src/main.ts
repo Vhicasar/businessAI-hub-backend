@@ -27,6 +27,7 @@ import {
 import { startWebhookRetrySweep } from './application/api-keys/webhook-delivery.service';
 import { startPromotionNotifier } from './application/marketing/promotion-engine.service';
 import { startReorderWatcher } from './application/purchasing/reorder.service';
+import { startExpiryWatcher } from './application/inventory/expiry-alerts.service';
 import { reconcileSystemRolePermissions } from './application/roles/reconcile-permissions';
 import { closeQueues, queueEnabled } from './infrastructure/queue/queue';
 import { createApp } from './app';
@@ -70,6 +71,7 @@ async function bootstrap(): Promise<void> {
   startSettlementRuns(); // release settlements as their schedule comes due (§10)
   startPromotionNotifier(); // push scheduled promotion notifications
   startReorderWatcher(); // raise purchase orders when stock hits its reorder point
+  startExpiryWatcher(); // warn warehouse staff before batches expire
   logger.info(
     queueEnabled()
       ? '📮 Queue mode: async — workflow & campaign jobs handed to the worker (run `npm run worker`)'

@@ -9,6 +9,9 @@ import type { DetectedType } from './detect';
 export const ENTITIES = [
   'customers', 'leads', 'employees', 'products', 'kb-articles',
   'suppliers', 'supplier-products', 'purchase-orders', 'reorder-levels',
+  // Onboarding: the two things a business has to load before it can trade —
+  // where stock lives, and how much of it is there on day one.
+  'warehouses', 'stock-levels',
 ] as const;
 export type Entity = (typeof ENTITIES)[number];
 
@@ -222,6 +225,28 @@ export const FIELD_DEFS: Record<Entity, FieldDef[]> = {
     { key: 'notes', label: 'Notes', accepts: ['text'], aliases: ['notes', 'comment', 'remarks'] },
   ],
 
+  warehouses: [
+    { key: 'name', label: 'Warehouse name', required: true, accepts: ['text'], aliases: ['name', 'warehouse', 'location', 'site', 'store', 'branch name'] },
+    { key: 'code', label: 'Code', required: true, accepts: ['text', 'number'], aliases: ['code', 'warehouse code', 'short code', 'ref'] },
+    // The same address block every other entity uses, so a warehouse address
+    // maps from the same spreadsheet headers a supplier address would.
+    ...ADDRESS,
+    PHONE,
+    {
+      key: 'isDefault', label: 'Default warehouse', accepts: ['boolean', 'text'],
+      aliases: ['default', 'is default', 'primary', 'main'],
+      hint: 'Only one warehouse can be the default — the last one marked wins',
+    },
+  ],
+
+  'stock-levels': [
+    { key: 'sku', label: 'Product SKU', required: true, accepts: ['text', 'number'], aliases: ['sku', 'item code', 'product code', 'code', 'barcode'] },
+    { key: 'warehouse', label: 'Warehouse', accepts: ['text'], aliases: ['warehouse', 'location', 'store', 'site'], hint: 'Defaults to your default warehouse' },
+    { key: 'quantity', label: 'Quantity on hand', required: true, accepts: ['number'], aliases: ['quantity', 'qty', 'on hand', 'stock', 'count', 'balance', 'opening stock'] },
+    { key: 'batchNumber', label: 'Batch / lot number', accepts: ['text', 'number'], aliases: ['batch', 'lot', 'batch number', 'lot number'] },
+    { key: 'expiryDate', label: 'Expiry date', accepts: ['date', 'text'], aliases: ['expiry', 'expiry date', 'expires', 'best before', 'use by'] },
+  ],
+
   'reorder-levels': [
     { key: 'sku', label: 'Product SKU', required: true, accepts: ['text', 'number'], aliases: ['sku', 'item code', 'product code', 'code'] },
     { key: 'warehouse', label: 'Warehouse', accepts: ['text'], aliases: ['warehouse', 'location', 'store'], hint: 'Defaults to your default warehouse' },
@@ -252,4 +277,6 @@ export const EITHER_OR: Record<Entity, string[][]> = {
   'supplier-products': [],
   'purchase-orders': [],
   'reorder-levels': [],
+  warehouses: [],
+  'stock-levels': [],
 };

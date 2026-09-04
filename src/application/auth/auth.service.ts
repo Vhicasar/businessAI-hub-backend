@@ -20,6 +20,7 @@ import { prisma, prismaUnscoped } from '../../infrastructure/database/prisma';
 import { mailer } from '../../infrastructure/mail/mailer';
 import { SYSTEM_ROLE_TEMPLATES, OWNER_ROLE_NAME } from '../../shared/permissions';
 import { PLAN_CATALOG } from '../../shared/plans';
+import { modulesFor } from '../modules/business-modules';
 import { resolveEntitlements } from '../billing/entitlements';
 import { resolveLocale } from '../../shared/currency';
 import { tokenService } from './token.service';
@@ -806,11 +807,22 @@ export const authService = {
       user.memberships.map(async (m) => [m.organization.id, [...(await resolveEntitlements(m.organization.id)).features]] as const),
     );
     const featuresByOrg = new Map(featureEntries);
+    /*
+     * And each org's optional modules, decided from its business type and any
+     * administrator override. Sent rather than derived on the client: a menu
+     * that works out its own answer is a menu that will eventually disagree
+     * with the API it opens.
+     */
+    const moduleEntries = await Promise.all(
+      user.memberships.map(async (m) => [m.organization.id, await modulesFor(m.organization.id)] as const),
+    );
+    const modulesByOrg = new Map(moduleEntries);
     return {
       ...user,
       memberships: user.memberships.map((m) => ({
         ...m,
         features: featuresByOrg.get(m.organization.id) ?? [],
+        modules: modulesByOrg.get(m.organization.id) ?? [],
         organization: {
           id: m.organization.id,
           name: m.organization.name,

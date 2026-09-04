@@ -5,6 +5,11 @@ export const listProductsSchema = z.object({
   categoryId: z.string().optional(),
   brandId: z.string().optional(),
   status: z.enum(['DRAFT', 'ACTIVE', 'ARCHIVED']).optional(),
+  /**
+   * Cursor paging orders by id under the hood, so every sort has to end in a
+   * unique tiebreak or a page boundary can repeat or skip a row.
+   */
+  sort: z.enum(['newest', 'oldest', 'name', 'name_desc']).default('newest'),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(100).default(25),
 });
@@ -48,6 +53,16 @@ export const createProductSchema = z.object({
    * Readable since the batch/expiry work; this is what makes it settable.
    */
   unit: z.string().trim().max(24).nullable().optional(),
+  /**
+   * Expiry tracking. Off by default so nothing changes for the products that
+   * exist today; a pharmacy or food business turns it on per product.
+   */
+  batchTracked: z.boolean().optional(),
+  expiryTracked: z.boolean().optional(),
+  /** Days from receipt to expiry — lets goods-in propose the expiry date. */
+  shelfLifeDays: z.coerce.number().int().min(1).max(36500).nullable().optional(),
+  /** How far ahead of expiry to warn. */
+  expiryAlertDays: z.coerce.number().int().min(0).max(3650).optional(),
   /** Arbitrary extras — e.g. the source system's id when importing. */
   customFields: z.record(z.unknown()).optional(),
   variants: z.array(variantSchema).min(1),

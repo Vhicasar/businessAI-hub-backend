@@ -26,6 +26,10 @@ const PERMS: Record<Entity, { read: string[]; write: string[] }> = {
   'purchase-orders': { read: ['purchasing.read'], write: ['purchasing.create'] },
   // Reorder levels live on stock, so they follow the inventory permission.
   'reorder-levels': { read: ['inventory.read'], write: ['inventory.set_reorder_levels'] },
+  warehouses: { read: ['inventory.read'], write: ['inventory.manage_warehouses'] },
+  // Loading opening stock is an adjustment like any other, and is written to
+  // the ledger as one.
+  'stock-levels': { read: ['inventory.read'], write: ['inventory.adjust'] },
 };
 
 const analyzeBody = z.object({ csv: z.string().min(1).max(20_000_000) });

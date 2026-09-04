@@ -20,6 +20,14 @@ import { rolesRoutes } from './presentation/http/v1/roles.routes';
 import { customersRoutes } from './presentation/http/v1/customers.routes';
 import { catalogRoutes } from './presentation/http/v1/catalog.routes';
 import { inventoryRoutes } from './presentation/http/v1/inventory.routes';
+// Branches are built but switched off for now — uncomment this and the
+// mount below to turn the feature back on.
+// import { branchesRoutes } from './presentation/http/v1/branches.routes';
+import { manufacturingRoutes } from './presentation/http/v1/manufacturing.routes';
+import { manufacturingQualityRoutes } from './presentation/http/v1/manufacturing-quality.routes';
+import { manufacturingAssetsRoutes } from './presentation/http/v1/manufacturing-assets.routes';
+import { documentsRoutes } from './presentation/http/v1/documents.routes';
+import { modulesRoutes } from './presentation/http/v1/modules.routes';
 import { suppliersRoutes } from './presentation/http/v1/suppliers.routes';
 import { purchaseOrdersRoutes } from './presentation/http/v1/purchase-orders.routes';
 import { requisitionsRoutes } from './presentation/http/v1/requisitions.routes';
@@ -147,6 +155,15 @@ export function createApp(): Express {
   v1.use('/customers', customersRoutes);
   v1.use('/catalog', catalogRoutes);
   v1.use('/inventory', inventoryRoutes);
+  // v1.use('/branches', branchesRoutes);
+  v1.use('/modules', modulesRoutes);
+  // Manufacturing & Operations. Three routers under one prefix so the module
+  // reads as one thing to a client while staying separable in the source.
+  v1.use('/manufacturing', manufacturingRoutes);
+  v1.use('/manufacturing', manufacturingQualityRoutes);
+  v1.use('/manufacturing', manufacturingAssetsRoutes);
+  // Scannable documents — one resolver for every QR the mobile app can read.
+  v1.use('/documents', documentsRoutes);
   v1.use('/suppliers', suppliersRoutes);
   v1.use('/purchase-orders', purchaseOrdersRoutes);
   v1.use('/requisitions', requisitionsRoutes);

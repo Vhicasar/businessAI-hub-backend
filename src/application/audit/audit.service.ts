@@ -16,6 +16,8 @@ export interface AuditInput {
   entityId?: string;
   before?: Record<string, unknown> | null;
   after?: Record<string, unknown> | null;
+  /** Why this was done, where the action alone does not explain it. */
+  reason?: string | null;
   actorType?: 'USER' | 'SYSTEM' | 'API_KEY' | 'AI';
 }
 
@@ -43,6 +45,7 @@ export const auditService = {
           entityId: input.entityId ?? null,
           before: (input.before ?? undefined) as Prisma.InputJsonValue | undefined,
           after: (input.after ?? undefined) as Prisma.InputJsonValue | undefined,
+          reason: input.reason ?? null,
         },
       });
     } catch (err) {
@@ -119,3 +122,40 @@ export const auditService = {
     };
   },
 };
+
+/**
+ * The fields an update actually changed, as a before/after pair.
+ *
+ * An audit entry that says only "someone updated this order" answers none of
+ * the questions an audit is for — what changed, from what, to what. This keeps
+ * the entry to the fields that genuinely moved, so a no-op save does not read
+ * as a change and a one-field edit does not bury it in unchanged columns.
+ *
+ * Dates and Decimals are normalised to strings so two equal values compare
+ * equal: Prisma hands back Decimal objects and Date objects that are never ===
+ * each other, which would otherwise report every field as changed.
+ */
+export function auditDiff<T extends Record<string, unknown>>(
+  before: T,
+  after: T,
+  keys: readonly (keyof T)[]
+): { before: Record<string, unknown>; after: Record<string, unknown> } | null {
+  const norm = (v: unknown): unknown => {
+    if (v === null || v === undefined) return null;
+    if (v instanceof Date) return v.toISOString();
+    // Prisma Decimal and anything else with a meaningful toString.
+    if (typeof v === 'object' && 'toString' in (v as object)) return String(v);
+    return v;
+  };
+
+  const b: Record<string, unknown> = {};
+  const a: Record<string, unknown> = {};
+  for (const key of keys) {
+    const bv = norm(before[key]);
+    const av = norm(after[key]);
+    if (bv === av) continue;
+    b[key as string] = bv;
+    a[key as string] = av;
+  }
+  return Object.keys(a).length > 0 ? { before: b, after: a } : null;
+}

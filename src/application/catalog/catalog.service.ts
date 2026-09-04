@@ -44,6 +44,19 @@ const productSelect = {
   description: true,
   status: true,
   taxRate: true,
+  /*
+   * How the business counts this product.
+   *
+   * Settable since the batch/expiry work but never returned, so every edit
+   * form loaded it as blank and saved that blank straight back — a product's
+   * unit could be set once and was then quietly cleared by the next unrelated
+   * edit.
+   */
+  unit: true,
+  batchTracked: true,
+  expiryTracked: true,
+  shelfLifeDays: true,
+  expiryAlertDays: true,
   createdAt: true,
   category: { select: { id: true, name: true } },
   brand: { select: { id: true, name: true } },
@@ -140,6 +153,18 @@ async function inPreferredCurrency<T extends { variants: Array<{
   })));
 }
 
+/**
+ * How a product list can be ordered. Each ends with `id` so cursor paging has
+ * a stable tiebreak — without it two products created in the same millisecond
+ * can straddle a page boundary and appear twice or not at all.
+ */
+const PRODUCT_SORTS = {
+  newest: [{ createdAt: 'desc' as const }, { id: 'desc' as const }],
+  oldest: [{ createdAt: 'asc' as const }, { id: 'asc' as const }],
+  name: [{ name: 'asc' as const }, { id: 'asc' as const }],
+  name_desc: [{ name: 'desc' as const }, { id: 'desc' as const }],
+};
+
 export const catalogService = {
   // ------------------------------------------------------------- products
   async listProducts(dto: ListProductsDto) {
@@ -160,7 +185,7 @@ export const catalogService = {
           : {}),
       },
       select: productSelect,
-      orderBy: { createdAt: 'desc' },
+      orderBy: PRODUCT_SORTS[dto.sort ?? 'newest'],
       take: dto.limit + 1,
       ...(dto.cursor ? { cursor: { id: dto.cursor }, skip: 1 } : {}),
     });
@@ -221,6 +246,10 @@ export const catalogService = {
           status: dto.status,
           taxRate: dto.taxRate,
           unit: dto.unit ?? null,
+          batchTracked: dto.batchTracked ?? false,
+          expiryTracked: dto.expiryTracked ?? false,
+          shelfLifeDays: dto.shelfLifeDays ?? null,
+          ...(dto.expiryAlertDays !== undefined ? { expiryAlertDays: dto.expiryAlertDays } : {}),
           customFields: dto.customFields ?? undefined,
           variants: {
             create: dto.variants.map((v, i) => ({
@@ -279,6 +308,10 @@ export const catalogService = {
         ...(dto.name !== undefined ? { name: dto.name } : {}),
         ...(dto.description !== undefined ? { description: dto.description } : {}),
         ...(dto.unit !== undefined ? { unit: dto.unit } : {}),
+        ...(dto.batchTracked !== undefined ? { batchTracked: dto.batchTracked } : {}),
+        ...(dto.expiryTracked !== undefined ? { expiryTracked: dto.expiryTracked } : {}),
+        ...(dto.shelfLifeDays !== undefined ? { shelfLifeDays: dto.shelfLifeDays } : {}),
+        ...(dto.expiryAlertDays !== undefined ? { expiryAlertDays: dto.expiryAlertDays } : {}),
         ...(dto.categoryId !== undefined ? { categoryId: dto.categoryId } : {}),
         ...(dto.brandId !== undefined ? { brandId: dto.brandId } : {}),
         ...(dto.status !== undefined ? { status: dto.status } : {}),

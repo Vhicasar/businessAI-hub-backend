@@ -52,6 +52,12 @@ enum BusinessType {
   PHARMACY
   HOSPITAL
   SCHOOL
+  /// Farming and agro-processing. Added for the manufacturing module: turning
+  /// a crop into a packaged good is the same problem as any other production
+  /// run, and these businesses had to register as something else to say so.
+  AGRICULTURE
+  /// Construction and building materials — block moulding, joinery, mixing.
+  CONSTRUCTION
   OTHER
 }
 
@@ -218,6 +224,118 @@ enum StockMovementType {
   ADJUSTMENT
   DAMAGE
   PRODUCTION
+  /// Materials leaving a store for a production line. Distinct from
+  /// CONSUMPTION: issued stock has left the shelf but may come back unused,
+  /// and a business that cannot tell the two apart cannot explain its variance.
+  MATERIAL_ISSUE
+  MATERIAL_CONSUMPTION
+  /// Unused issued material handed back to the store.
+  MATERIAL_RETURN
+  EXPIRED
+  /// Quality decisions move stock between available and held without any of it
+  /// physically going anywhere, which is exactly why they need their own types.
+  QC_QUARANTINE
+  QC_RELEASE
+  QC_REJECTION
+  MAINTENANCE_CONSUMPTION
+}
+
+/// What a product is, to a business that makes things.
+///
+/// Null for everyone else: a shop's products are just products, and forcing a
+/// classification on them would be inventing a decision nobody made.
+enum ManufacturingType {
+  RAW_MATERIAL
+  PACKAGING
+  WORK_IN_PROGRESS
+  FINISHED_GOOD
+  SPARE_PART
+  CONSUMABLE
+}
+
+/// What a warehouse holds. GENERAL is the default and what every existing
+/// warehouse is, so nothing changes for a business that does not classify them.
+enum WarehouseType {
+  GENERAL
+  RAW_MATERIAL
+  PACKAGING
+  WORK_IN_PROGRESS
+  FINISHED_GOODS
+  SPARE_PARTS
+  QUARANTINE
+}
+
+enum BomStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum ProductionPlanStatus {
+  DRAFT
+  PLANNED
+  APPROVED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum ProductionOrderStatus {
+  DRAFT
+  APPROVED
+  READY
+  IN_PROGRESS
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+enum ProductionPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum ProductionLineStatus {
+  OPERATIONAL
+  IDLE
+  MAINTENANCE
+  BREAKDOWN
+  OFFLINE
+}
+
+enum EquipmentStatus {
+  OPERATIONAL
+  IDLE
+  MAINTENANCE
+  BREAKDOWN
+  RETIRED
+}
+
+enum MaintenanceType {
+  PREVENTIVE
+  CORRECTIVE
+  EMERGENCY
+}
+
+/// A batch's standing with quality control.
+///
+/// PENDING is not the same as PASSED: stock that has not been inspected must
+/// not be sellable simply because nobody has got to it yet.
+enum QcStatus {
+  PENDING
+  PASSED
+  FAILED
+  CONDITIONAL
+}
+
+enum QuarantineStatus {
+  HELD
+  RELEASED
+  REJECTED
+  REWORK
+  DISPOSED
 }
 
 /// Where an internal requisition has got to.
@@ -459,6 +577,10 @@ enum BookingStatus {
 
 enum MaintenanceStatus {
   OPEN
+  /// Raised and given to someone, but not started. Manufacturing needs the
+  /// distinction — an unassigned breakdown is nobody's job yet. Property
+  /// maintenance simply never uses it.
+  ASSIGNED
   IN_PROGRESS
   COMPLETED
   CANCELLED
@@ -544,6 +666,29 @@ enum StorageDriver {
 // TENANCY & IDENTITY
 // ============================================================
 
+/// An administrator's decision about one optional module for one business.
+///
+/// Absent means "whatever this business type implies", which is not the same
+/// as `enabled: false` — the difference shows when the business later changes
+/// type, and only the explicit decision should survive that.
+model OrganizationModule {
+  id             String   @id @default(cuid())
+  organizationId String
+  /// Matches an id in `application/modules/business-modules.ts`.
+  moduleId       String
+  enabled        Boolean
+  /// Why, in the administrator's words. Shown wherever the override is.
+  reason         String?
+  setByUserId    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, moduleId])
+  @@index([organizationId])
+}
+
 model Organization {
   id                   String       @id @default(cuid())
   name                 String
@@ -597,6 +742,7 @@ model Organization {
   PayoutAccount   PayoutAccount[]
   businessProfile BusinessProfile?
   businessQrs     BusinessQr[]
+  modules         OrganizationModule[]
 
   settlementAccounts SettlementAccount[]
   settlementRules    SettlementRule[]
@@ -729,15 +875,42 @@ model Membership {
   updatedAt      DateTime  @updatedAt
   deletedAt      DateTime?
 
-  organization Organization @relation(fields: [organizationId], references: [id])
-  user         User         @relation(fields: [userId], references: [id])
-  role         Role         @relation(fields: [roleId], references: [id])
-  branch       Branch?      @relation(fields: [branchId], references: [id])
-  department   Department?  @relation(fields: [departmentId], references: [id])
+  organization    Organization          @relation(fields: [organizationId], references: [id])
+  user            User                  @relation(fields: [userId], references: [id])
+  role            Role                  @relation(fields: [roleId], references: [id])
+  branch          Branch?               @relation(fields: [branchId], references: [id])
+  department      Department?           @relation(fields: [departmentId], references: [id])
+  /// Warehouses this member is restricted to. Empty means unrestricted, which
+  /// is what every existing member is — access narrows only when granted.
+  warehouseAccess WarehouseAssignment[]
 
   @@unique([organizationId, userId])
   @@index([userId])
   @@index([roleId])
+}
+
+/// Ties a member to the warehouses they may see and act on.
+///
+/// The convention is deliberately opt-in: a member with NO rows here is
+/// unrestricted (the behaviour every organisation has today), and a member
+/// with one or more rows can only read or move stock in those warehouses. That
+/// way granting "warehouse manager" to someone narrows their world instead of
+/// silently locking out everybody who was never assigned.
+model WarehouseAssignment {
+  id             String   @id @default(cuid())
+  organizationId String
+  membershipId   String
+  warehouseId    String
+  /// Read-only access still lets them see the warehouse but not move stock.
+  canManage      Boolean  @default(true)
+  createdAt      DateTime @default(now())
+
+  membership Membership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+  warehouse  Warehouse  @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@unique([membershipId, warehouseId])
+  @@index([organizationId])
+  @@index([warehouseId])
 }
 
 model Role {
@@ -1159,34 +1332,34 @@ model Company {
 }
 
 model Lead {
-  id             String     @id @default(cuid())
-  organizationId String
-  firstName      String
-  lastName       String?
-  email          String?
-  phone          String?
-  companyId      String?
-  customerId     String? // set when converted/matched
-  source         String? // WHATSAPP, WEBSITE, REFERRAL…
-  status         LeadStatus @default(NEW)
-  ownerId        String? // Membership id
-  aiScore        Int? // 0-100
-  aiScoreReason  String?    @db.Text
-  estimatedValue Decimal?   @db.Decimal(14, 2)
-  convertedAt    DateTime?
+  id                String     @id @default(cuid())
+  organizationId    String
+  firstName         String
+  lastName          String?
+  email             String?
+  phone             String?
+  companyId         String?
+  customerId        String? // set when converted/matched
+  source            String? // WHATSAPP, WEBSITE, REFERRAL…
+  status            LeadStatus @default(NEW)
+  ownerId           String? // Membership id
+  aiScore           Int? // 0-100
+  aiScoreReason     String?    @db.Text
+  estimatedValue    Decimal?   @db.Decimal(14, 2)
+  convertedAt       DateTime?
   /// Membership that performed the conversion — "converted by", for the record.
-  convertedById  String?
+  convertedById     String?
   /// The deal this lead became. The deals relation can hold several over a
   /// lead's life; this is the one the conversion produced.
-  convertedDealId String?
+  convertedDealId   String?
   /// Last time a new inquiry was matched to this lead and the user chose to
   /// re-engage it rather than open a second lead.
-  reengagedAt    DateTime?
-  reengagementCount Int      @default(0)
-  customFields   Json?
-  createdAt      DateTime   @default(now())
-  updatedAt      DateTime   @updatedAt
-  deletedAt      DateTime?
+  reengagedAt       DateTime?
+  reengagementCount Int        @default(0)
+  customFields      Json?
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+  deletedAt         DateTime?
 
   company  Company?  @relation(fields: [companyId], references: [id])
   customer Customer? @relation(fields: [customerId], references: [id])
@@ -1282,16 +1455,16 @@ model Deal {
   updatedAt        DateTime   @updatedAt
   deletedAt        DateTime?
 
-  pipeline   Pipeline      @relation(fields: [pipelineId], references: [id])
-  stage      PipelineStage @relation(fields: [stageId], references: [id])
-  customer   Customer?     @relation(fields: [customerId], references: [id])
-  company    Company?      @relation(fields: [companyId], references: [id])
-  lead       Lead?         @relation(fields: [leadId], references: [id])
-  quotations Quotation[]
-  contracts  Contract[]
-  invoices   Invoice[]
+  pipeline       Pipeline          @relation(fields: [pipelineId], references: [id])
+  stage          PipelineStage     @relation(fields: [stageId], references: [id])
+  customer       Customer?         @relation(fields: [customerId], references: [id])
+  company        Company?          @relation(fields: [companyId], references: [id])
+  lead           Lead?             @relation(fields: [leadId], references: [id])
+  quotations     Quotation[]
+  contracts      Contract[]
+  invoices       Invoice[]
   paymentIntents PaymentIntent[]
-  valueChanges DealValueChange[]
+  valueChanges   DealValueChange[]
 
   @@index([organizationId, status])
   @@index([pipelineId, stageId])
@@ -1338,32 +1511,32 @@ model Task {
 }
 
 model Meeting {
-  id             String      @id @default(cuid())
-  organizationId String
-  title          String
-  description    String?     @db.Text
-  location       String?
-  meetingUrl     String?
-  startAt        DateTime
-  endAt          DateTime
-  organizerId    String? // Membership id (assigned staff/agent)
-  entityType     EntityType?
-  entityId       String?
-  attendees      Json? // [{type: 'user'|'customer', id, name, email, response}]
-  aiSummary      String?     @db.Text
-  transcription  String?     @db.Text
+  id               String      @id @default(cuid())
+  organizationId   String
+  title            String
+  description      String?     @db.Text
+  location         String?
+  meetingUrl       String?
+  startAt          DateTime
+  endAt            DateTime
+  organizerId      String? // Membership id (assigned staff/agent)
+  entityType       EntityType?
+  entityId         String?
+  attendees        Json? // [{type: 'user'|'customer', id, name, email, response}]
+  aiSummary        String?     @db.Text
+  transcription    String?     @db.Text
   /// CONFIRMED | CANCELLED | COMPLETED — appointment lifecycle (#12).
-  status         String      @default("CONFIRMED")
+  status           String      @default("CONFIRMED")
   /// Customer this appointment is for (booking flows); scalar, matches entityId style.
-  customerId     String?
+  customerId       String?
   /// Appointment type id from the org's appointment config.
-  typeId         String?
+  typeId           String?
   /// Where the booking came from: CHAT | MANUAL | WEB.
-  source         String?
+  source           String?
   /// Unguessable token for the public manage/cancel link in confirmations.
-  bookingToken   String?     @unique
+  bookingToken     String?     @unique
   /// Set once a reminder has been emailed, so the sweep never double-sends.
-  reminderSentAt DateTime?
+  reminderSentAt   DateTime?
   /// Which calendar this booking is mirrored to/from: google_calendar | calendly.
   externalProvider String?
   /// The provider's id for the event, so an update edits rather than duplicates.
@@ -1372,16 +1545,16 @@ model Meeting {
   externalUrl      String?
   /// Last successful mirror, for spotting a sync that has stopped working.
   externalSyncedAt DateTime?
-  createdAt      DateTime    @default(now())
-  updatedAt      DateTime    @updatedAt
-  deletedAt      DateTime?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+  deletedAt        DateTime?
 
+  /// An event imported twice must land on the same row, not a duplicate.
+  @@unique([organizationId, externalProvider, externalEventId])
   @@index([organizationId, startAt])
   @@index([entityType, entityId])
   @@index([customerId])
   @@index([status, startAt])
-  /// An event imported twice must land on the same row, not a duplicate.
-  @@unique([organizationId, externalProvider, externalEventId])
 }
 
 model Note {
@@ -1539,35 +1712,73 @@ model Brand {
 }
 
 model Product {
-  id             String        @id @default(cuid())
-  organizationId String
-  categoryId     String?
-  brandId        String?
-  name           String
+  id                   String             @id @default(cuid())
+  organizationId       String
+  categoryId           String?
+  brandId              String?
+  name                 String
   /// How this product is counted — "kg", "bag", "case", "each". Free text
   /// because a business's own vocabulary is what its warehouse staff read on
   /// the shelf, and a fixed list would not survive contact with one.
-  unit           String?
-  slug           String
-  description    String?       @db.Text
-  status         ProductStatus @default(DRAFT)
-  type           String        @default("PHYSICAL") // PHYSICAL | DIGITAL | SERVICE
-  taxRate        Decimal       @default(0) @db.Decimal(5, 2)
-  attributes     Json? // definition of variant option axes e.g. [{name:"Size",values:["S","M"]}]
-  aiTags         Json? // AI-generated search/recommendation tags
-  customFields   Json? // arbitrary extras, incl. externalId from an imported system
-  isFeatured     Boolean       @default(false)
-  createdAt      DateTime      @default(now())
-  updatedAt      DateTime      @updatedAt
-  deletedAt      DateTime?
+  unit                 String?
+  slug                 String
+  description          String?            @db.Text
+  status               ProductStatus      @default(DRAFT)
+  type                 String             @default("PHYSICAL") // PHYSICAL | DIGITAL | SERVICE
+  taxRate              Decimal            @default(0) @db.Decimal(5, 2)
+  attributes           Json? // definition of variant option axes e.g. [{name:"Size",values:["S","M"]}]
+  /// ── Manufacturing ─────────────────────────────────────────────────────
+  /// All optional, and all ignored by businesses without the manufacturing
+  /// module. A shop's products are just products; classifying them would be
+  /// inventing a decision nobody made.
+  ///
+  /// Deliberately absent because the product already has them elsewhere: the
+  /// preferred supplier and its lead time live on `SupplierProduct`, cost on
+  /// `ProductVariant.costPrice`, per-warehouse reorder points on `StockLevel`,
+  /// the SKU on the variant and the unit of measure on `unit`.
+  manufacturingType    ManufacturingType?
+  /// Planning levels for the business as a whole, distinct from the
+  /// per-warehouse reorder point: how much of this must exist anywhere.
+  minStock             Decimal?           @db.Decimal(12, 3)
+  maxStock             Decimal?           @db.Decimal(12, 3)
+  safetyStock          Decimal?           @db.Decimal(12, 3)
+  /// What each unit is expected to cost, for costing a production run before
+  /// it happens. The actual cost comes from what was really consumed.
+  standardCost         Decimal?           @db.Decimal(14, 4)
+  batchTracked         Boolean            @default(false)
+  expiryTracked        Boolean            @default(false)
+  /// Days from the moment stock is received until it expires. Lets goods-in
+  /// propose an expiry date instead of asking a receiving clerk to work it out
+  /// per delivery; the clerk can always override it.
+  shelfLifeDays        Int?
+  /// How many days before expiry the business wants to be warned. Long enough
+  /// to sell it down or return it, and per-product because a vaccine and a bag
+  /// of rice are not the same conversation.
+  expiryAlertDays      Int                @default(30)
+  serialTracked        Boolean            @default(false)
+  /// Whether this can be produced, bought and sold. The last two default to
+  /// true so every product that exists today behaves exactly as it does now.
+  manufacturingEnabled Boolean            @default(false)
+  purchaseEnabled      Boolean            @default(true)
+  sellable             Boolean            @default(true)
+  aiTags               Json? // AI-generated search/recommendation tags
+  customFields         Json? // arbitrary extras, incl. externalId from an imported system
+  isFeatured           Boolean            @default(false)
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+  deletedAt            DateTime?
 
-  category    ProductCategory?  @relation(fields: [categoryId], references: [id])
-  brand       Brand?            @relation(fields: [brandId], references: [id])
-  variants    ProductVariant[]
-  images      ProductImage[]
-  bundleItems BundleItem[]      @relation("BundleChild")
-  bundles     ProductBundle[]
-  suppliers   SupplierProduct[]
+  category         ProductCategory?   @relation(fields: [categoryId], references: [id])
+  brand            Brand?             @relation(fields: [brandId], references: [id])
+  variants         ProductVariant[]
+  images           ProductImage[]
+  bundleItems      BundleItem[]       @relation("BundleChild")
+  bundles          ProductBundle[]
+  suppliers        SupplierProduct[]
+  BillOfMaterial   BillOfMaterial[]
+  ProductionPlan   ProductionPlan[]
+  ProductionOrder  ProductionOrder[]
+  QualityParameter QualityParameter[]
 
   @@unique([organizationId, slug])
   @@index([organizationId, status])
@@ -1595,17 +1806,24 @@ model ProductVariant {
   updatedAt      DateTime  @updatedAt
   deletedAt      DateTime?
 
-  product            Product             @relation(fields: [productId], references: [id])
-  stockLevels        StockLevel[]
-  stockMovements     StockMovement[]
-  cartItems          CartItem[]
-  orderItems         OrderItem[]
-  purchaseOrderItems PurchaseOrderItem[]
-  requisitionItems   InternalRequisitionItem[]
-  transferItems      StockTransferItem[]
-  priceListItems     PriceListItem[]
-  quotationItems     QuotationItem[]
-  bundleItems        BundleItem[]
+  product             Product                   @relation(fields: [productId], references: [id])
+  stockLevels         StockLevel[]
+  stockMovements      StockMovement[]
+  cartItems           CartItem[]
+  orderItems          OrderItem[]
+  purchaseOrderItems  PurchaseOrderItem[]
+  requisitionItems    InternalRequisitionItem[]
+  transferItems       StockTransferItem[]
+  priceListItems      PriceListItem[]
+  quotationItems      QuotationItem[]
+  bundleItems         BundleItem[]
+  BillOfMaterialItem  BillOfMaterialItem[]
+  ProductionMaterial  ProductionMaterial[]
+  MaterialConsumption MaterialConsumption[]
+  ProductionOutput    ProductionOutput[]
+  Batch               Batch[]
+  QualityInspection   QualityInspection[]
+  MaintenancePart     MaintenancePart[]
 
   @@unique([organizationId, sku])
   @@index([productId])
@@ -1770,7 +1988,7 @@ model Promotion {
 // ============================================================
 
 model Warehouse {
-  id             String    @id @default(cuid())
+  id             String        @id @default(cuid())
   organizationId String
   branchId       String?
   /// Membership id of the staff member responsible for this warehouse.
@@ -1782,24 +2000,34 @@ model Warehouse {
   city           String?
   state          String?
   postalCode     String?
-  country        String?   @db.Char(2)
+  country        String?       @db.Char(2)
   phone          String?
-  isDefault      Boolean   @default(false)
-  isActive       Boolean   @default(true)
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  /// What this warehouse holds. GENERAL is what every existing warehouse is,
+  /// so classification is something a business opts into rather than a change
+  /// imposed on it.
+  warehouseType  WarehouseType @default(GENERAL)
+  isDefault      Boolean       @default(false)
+  isActive       Boolean       @default(true)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
   deletedAt      DateTime?
 
-  branch         Branch?         @relation(fields: [branchId], references: [id])
-  stockLevels    StockLevel[]
-  movements      StockMovement[]
-  transfersFrom  StockTransfer[] @relation("TransferFrom")
-  transfersTo    StockTransfer[] @relation("TransferTo")
-  poReceipts     PurchaseOrderReceipt[]
-  requisitionsFrom InternalRequisition[] @relation("RequisitionFrom")
-  requisitionsTo   InternalRequisition[] @relation("RequisitionTo")
-  purchaseOrders PurchaseOrder[]
-  orders         Order[]
+  branch              Branch?                @relation(fields: [branchId], references: [id])
+  stockLevels         StockLevel[]
+  movements           StockMovement[]
+  transfersFrom       StockTransfer[]        @relation("TransferFrom")
+  transfersTo         StockTransfer[]        @relation("TransferTo")
+  poReceipts          PurchaseOrderReceipt[]
+  requisitionsFrom    InternalRequisition[]  @relation("RequisitionFrom")
+  requisitionsTo      InternalRequisition[]  @relation("RequisitionTo")
+  purchaseOrders      PurchaseOrder[]
+  orders              Order[]
+  BillOfMaterial      BillOfMaterial[]
+  ProductionPlan      ProductionPlan[]
+  MaterialConsumption MaterialConsumption[]
+  ProductionOutput    ProductionOutput[]
+  Batch               Batch[]
+  assignments         WarehouseAssignment[]
 
   @@unique([organizationId, code])
   @@index([organizationId])
@@ -1857,31 +2085,31 @@ model StockMovement {
 /// transfer is the *movement*, while this is the conversation that may or may
 /// not produce one — a rejected requisition never becomes a transfer at all.
 model InternalRequisition {
-  id             String            @id @default(cuid())
-  organizationId String
-  number         String
+  id              String            @id @default(cuid())
+  organizationId  String
+  number          String
   /// Who needs the stock.
-  toWarehouseId  String
+  toWarehouseId   String
   /// Who is being asked to supply it.
   fromWarehouseId String
-  status         RequisitionStatus @default(DRAFT)
-  priority       String            @default("NORMAL")
+  status          RequisitionStatus @default(DRAFT)
+  priority        String            @default("NORMAL")
   /// Why the stock is needed — read by whoever approves it.
-  reason         String?           @db.Text
-  notes          String?           @db.Text
-  requestedById  String?
-  approvedById   String?
-  approvedAt     DateTime?
+  reason          String?           @db.Text
+  notes           String?           @db.Text
+  requestedById   String?
+  approvedById    String?
+  approvedAt      DateTime?
   /// Required when rejected: a refusal without a reason cannot be acted on.
-  rejectionReason String?          @db.Text
-  submittedAt    DateTime?
-  completedAt    DateTime?
-  cancelledAt    DateTime?
+  rejectionReason String?           @db.Text
+  submittedAt     DateTime?
+  completedAt     DateTime?
+  cancelledAt     DateTime?
   /// Opaque token printed/displayed as a QR so the destination warehouse can
   /// scan the paperwork open rather than search for a number.
-  scanToken      String?           @unique
-  createdAt      DateTime          @default(now())
-  updatedAt      DateTime          @updatedAt
+  scanToken       String?           @unique
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
 
   fromWarehouse Warehouse                 @relation("RequisitionFrom", fields: [fromWarehouseId], references: [id])
   toWarehouse   Warehouse                 @relation("RequisitionTo", fields: [toWarehouseId], references: [id])
@@ -1895,17 +2123,17 @@ model InternalRequisition {
 }
 
 model InternalRequisitionItem {
-  id             String  @id @default(cuid())
-  requisitionId  String
-  variantId      String
+  id            String   @id @default(cuid())
+  requisitionId String
+  variantId     String
   /// What was asked for.
-  requestedQty   Decimal @db.Decimal(12, 3)
+  requestedQty  Decimal  @db.Decimal(12, 3)
   /// What the source agreed to send — may be less than requested.
-  approvedQty    Decimal? @db.Decimal(12, 3)
+  approvedQty   Decimal? @db.Decimal(12, 3)
   /// What has actually left the source warehouse.
-  dispatchedQty  Decimal @default(0) @db.Decimal(12, 3)
+  dispatchedQty Decimal  @default(0) @db.Decimal(12, 3)
   /// What has actually arrived at the destination.
-  receivedQty    Decimal @default(0) @db.Decimal(12, 3)
+  receivedQty   Decimal  @default(0) @db.Decimal(12, 3)
 
   requisition InternalRequisition @relation(fields: [requisitionId], references: [id], onDelete: Cascade)
   variant     ProductVariant      @relation(fields: [variantId], references: [id])
@@ -2071,8 +2299,8 @@ model PurchaseOrder {
   createdAt      DateTime            @default(now())
   updatedAt      DateTime            @updatedAt
 
-  supplier  Supplier            @relation(fields: [supplierId], references: [id])
-  warehouse Warehouse           @relation(fields: [warehouseId], references: [id])
+  supplier  Supplier               @relation(fields: [supplierId], references: [id])
+  warehouse Warehouse              @relation(fields: [warehouseId], references: [id])
   items     PurchaseOrderItem[]
   receipts  PurchaseOrderReceipt[]
 
@@ -2110,21 +2338,21 @@ model PurchaseOrderReceipt {
 }
 
 model PurchaseOrderReceiptLine {
-  id        String  @id @default(cuid())
-  receiptId String
-  itemId    String
-  variantId String
-  quantity  Decimal @db.Decimal(12, 3)
+  id                   String    @id @default(cuid())
+  receiptId            String
+  itemId               String
+  variantId            String
+  quantity             Decimal   @db.Decimal(12, 3)
   /// What was still outstanding when this line was received, so the history
   /// reads correctly even after the expected quantity is later amended.
-  outstandingAtReceipt Decimal @db.Decimal(12, 3)
+  outstandingAtReceipt Decimal   @db.Decimal(12, 3)
   /// True when this line took the order past its expected quantity.
-  overReceived Boolean @default(false)
+  overReceived         Boolean   @default(false)
   /// The supplier's batch or lot reference for what arrived, and when it goes
   /// out of date. Recorded against the receipt rather than the order line
   /// because two deliveries against the same line can carry different batches.
-  batchNumber  String?
-  expiryDate   DateTime?
+  batchNumber          String?
+  expiryDate           DateTime?
 
   receipt PurchaseOrderReceipt @relation(fields: [receiptId], references: [id], onDelete: Cascade)
   item    PurchaseOrderItem    @relation(fields: [itemId], references: [id])
@@ -2145,8 +2373,8 @@ model PurchaseOrderItem {
   /// so a reprinted PO still matches what the supplier was sent.
   supplierSku     String?
 
-  purchaseOrder PurchaseOrder  @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
-  variant       ProductVariant @relation(fields: [variantId], references: [id])
+  purchaseOrder PurchaseOrder              @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  variant       ProductVariant             @relation(fields: [variantId], references: [id])
   receiptLines  PurchaseOrderReceiptLine[]
 
   @@index([purchaseOrderId])
@@ -2463,43 +2691,43 @@ model Refund {
 // ============================================================
 
 model Invoice {
-  id             String        @id @default(cuid())
-  organizationId String
-  number         String
-  customerId     String
-  orderId        String?
-  dealId         String? // CRM deal this invoice was generated from
-  leaseId        String? // real-estate rent invoices
-  status         InvoiceStatus @default(DRAFT)
-  currency       String        @default("USD") @db.Char(3)
-  subtotal       Decimal       @default(0) @db.Decimal(14, 2)
-  taxTotal       Decimal       @default(0) @db.Decimal(14, 2)
-  discountTotal  Decimal       @default(0) @db.Decimal(14, 2)
-  total          Decimal       @default(0) @db.Decimal(14, 2)
-  amountPaid     Decimal       @default(0) @db.Decimal(14, 2)
-  issuedAt       DateTime?
-  dueAt          DateTime?
-  paidAt         DateTime?
-  pdfFileId      String?
-  notes          String?       @db.Text
+  id                  String        @id @default(cuid())
+  organizationId      String
+  number              String
+  customerId          String
+  orderId             String?
+  dealId              String? // CRM deal this invoice was generated from
+  leaseId             String? // real-estate rent invoices
+  status              InvoiceStatus @default(DRAFT)
+  currency            String        @default("USD") @db.Char(3)
+  subtotal            Decimal       @default(0) @db.Decimal(14, 2)
+  taxTotal            Decimal       @default(0) @db.Decimal(14, 2)
+  discountTotal       Decimal       @default(0) @db.Decimal(14, 2)
+  total               Decimal       @default(0) @db.Decimal(14, 2)
+  amountPaid          Decimal       @default(0) @db.Decimal(14, 2)
+  issuedAt            DateTime?
+  dueAt               DateTime?
+  paidAt              DateTime?
+  pdfFileId           String?
+  notes               String?       @db.Text
   /// When a renegotiated deal produces a fresh invoice, the old one is voided
   /// and points here. The chain is how a business answers "what happened to
   /// INV-1001?" without either invoice being deleted.
-  replacedByInvoiceId String?  @unique
+  replacedByInvoiceId String?       @unique
   /// The invoice this one supersedes — the other end of the same link.
   replacesInvoiceId   String?
-  voidedAt       DateTime?
-  voidReason     String?       @db.Text
-  createdAt      DateTime      @default(now())
-  updatedAt      DateTime      @updatedAt
-  deletedAt      DateTime?
+  voidedAt            DateTime?
+  voidReason          String?       @db.Text
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+  deletedAt           DateTime?
 
-  customer Customer      @relation(fields: [customerId], references: [id])
-  order    Order?        @relation(fields: [orderId], references: [id])
-  deal     Deal?         @relation(fields: [dealId], references: [id])
-  lease    Lease?        @relation(fields: [leaseId], references: [id])
-  items    InvoiceItem[]
-  payments Payment[]
+  customer       Customer        @relation(fields: [customerId], references: [id])
+  order          Order?          @relation(fields: [orderId], references: [id])
+  deal           Deal?           @relation(fields: [dealId], references: [id])
+  lease          Lease?          @relation(fields: [leaseId], references: [id])
+  items          InvoiceItem[]
+  payments       Payment[]
   paymentIntents PaymentIntent[]
 
   @@unique([organizationId, number])
@@ -2523,27 +2751,27 @@ model InvoiceItem {
 }
 
 model Payment {
-  id             String            @id @default(cuid())
-  organizationId String
-  customerId     String?
-  orderId        String?
-  invoiceId      String?
+  id              String            @id @default(cuid())
+  organizationId  String
+  customerId      String?
+  orderId         String?
+  invoiceId       String?
   /// The intent this payment settled, when it came in through one. Null for
   /// money recorded by hand (cash at the counter, a cheque banked later).
   paymentIntentId String?
-  method         PaymentMethodType
-  status         PaymentStatus     @default(PENDING)
-  amount         Decimal           @db.Decimal(14, 2)
-  currency       String            @default("USD") @db.Char(3)
-  provider       String? // adapter key: e.g. "stripe", "paystack", "manual"
-  providerRef    String? // gateway transaction id
-  idempotencyKey String?           @unique
-  receivedById   String? // Membership id (cash/POS)
-  paidAt         DateTime?
-  failureReason  String?
-  metadata       Json?
-  createdAt      DateTime          @default(now())
-  updatedAt      DateTime          @updatedAt
+  method          PaymentMethodType
+  status          PaymentStatus     @default(PENDING)
+  amount          Decimal           @db.Decimal(14, 2)
+  currency        String            @default("USD") @db.Char(3)
+  provider        String? // adapter key: e.g. "stripe", "paystack", "manual"
+  providerRef     String? // gateway transaction id
+  idempotencyKey  String?           @unique
+  receivedById    String? // Membership id (cash/POS)
+  paidAt          DateTime?
+  failureReason   String?
+  metadata        Json?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
 
   customer    Customer?    @relation(fields: [customerId], references: [id])
   order       Order?       @relation(fields: [orderId], references: [id])
@@ -2710,20 +2938,20 @@ model PaymentIntent {
   dealId         String?
   propertyId     String?
 
-  amount    Decimal @db.Decimal(14, 2)
+  amount         Decimal @db.Decimal(14, 2)
   /// Sum of verified provider transactions. Never written from a client.
-  amountPaid Decimal @default(0) @db.Decimal(14, 2)
+  amountPaid     Decimal @default(0) @db.Decimal(14, 2)
   amountRefunded Decimal @default(0) @db.Decimal(14, 2)
-  currency  String  @default("NGN") @db.Char(3)
+  currency       String  @default("NGN") @db.Char(3)
 
-  status      PaymentIntentStatus @default(CREATED)
-  description String?
+  status       PaymentIntentStatus @default(CREATED)
+  description  String?
   /// Set once the customer commits to a method; null while they are choosing.
-  method      PaymentMethodKind?
+  method       PaymentMethodKind?
   /// Adapter key of the provider that will settle this — "paystack" etc.
-  provider    String?
+  provider     String?
   /// Whether the customer may settle this in instalments.
-  allowPartial Boolean            @default(false)
+  allowPartial Boolean             @default(false)
 
   /// Opaque token behind the public /pay/<token> page and QR codes. Separate
   /// from `reference`: the reference is quoted out loud and printed on bills,
@@ -2827,21 +3055,21 @@ model PaymentMethodSetting {
 /// method is a data change rather than a deploy. This is the ceiling: a
 /// business can only enable what its provider supports here.
 model ProviderCapability {
-  id           String            @id @default(cuid())
-  provider     String
-  method       PaymentMethodKind
+  id         String            @id @default(cuid())
+  provider   String
+  method     PaymentMethodKind
   /// Empty means "any currency the provider settles".
-  currencies   String[]          @default([])
+  currencies String[]          @default([])
   /// ISO-2 codes. Empty means "any country".
-  countries    String[]          @default([])
+  countries  String[]          @default([])
   /// Platform kill switch, independent of any business's choice.
-  enabled      Boolean           @default(true)
+  enabled    Boolean           @default(true)
   /// Some methods only make sense above/below a size — USSD caps, for example.
-  minAmount    Decimal?          @db.Decimal(14, 2)
-  maxAmount    Decimal?          @db.Decimal(14, 2)
-  notes        String?
-  createdAt    DateTime          @default(now())
-  updatedAt    DateTime          @updatedAt
+  minAmount  Decimal?          @db.Decimal(14, 2)
+  maxAmount  Decimal?          @db.Decimal(14, 2)
+  notes      String?
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
 
   @@unique([provider, method])
   @@index([provider, enabled])
@@ -2903,21 +3131,21 @@ enum InboundWebhookStatus {
 /// an event belongs to is worked out during processing, so this table is read
 /// and written through the unscoped client.
 model InboundWebhookEvent {
-  id             String               @id @default(cuid())
-  provider       String
+  id              String               @id @default(cuid())
+  provider        String
   /// Provider's own event id where it gives one, else a hash of the payload.
-  eventKey       String
-  eventType      String?
-  organizationId String?
+  eventKey        String
+  eventType       String?
+  organizationId  String?
   /// Set once the event has been matched to something we know about.
   paymentIntentId String?
-  status         InboundWebhookStatus @default(RECEIVED)
-  signatureValid Boolean              @default(false)
-  attempts       Int                  @default(0)
-  lastError      String?              @db.Text
-  payload        Json
-  receivedAt     DateTime             @default(now())
-  processedAt    DateTime?
+  status          InboundWebhookStatus @default(RECEIVED)
+  signatureValid  Boolean              @default(false)
+  attempts        Int                  @default(0)
+  lastError       String?              @db.Text
+  payload         Json
+  receivedAt      DateTime             @default(now())
+  processedAt     DateTime?
 
   @@unique([provider, eventKey])
   @@index([status, receivedAt])
@@ -3226,12 +3454,12 @@ model Property {
   updatedAt      DateTime        @updatedAt
   deletedAt      DateTime?
 
-  owner       Customer?            @relation("PropertyOwner", fields: [ownerId], references: [id])
-  media       PropertyMedia[]
-  leases      Lease[]
-  bookings    PropertyBooking[]
-  maintenance MaintenanceRequest[]
-  commissions Commission[]
+  owner          Customer?            @relation("PropertyOwner", fields: [ownerId], references: [id])
+  media          PropertyMedia[]
+  leases         Lease[]
+  bookings       PropertyBooking[]
+  maintenance    MaintenanceRequest[]
+  commissions    Commission[]
   paymentIntents PaymentIntent[]
 
   @@unique([organizationId, reference])
@@ -4310,6 +4538,13 @@ model AuditLog {
   entityId       String?
   before         Json?
   after          Json?
+  /// Why, in the actor's own words.
+  ///
+  /// Some decisions are not explained by what changed. Releasing a quarantined
+  /// batch, writing stock off or overriding a variance all look identical in
+  /// `before`/`after` to the same action taken for a completely different
+  /// reason, and the reason is the part anyone reviewing it needs.
+  reason         String?
   ipAddress      String?
   userAgent      String?
   createdAt      DateTime @default(now())
@@ -6087,24 +6322,24 @@ model AiReplySuggestion {
 /// document summary both counted as one. This records what was actually
 /// consumed, so an operator can see which businesses are expensive and why.
 model AiUsageEvent {
-  id             String   @id @default(cuid())
-  organizationId String
+  id               String   @id @default(cuid())
+  organizationId   String
   /// Adapter key — "anthropic", "openai", "openrouter", …
-  provider       String
-  model          String
+  provider         String
+  model            String
   /// What asked for it: chat reply, insights, suggestions, summary.
-  feature        String
-  promptTokens   Int      @default(0)
-  completionTokens Int    @default(0)
-  totalTokens    Int      @default(0)
+  feature          String
+  promptTokens     Int      @default(0)
+  completionTokens Int      @default(0)
+  totalTokens      Int      @default(0)
   /// Credits drawn from the organisation's allowance for this call.
-  credits        Int      @default(0)
+  credits          Int      @default(0)
   /// True when the business used its own API key, so the platform bore no cost
   /// and no credit was drawn.
-  ownKey         Boolean  @default(false)
+  ownKey           Boolean  @default(false)
   /// Set when a call failed, so failures are visible rather than missing.
-  failed         Boolean  @default(false)
-  createdAt      DateTime @default(now())
+  failed           Boolean  @default(false)
+  createdAt        DateTime @default(now())
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
@@ -6119,7 +6354,7 @@ model AiUsageEvent {
 /// business have 5,000 extra credits?" is a question that gets asked, and a
 /// single figure cannot answer it. Negative values claw credit back.
 model AiCreditGrant {
-  id             String   @id @default(cuid())
+  id             String    @id @default(cuid())
   organizationId String
   /// Positive grants credit, negative removes it.
   credits        Int
@@ -6128,9 +6363,554 @@ model AiCreditGrant {
   grantedById    String?
   /// Null means it never lapses; otherwise it stops counting after this date.
   expiresAt      DateTime?
-  createdAt      DateTime @default(now())
+  createdAt      DateTime  @default(now())
 
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
   @@index([organizationId, createdAt])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MANUFACTURING & OPERATIONS
+//
+// For businesses that make things. Gated by `OrganizationModule` /
+// `business-modules.ts` — a business without the module never sees any of it,
+// and these tables simply stay empty.
+//
+// Everything here leans on what already exists rather than restating it:
+// products and their variants, warehouses, stock levels and movements,
+// suppliers, purchase orders, internal requisitions, employees and users. A
+// second parallel inventory would be the fastest way to make both wrong.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Per-business manufacturing preferences.
+///
+/// Kept as a row rather than JSON on the organization so the values can be
+/// read and reported on — "which businesses allow 10% variance?" is a question
+/// somebody will eventually ask.
+model ManufacturingSettings {
+  id             String @id @default(cuid())
+  organizationId String @unique
+
+  /// Whether more than one BOM version may be active for a product at once.
+  /// Off by default: two active recipes means production picks one at random.
+  allowMultipleActiveBoms   Boolean @default(false)
+  /// How far actual consumption may drift from the BOM before it is flagged.
+  acceptableVariancePercent Decimal @default(5) @db.Decimal(5, 2)
+  /// Template for generated batch numbers, e.g. "{SKU}-{YYYYMMDD}-{SEQ}".
+  batchNumberFormat         String  @default("{SKU}-{YYYYMMDD}-{SEQ}")
+  /// Whether a batch must pass QC before its stock counts as sellable.
+  requireQcBeforeRelease    Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// What it takes to make one product — the recipe.
+model BillOfMaterial {
+  id             String    @id @default(cuid())
+  organizationId String
+  bomNumber      String
+  productId      String
+  version        Int       @default(1)
+  status         BomStatus @default(DRAFT)
+  effectiveFrom  DateTime?
+  /// The batch size this recipe is written for. Components are scaled from
+  /// here, so "650kg of sugar" is meaningless without "per 1,000 cases".
+  outputQuantity Decimal   @db.Decimal(12, 3)
+  /// Where the finished goods land by default.
+  warehouseId    String?
+  notes          String?   @db.Text
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  product          Product              @relation(fields: [productId], references: [id])
+  warehouse        Warehouse?           @relation(fields: [warehouseId], references: [id])
+  items            BillOfMaterialItem[]
+  productionPlans  ProductionPlan[]
+  productionOrders ProductionOrder[]
+
+  @@unique([organizationId, bomNumber])
+  @@index([organizationId, productId, status])
+}
+
+model BillOfMaterialItem {
+  id             String  @id @default(cuid())
+  organizationId String
+  bomId          String
+  /// The material, at variant level — that is what stock is actually held
+  /// against.
+  variantId      String
+  quantity       Decimal @db.Decimal(12, 3)
+  /// Copied from the product at the time, so a later rename of the unit does
+  /// not silently reinterpret an old recipe.
+  unit           String?
+  /// Expected loss in handling, as a percentage. Requirements are grossed up
+  /// by this, which is why planned consumption exceeds the bare recipe.
+  scrapPercent   Decimal @default(0) @db.Decimal(5, 2)
+  notes          String?
+
+  bom     BillOfMaterial @relation(fields: [bomId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [variantId], references: [id])
+
+  @@index([organizationId])
+  @@index([bomId])
+}
+
+/// An intention to produce, before it becomes an order.
+model ProductionPlan {
+  id                     String               @id @default(cuid())
+  organizationId         String
+  planNumber             String
+  productId              String
+  bomId                  String?
+  quantity               Decimal              @db.Decimal(12, 3)
+  productionDate         DateTime
+  expectedCompletionDate DateTime?
+  productionLineId       String?
+  warehouseId            String?
+  priority               ProductionPriority   @default(NORMAL)
+  /// Employee record, not a user: the person answerable on the floor may not
+  /// have a login.
+  responsibleEmployeeId  String?
+  status                 ProductionPlanStatus @default(DRAFT)
+  notes                  String?              @db.Text
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  product        Product           @relation(fields: [productId], references: [id])
+  bom            BillOfMaterial?   @relation(fields: [bomId], references: [id])
+  productionLine ProductionLine?   @relation(fields: [productionLineId], references: [id])
+  warehouse      Warehouse?        @relation(fields: [warehouseId], references: [id])
+  orders         ProductionOrder[]
+
+  @@unique([organizationId, planNumber])
+  @@index([organizationId, status, productionDate])
+}
+
+/// A committed production run.
+model ProductionOrder {
+  id                     String                @id @default(cuid())
+  organizationId         String
+  orderNumber            String
+  planId                 String?
+  productId              String
+  bomId                  String?
+  plannedQuantity        Decimal               @db.Decimal(12, 3)
+  /// Filled in as output is recorded, not planned up front.
+  actualQuantity         Decimal               @default(0) @db.Decimal(12, 3)
+  rejectedQuantity       Decimal               @default(0) @db.Decimal(12, 3)
+  productionLineId       String?
+  /// Where materials are drawn from and finished goods are booked in.
+  warehouseId            String?
+  finishedWarehouseId    String?
+  startDate              DateTime?
+  expectedCompletionDate DateTime?
+  actualCompletionDate   DateTime?
+  responsibleEmployeeId  String?
+  status                 ProductionOrderStatus @default(DRAFT)
+  priority               ProductionPriority    @default(NORMAL)
+  notes                  String?               @db.Text
+  /// Printed on the job card so the operator at the machine can scan it and
+  /// act on the order instead of hunting for its number. Random rather than
+  /// signed, matching PurchaseOrder: the token *is* the secret, it is only
+  /// ever accepted from an authenticated session, and reprinting rotates it.
+  /// Nullable so orders raised before this shipped still open.
+  scanToken              String?               @unique
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  plan           ProductionPlan?       @relation(fields: [planId], references: [id])
+  product        Product               @relation(fields: [productId], references: [id])
+  bom            BillOfMaterial?       @relation(fields: [bomId], references: [id])
+  productionLine ProductionLine?       @relation(fields: [productionLineId], references: [id])
+  materials      ProductionMaterial[]
+  consumption    MaterialConsumption[]
+  outputs        ProductionOutput[]
+  batches        Batch[]
+  inspections    QualityInspection[]
+  costs          ProductionCost[]
+
+  @@unique([organizationId, orderNumber])
+  @@index([organizationId, status])
+  @@index([organizationId, productId])
+}
+
+/// What one production order needs, worked out from its BOM when the order is
+/// raised. Frozen at that moment: a BOM edited next month must not silently
+/// rewrite what a run in progress was supposed to use.
+model ProductionMaterial {
+  id                String  @id @default(cuid())
+  organizationId    String
+  productionOrderId String
+  variantId         String
+  requiredQuantity  Decimal @db.Decimal(12, 3)
+  /// Running totals, updated by issue and consumption transactions.
+  issuedQuantity    Decimal @default(0) @db.Decimal(12, 3)
+  consumedQuantity  Decimal @default(0) @db.Decimal(12, 3)
+  unit              String?
+
+  productionOrder ProductionOrder @relation(fields: [productionOrderId], references: [id], onDelete: Cascade)
+  variant         ProductVariant  @relation(fields: [variantId], references: [id])
+
+  @@unique([productionOrderId, variantId])
+  @@index([organizationId])
+}
+
+/// Material physically leaving a store for a line, and what was really used.
+model MaterialConsumption {
+  id                String   @id @default(cuid())
+  organizationId    String
+  productionOrderId String
+  warehouseId       String
+  variantId         String
+  /// What the order said it needed, copied here so the transaction reads on
+  /// its own without re-deriving the BOM.
+  requiredQuantity  Decimal? @db.Decimal(12, 3)
+  issuedQuantity    Decimal  @default(0) @db.Decimal(12, 3)
+  consumedQuantity  Decimal  @default(0) @db.Decimal(12, 3)
+  /// Which lot was used, for tracing a finished batch back to its inputs.
+  batchId           String?
+  batchNumber       String?
+  issuedByUserId    String?
+  occurredAt        DateTime @default(now())
+  notes             String?
+
+  productionOrder ProductionOrder @relation(fields: [productionOrderId], references: [id], onDelete: Cascade)
+  warehouse       Warehouse       @relation(fields: [warehouseId], references: [id])
+  variant         ProductVariant  @relation(fields: [variantId], references: [id])
+  batch           Batch?          @relation(fields: [batchId], references: [id])
+
+  @@index([organizationId, occurredAt])
+  @@index([productionOrderId])
+}
+
+/// What actually came off the line.
+model ProductionOutput {
+  id                    String    @id @default(cuid())
+  organizationId        String
+  productionOrderId     String
+  variantId             String
+  plannedQuantity       Decimal   @default(0) @db.Decimal(12, 3)
+  producedQuantity      Decimal   @db.Decimal(12, 3)
+  rejectedQuantity      Decimal   @default(0) @db.Decimal(12, 3)
+  /// produced − rejected. Stored rather than derived because it is what was
+  /// actually booked into stock, and a later correction to either input must
+  /// not retrospectively change history.
+  goodQuantity          Decimal   @db.Decimal(12, 3)
+  warehouseId           String
+  batchId               String?
+  productionDate        DateTime  @default(now())
+  expiryDate            DateTime?
+  responsibleEmployeeId String?
+  recordedByUserId      String?
+  notes                 String?
+
+  createdAt DateTime @default(now())
+
+  productionOrder ProductionOrder @relation(fields: [productionOrderId], references: [id], onDelete: Cascade)
+  variant         ProductVariant  @relation(fields: [variantId], references: [id])
+  warehouse       Warehouse       @relation(fields: [warehouseId], references: [id])
+  batch           Batch?          @relation(fields: [batchId], references: [id])
+
+  @@index([organizationId, productionDate])
+  @@index([productionOrderId])
+}
+
+/// A traceable lot.
+///
+/// The spine of a recall: a batch knows the order that made it, and the order
+/// knows what it consumed, which in turn knows the batches those came from and
+/// therefore the supplier and purchase order behind them.
+model Batch {
+  id                String    @id @default(cuid())
+  organizationId    String
+  batchNumber       String
+  variantId         String
+  productionOrderId String?
+  productionDate    DateTime  @default(now())
+  expiryDate        DateTime?
+  quantityProduced  Decimal   @default(0) @db.Decimal(12, 3)
+  /// What is left and unreserved. Not derived from movements on read: a
+  /// recall needs this to be a fact, not a sum that might time out.
+  quantityAvailable Decimal   @default(0) @db.Decimal(12, 3)
+  warehouseId       String?
+  qcStatus          QcStatus  @default(PENDING)
+  /// True while quarantined. Kept separate from `qcStatus` because a batch can
+  /// be held for reasons other than a failed inspection.
+  isQuarantined     Boolean   @default(false)
+  notes             String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  variant         ProductVariant        @relation(fields: [variantId], references: [id])
+  productionOrder ProductionOrder?      @relation(fields: [productionOrderId], references: [id])
+  warehouse       Warehouse?            @relation(fields: [warehouseId], references: [id])
+  consumption     MaterialConsumption[]
+  outputs         ProductionOutput[]
+  inspections     QualityInspection[]
+  quarantines     QuarantineRecord[]
+
+  @@unique([organizationId, batchNumber])
+  @@index([organizationId, qcStatus])
+  @@index([variantId])
+}
+
+/// A quality parameter a business checks on a product — pH, weight, colour.
+model QualityParameter {
+  id             String   @id @default(cuid())
+  organizationId String
+  productId      String
+  name           String
+  unit           String?
+  /// A numeric range, a expected text value, or both left null for a simple
+  /// pass/fail judgement.
+  expectedMin    Decimal? @db.Decimal(14, 4)
+  expectedMax    Decimal? @db.Decimal(14, 4)
+  expectedText   String?
+  isRequired     Boolean  @default(true)
+  position       Int      @default(0)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, productId])
+}
+
+model QualityInspection {
+  id                String   @id @default(cuid())
+  organizationId    String
+  inspectionNumber  String
+  variantId         String
+  batchId           String?
+  productionOrderId String?
+  inspectorUserId   String?
+  inspectedAt       DateTime @default(now())
+  status            QcStatus @default(PENDING)
+  comments          String?  @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  variant         ProductVariant          @relation(fields: [variantId], references: [id])
+  batch           Batch?                  @relation(fields: [batchId], references: [id])
+  productionOrder ProductionOrder?        @relation(fields: [productionOrderId], references: [id])
+  items           QualityInspectionItem[]
+
+  @@unique([organizationId, inspectionNumber])
+  @@index([organizationId, status])
+}
+
+model QualityInspectionItem {
+  id             String   @id @default(cuid())
+  organizationId String
+  inspectionId   String
+  /// Copied from the parameter rather than referenced, so an inspection still
+  /// reads correctly after the parameter is renamed or retired.
+  parameterId    String?
+  name           String
+  unit           String?
+  expectedMin    Decimal? @db.Decimal(14, 4)
+  expectedMax    Decimal? @db.Decimal(14, 4)
+  expectedText   String?
+  actualValue    String?
+  actualNumeric  Decimal? @db.Decimal(14, 4)
+  passed         Boolean?
+
+  inspection QualityInspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([inspectionId])
+}
+
+/// Stock held back from sale, and what was decided about it.
+model QuarantineRecord {
+  id              String           @id @default(cuid())
+  organizationId  String
+  batchId         String
+  quantity        Decimal          @db.Decimal(12, 3)
+  reason          String
+  status          QuarantineStatus @default(HELD)
+  heldByUserId    String?
+  heldAt          DateTime         @default(now())
+  /// The decision, and who is answerable for it.
+  decidedByUserId String?
+  decidedAt       DateTime?
+  decisionReason  String?          @db.Text
+  notes           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  batch Batch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, status])
+  @@index([batchId])
+}
+
+model ProductionLine {
+  id                    String               @id @default(cuid())
+  organizationId        String
+  name                  String
+  code                  String
+  location              String?
+  /// How much it can make per period, in whatever the business counts.
+  capacity              Decimal?             @db.Decimal(12, 3)
+  capacityUnit          String?
+  status                ProductionLineStatus @default(OPERATIONAL)
+  responsibleEmployeeId String?
+  description           String?              @db.Text
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  equipment        Equipment[]
+  productionPlans  ProductionPlan[]
+  productionOrders ProductionOrder[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId, status])
+}
+
+model Equipment {
+  id                       String          @id @default(cuid())
+  organizationId           String
+  name                     String
+  code                     String
+  category                 String?
+  productionLineId         String?
+  location                 String?
+  manufacturer             String?
+  model                    String?
+  serialNumber             String?
+  purchaseDate             DateTime?
+  warrantyExpiry           DateTime?
+  status                   EquipmentStatus @default(OPERATIONAL)
+  /// How often it is meant to be serviced, and when it last was. The next due
+  /// date is stored rather than computed so it can be overridden by hand.
+  maintenanceFrequencyDays Int?
+  lastMaintenanceAt        DateTime?
+  nextMaintenanceAt        DateTime?
+  notes                    String?         @db.Text
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  productionLine ProductionLine?        @relation(fields: [productionLineId], references: [id])
+  workOrders     MaintenanceWorkOrder[]
+
+  @@unique([organizationId, code])
+  @@index([organizationId, status])
+}
+
+model MaintenanceWorkOrder {
+  id                 String              @id @default(cuid())
+  organizationId     String
+  workOrderNumber    String
+  equipmentId        String
+  type               MaintenanceType     @default(CORRECTIVE)
+  issue              String              @db.Text
+  priority           MaintenancePriority @default(MEDIUM)
+  assignedEmployeeId String?
+  startDate          DateTime?
+  completionDate     DateTime?
+  status             MaintenanceStatus   @default(OPEN)
+  /// Minutes the equipment was unavailable. The number every downtime report
+  /// is built from.
+  downtimeMinutes    Int?
+  cost               Decimal?            @db.Decimal(14, 2)
+  notes              String?             @db.Text
+  /// Scannable from the work order sheet taped to the machine — same
+  /// convention as PurchaseOrder and ProductionOrder.
+  scanToken          String?             @unique
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  equipment Equipment         @relation(fields: [equipmentId], references: [id])
+  parts     MaintenancePart[]
+
+  @@unique([organizationId, workOrderNumber])
+  @@index([organizationId, status])
+  @@index([equipmentId])
+}
+
+/// A spare part consumed by a maintenance job. Draws on the same stock as
+/// everything else, so fitting a bearing shows up in inventory like any other
+/// movement.
+model MaintenancePart {
+  id             String   @id @default(cuid())
+  organizationId String
+  workOrderId    String
+  variantId      String
+  warehouseId    String?
+  quantity       Decimal  @db.Decimal(12, 3)
+  unitCost       Decimal? @db.Decimal(14, 2)
+  issuedAt       DateTime @default(now())
+
+  workOrder MaintenanceWorkOrder @relation(fields: [workOrderId], references: [id], onDelete: Cascade)
+  variant   ProductVariant       @relation(fields: [variantId], references: [id])
+
+  @@index([organizationId])
+  @@index([workOrderId])
+}
+
+/// What a production run cost, worked out when it completed.
+///
+/// A stored snapshot rather than a live calculation: material prices move, and
+/// last quarter's cost must not change because this quarter's sugar did.
+model ProductionCost {
+  id                String   @id @default(cuid())
+  organizationId    String
+  productionOrderId String
+  materialCost      Decimal  @default(0) @db.Decimal(14, 2)
+  packagingCost     Decimal  @default(0) @db.Decimal(14, 2)
+  labourCost        Decimal  @default(0) @db.Decimal(14, 2)
+  overheadCost      Decimal  @default(0) @db.Decimal(14, 2)
+  otherCost         Decimal  @default(0) @db.Decimal(14, 2)
+  totalCost         Decimal  @default(0) @db.Decimal(14, 2)
+  /// Divided by good output, so it reflects what sellable units actually cost.
+  unitCost          Decimal? @db.Decimal(14, 4)
+  /// What the BOM and standard costs said it should have been.
+  estimatedCost     Decimal? @db.Decimal(14, 2)
+  estimatedUnitCost Decimal? @db.Decimal(14, 4)
+  currency          String   @db.Char(3)
+  calculatedAt      DateTime @default(now())
+
+  productionOrder ProductionOrder @relation(fields: [productionOrderId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, calculatedAt])
+  @@index([productionOrderId])
+}
+
+/// Where a run drifted from its recipe, per material.
+model ProductionVariance {
+  id                String   @id @default(cuid())
+  organizationId    String
+  productionOrderId String
+  variantId         String
+  plannedQuantity   Decimal  @db.Decimal(12, 3)
+  actualQuantity    Decimal  @db.Decimal(12, 3)
+  /// actual − planned. Positive is overconsumption.
+  varianceQuantity  Decimal  @db.Decimal(12, 3)
+  variancePercent   Decimal? @db.Decimal(8, 2)
+  /// Whether it exceeded the business's configured tolerance.
+  exceedsThreshold  Boolean  @default(false)
+  calculatedAt      DateTime @default(now())
+
+  @@index([organizationId, calculatedAt])
+  @@index([productionOrderId])
 }

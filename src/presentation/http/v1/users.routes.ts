@@ -7,6 +7,11 @@ import { authLimiter } from '../middleware/rate-limit';
 import { usersService } from '../../../application/users/users.service';
 import { authService } from '../../../application/auth/auth.service';
 import {
+  listAssignments,
+  setAssignments,
+} from '../../../application/inventory/warehouse-access';
+import { z } from 'zod';
+import {
   acceptInviteSchema,
   inviteUserSchema,
   updateMemberSchema,
@@ -31,6 +36,46 @@ usersRoutes.get(
   requirePermission('settings.manage_users'),
   wrap(async (req, res) => {
     const data = await usersService.listMembers(req.auth!.organizationId!);
+    res.json({ success: true, data });
+  })
+);
+
+/**
+ * Which warehouses a member is confined to. An empty list means unrestricted,
+ * so this is also how an admin lifts a restriction.
+ */
+usersRoutes.get(
+  '/:membershipId/warehouses',
+  authenticate,
+  requireTenant,
+  requirePermission('settings.manage_users'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await listAssignments(req.params.membershipId as string) });
+  })
+);
+
+usersRoutes.put(
+  '/:membershipId/warehouses',
+  authenticate,
+  requireTenant,
+  // Only user administration, deliberately: `inventory.manage_warehouses` is
+  // what a warehouse manager holds, and they must not be able to widen their
+  // own access. requirePermission is ANY-of, so listing both would do exactly
+  // that.
+  requirePermission('settings.manage_users'),
+  validate({
+    body: z.object({
+      assignments: z
+        .array(z.object({ warehouseId: z.string().min(1), canManage: z.boolean().optional() }))
+        .max(200),
+    }),
+  }),
+  wrap(async (req, res) => {
+    const data = await setAssignments(
+      req.params.membershipId as string,
+      req.body.assignments,
+      req.auth!.organizationId!
+    );
     res.json({ success: true, data });
   })
 );

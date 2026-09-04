@@ -1,6 +1,6 @@
 import type { RequestHandler } from 'express';
 import { ForbiddenError, UnauthorizedError } from '../../../shared/errors';
-import { permissionsForRole } from '../../../application/roles/role-permissions';
+import { isOwnerMembership, permissionsForRole } from '../../../application/roles/role-permissions';
 
 // Re-exported so existing importers keep working; the cache itself now lives in
 // the application layer, where services can consult it too.
@@ -22,6 +22,12 @@ export function requirePermission(...keys: string[]): RequestHandler {
 
       const granted = await permissionsForRole(req.auth.roleId);
       if (keys.some((k) => granted.has(k))) {
+        next();
+        return;
+      }
+      // Checked only once the role has already said no, so the common path
+      // costs nothing. See isOwnerMembership for why owners bypass.
+      if (req.auth.membershipId && (await isOwnerMembership(req.auth.membershipId))) {
         next();
         return;
       }

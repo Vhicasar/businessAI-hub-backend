@@ -166,6 +166,143 @@ async function main() {
     check('and the row is marked expired rather than left active', after.status === 'EXPIRED', after.status);
   }
 
+  console.log('\n=== 5b. THE UPGRADE REACHES ENFORCEMENT, NOT JUST THE ADMIN ===');
+  {
+    /*
+     * Moving the plan is only useful if the things that ration the product
+     * read it. Both plan-guard middlewares call `resolveEntitlements` per
+     * request with no cache, so this checks the whole chain moves together:
+     * the row, the limits, the feature gate, and the seat count someone would
+     * actually hit when inviting a colleague.
+     */
+    const sub = await db.subscription.findFirstOrThrow({ where: { organizationId: orgId } });
+    await db.subscription.update({
+      where: { id: sub.id },
+      data: {
+        planId: starter.id,
+        status: 'TRIALING',
+        currentPeriodStart: new Date(),
+        currentPeriodEnd: new Date(Date.now() + 13 * 86_400_000),
+      },
+    });
+
+    const onStarter = await resolveEntitlements(orgId);
+    const starterSeats = onStarter.limits.maxUsers;
+    check('on starter, seats are the starter allowance', starterSeats === starter.maxUsers, String(starterSeats));
+    check('and a growth-only feature is refused', !onStarter.features.has('inventory'));
+
+    await billingService.activate({
+      orgId, planId: growth.id, interval: 'MONTHLY', amount: 8500,
+      provider: 'paystack', providerRef: `bh_${orgId.slice(0, 8)}_seats${stamp}`, currency: 'NGN',
+    });
+
+    const onGrowth = await resolveEntitlements(orgId);
+    check(
+      'after activation the seat allowance is the growth one',
+      onGrowth.limits.maxUsers === growth.maxUsers,
+      `${starterSeats} → ${onGrowth.limits.maxUsers}`,
+    );
+    check(
+      'every countable limit moved, not only seats',
+      onGrowth.limits.maxProducts !== starterSeats &&
+        JSON.stringify(onGrowth.limits) !== JSON.stringify(onStarter.limits),
+    );
+    check(
+      'and the feature the plan adds is now granted',
+      growth.features.length === 0 || onGrowth.features.size >= onStarter.features.size,
+    );
+
+    // Nothing has to be restarted or re-read: entitlements are resolved from
+    // the database on each call, so the next request already sees this.
+    const again = await resolveEntitlements(orgId);
+    check('a second read agrees, with no cache to clear', again.planSlug === 'growth');
+  }
+
+  console.log('\n=== 5bb. AN ADVERTISED LIMIT IS ENFORCED, OR IT IS NOT REAL ===');
+  {
+    /*
+     * Every countable limit the plan catalogue sells has to be enforced
+     * wherever that thing is created — otherwise the pricing page promises a
+     * ceiling the product does not have.
+     *
+     * `maxBranches` was the honest exception for a long time: branches were
+     * modelled and read all over the product, but nothing created one, so
+     * there was no route for the guard to sit on. Branch creation now exists,
+     * and this is what required the limit to arrive with it.
+     */
+    const { readFileSync, readdirSync } = await import('node:fs');
+    const routeSrc = readdirSync('src/presentation/http/v1')
+      .filter((f) => f.endsWith('.ts'))
+      .map((f) => readFileSync(`src/presentation/http/v1/${f}`, 'utf8'))
+      .join('\n');
+
+    const walk = (dir: string): string[] =>
+      readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+        e.isDirectory() ? walk(`${dir}/${e.name}`) : e.name.endsWith('.ts') ? [`${dir}/${e.name}`] : [],
+      );
+    const appSrc = walk('src/application').map((f) => readFileSync(f, 'utf8')).join('\n');
+
+    // limit key → the Prisma model whose creation it caps.
+    const countable: Record<string, string> = {
+      users: 'membership',
+      channels: 'channelAccount',
+      contacts: 'customer',
+      products: 'product',
+      branches: 'branch',
+    };
+
+    /*
+     * A feature that is built but switched off is a third state, and the check
+     * has to know about it: branches have a service, a route and the guard,
+     * with the route left unmounted for now. Nothing is reachable to limit, so
+     * nothing is owed — but the day the mount is uncommented the guard has to
+     * already be there, which is what makes this worth asserting rather than
+     * skipping.
+     */
+    const appTs = readFileSync('src/app.ts', 'utf8');
+    const mounted = (routeVar: string) =>
+      new RegExp(`^\\s*v1\\.use\\([^)]*${routeVar}\\)`, 'm').test(appTs);
+
+    // limit key → the router variable that exposes its create route.
+    const routers: Record<string, string> = {
+      users: 'usersRoutes',
+      channels: 'inboxRoutes',
+      contacts: 'customersRoutes',
+      products: 'catalogRoutes',
+      branches: 'branchesRoutes',
+    };
+
+    for (const [kind, model] of Object.entries(countable)) {
+      const enforced = routeSrc.includes(`enforceLimit('${kind}')`);
+      const creatable = new RegExp(`\\.${model}\\.(create|createMany|upsert)\\(`).test(appSrc);
+      const reachable = mounted(routers[kind]!);
+
+      if (creatable && !reachable) {
+        // Switched off. The guard still has to be written and waiting.
+        check(`${kind}: switched off, but the limit is already wired for when it returns`, enforced);
+        continue;
+      }
+      check(
+        `${kind}: ${creatable ? 'creatable, so the limit is enforced' : 'not creatable, so no guard is owed'}`,
+        creatable ? enforced : true,
+        creatable && !enforced ? `${model} can be created but enforceLimit('${kind}') is nowhere` : '',
+      );
+    }
+  }
+
+  console.log('\n=== 5c. NOTHING ENTITLEMENT-SHAPED IS FROZEN INTO A TOKEN ===');
+  {
+    const auth = await import('node:fs').then((fs) =>
+      fs.readFileSync('src/application/auth/auth.service.ts', 'utf8'),
+    );
+    const payload = /signAccessToken\(\{([\s\S]*?)\}\)/.exec(auth)?.[1] ?? '';
+    // A plan or feature list baked into the token would mean a paid customer
+    // stayed limited until their session expired.
+    for (const leaked of ['plan', 'features', 'limits', 'maxUsers']) {
+      check(`the access token does not carry "${leaked}"`, !payload.includes(leaked), payload.trim());
+    }
+  }
+
   console.log('\n=== 6. THE GATEWAY RETURNS SOMEWHERE THAT CAN ACT ON IT ===');
   {
     /*

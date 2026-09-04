@@ -22,6 +22,7 @@ import { promotionSchema } from '../../src/application/marketing/promotions.serv
 import { createRequisitionSchema } from '../../src/application/inventory/requisitions.service';
 import { dealSchema } from '../../src/application/crm/crm.service';
 import { purchaseOrderSchema } from '../../src/application/purchasing/purchase-orders.service';
+import { branchSchema, updateBranchSchema } from '../../src/application/branches/branches.service';
 import { createInvoiceSchema, invoicePaymentSchema } from '../../src/application/invoices/invoices.service';
 import { updateSupplierSchema } from '../../src/application/purchasing/suppliers.service';
 import { updateEmployeeSchema } from '../../src/application/employees/employees.service';
@@ -100,6 +101,7 @@ const schemas: Record<string, { keys: Set<string>; required: Set<string> }> = {
   promotions: shapeOf(promotionSchema),
   support: shapeOf(createTicketSchema),
   crm: shapeOf(dealSchema),
+  branches: shapeOf(branchSchema),
   // A product form fills in the product and its first variant together.
   catalog: (() => {
     const p = shapeOf(createProductSchema);
@@ -112,6 +114,20 @@ const schemas: Record<string, { keys: Set<string>; required: Set<string> }> = {
   })(),
 };
 
+/**
+ * The keys one variant card sends, read from `_VariantRow.toJson()`.
+ *
+ * Parsed rather than listed here on purpose: a variant field added to the card
+ * and forgotten in the server's schema — or the reverse — is exactly the drift
+ * this suite exists to catch, and a hand-written list would hide it.
+ */
+function variantCardKeys(): string[] {
+  const sheet = readFileSync('../flutter/lib/features/tablet/module_form_sheet.dart', 'utf8');
+  const body = /Map<String, dynamic> toJson\(\) \{([\s\S]*?)\n  \}/.exec(sheet)?.[1];
+  if (!body) throw new Error('Could not find _VariantRow.toJson in module_form_sheet.dart');
+  return [...body.matchAll(/'([a-zA-Z0-9]+)':/g)].map((m) => m[1]!);
+}
+
 const routeFiles = [
   'src/presentation/http/v1/inventory.routes.ts',
   'src/presentation/http/v1/suppliers.routes.ts',
@@ -122,6 +138,7 @@ const routeFiles = [
   'src/presentation/http/v1/support.routes.ts',
   'src/presentation/http/v1/crm.routes.ts',
   'src/presentation/http/v1/purchase-orders.routes.ts',
+  'src/presentation/http/v1/branches.routes.ts',
   'src/presentation/http/v1/orders.routes.ts',
   'src/presentation/http/v1/invoices.routes.ts',
   'src/presentation/http/v1/catalog.routes.ts',
@@ -147,11 +164,12 @@ const updateSchemas: Record<string, ReturnType<typeof shapeOf>> = {
   employees: shapeOf(updateEmployeeSchema),
   catalog: shapeOf(updateProductSchema),
   support: shapeOf(updateTicketSchema),
+  branches: shapeOf(updateBranchSchema),
 };
 const declarative = forms.filter((f) => !bespoke.has(f.slug));
 
 console.log('\n=== 1. EVERY FORM WAS FOUND ===');
-check('every module with a form was parsed', forms.length === 10, String(forms.length));
+check('every module with a form was parsed', forms.length === 11, String(forms.length));
 check('the declarative ones have fields', declarative.every((f) => f.fields.length > 0));
 check('the bespoke ones deliberately have none',
   forms.filter((f) => bespoke.has(f.slug)).every((f) => f.fields.length === 0));
@@ -159,12 +177,50 @@ for (const f of declarative) {
   check(`${f.slug} parsed`, Boolean(schemas[f.slug]), 'no schema mapped');
 }
 
+/**
+ * Fields a form collects but does not put in the record's own body.
+ *
+ * A product's photos are the case: they are uploaded to /files and attached
+ * through the product's gallery endpoint, because an image has to point at a
+ * product that already exists. The exemption is checked below rather than
+ * simply trusted — the form has to actually strip the key, and the endpoint
+ * it uses instead has to exist.
+ */
+const sentElsewhere: Record<string, string[]> = { catalog: ['images'] };
+const exempt = (slug: string, key: string) => (sentElsewhere[slug] ?? []).includes(key);
+
 console.log('\n=== 2. NO FORM ASKS FOR A FIELD THE SERVER REFUSES ===');
 for (const form of declarative) {
   const schema = schemas[form.slug];
   if (!schema) continue;
-  const unknown = form.fields.map((f) => f.key).filter((k) => !schema.keys.has(k));
+  const unknown = form.fields
+    .map((f) => f.key)
+    .filter((k) => !schema.keys.has(k) && !exempt(form.slug, k));
   check(`${form.slug} sends only accepted fields`, unknown.length === 0, unknown.join(', '));
+}
+
+console.log('\n=== 2b. WHAT IS SENT ELSEWHERE REALLY IS SENT ELSEWHERE ===');
+{
+  const dart = readFileSync(FORMS, 'utf8');
+  for (const [slug, keys] of Object.entries(sentElsewhere)) {
+    for (const key of keys) {
+      // Stripped from the record's own body, or the create would be rejected
+      // for a field the schema has never heard of.
+      check(
+        `${slug} strips ${key} from the body it posts`,
+        new RegExp(`body\\.remove\\('${key}'\\)`).test(dart),
+        'buildBody does not remove it',
+      );
+      // And there is somewhere else for it to go.
+      const form = forms.find((f) => f.slug === slug);
+      const gallery = `${form?.endpoint}/:id/${key}`;
+      check(
+        `${slug} has a ${key} endpoint to attach to`,
+        routeFiles.includes(`'/products/:id/${key}'`),
+        `${gallery} not found in the routes`,
+      );
+    }
+  }
 }
 
 console.log('\n=== 3. NO REQUIRED FIELD IS MISSING FROM A FORM ===');
@@ -172,6 +228,13 @@ for (const form of declarative) {
   const schema = schemas[form.slug];
   if (!schema) continue;
   const asked = new Set(form.fields.map((f) => f.key));
+  // A product's variant fields are filled in on the repeatable variant card
+  // rather than as top-level specs, so they are read from what that card
+  // actually sends. Without this the check would report sku and price as
+  // missing while the phone asks for both.
+  if (form.slug === 'catalog') {
+    for (const key of variantCardKeys()) asked.add(key);
+  }
   const missing = [...schema.required].filter((k) => !asked.has(k));
   // A form missing one of these cannot be submitted at all.
   check(`${form.slug} asks for everything the server insists on`, missing.length === 0, missing.join(', '));
@@ -235,7 +298,10 @@ for (const form of declarative) {
   // A product's variant fields are create-only and dropped before the PATCH.
   const createOnly = new Set(['sku', 'barcode', 'price', 'costPrice', 'initialStock']);
   const ignored = offered.filter(
-    (k) => !update.keys.has(k) && !(form.slug === 'catalog' && createOnly.has(k)),
+    (k) =>
+      !update.keys.has(k) &&
+      !(form.slug === 'catalog' && createOnly.has(k)) &&
+      !exempt(form.slug, k),
   );
   check(
     `${form.slug} edit fields are all things a PATCH keeps`,

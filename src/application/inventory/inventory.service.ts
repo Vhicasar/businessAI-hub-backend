@@ -62,10 +62,20 @@ export type ListMovementsDto = z.infer<typeof listMovementsSchema>;
 export type AdjustStockDto = z.infer<typeof adjustStockSchema>;
 export type ListStockDto = z.infer<typeof listStockSchema>;
 
+import {
+  assertCanManage,
+  assertCanRead,
+  warehouseFieldFilter,
+  warehouseIdFilter,
+  warehouseScope,
+} from './warehouse-access';
+
 export const inventoryService = {
   async listWarehouses() {
     return prisma.warehouse.findMany({
-      where: { deletedAt: null },
+      // Archived warehouses stay in the list (the page dims them and offers
+      // Restore); what narrows it is the member's own warehouse assignments.
+      where: { deletedAt: null, ...(await warehouseIdFilter()) },
       select: {
         id: true, name: true, code: true, managerId: true,
         addressLine1: true, addressLine2: true, city: true, state: true,
@@ -113,6 +123,7 @@ export const inventoryService = {
   },
 
   async updateWarehouse(id: string, dto: UpdateWarehouseDto) {
+    await assertCanManage(id);
     const wh = await prisma.warehouse.findFirst({ where: { id, deletedAt: null } });
     if (!wh) throw new NotFoundError('Warehouse');
     if (dto.code && dto.code !== wh.code) {
@@ -142,6 +153,7 @@ export const inventoryService = {
 
   /** Archive/unarchive a warehouse (kept for history; can't archive the default). */
   async setWarehouseActive(id: string, isActive: boolean) {
+    await assertCanManage(id);
     const wh = await prisma.warehouse.findFirst({ where: { id, deletedAt: null } });
     if (!wh) throw new NotFoundError('Warehouse');
     if (!isActive && wh.isDefault) throw new ValidationError('Set another warehouse as default before archiving this one');
@@ -149,6 +161,7 @@ export const inventoryService = {
   },
 
   async deleteWarehouse(id: string) {
+    await assertCanManage(id);
     const wh = await prisma.warehouse.findFirst({ where: { id, deletedAt: null } });
     if (!wh) throw new NotFoundError('Warehouse');
     if (wh.isDefault) throw new ValidationError('Cannot delete the default warehouse');
@@ -162,9 +175,12 @@ export const inventoryService = {
   },
 
   async listStock(dto: ListStockDto) {
+    // An explicit warehouseId still has to clear the member's own scope, so a
+    // confined member cannot read another warehouse by guessing its id.
+    if (dto.warehouseId) await assertCanRead(dto.warehouseId);
     const rows = await prisma.stockLevel.findMany({
       where: {
-        ...(dto.warehouseId ? { warehouseId: dto.warehouseId } : {}),
+        ...(dto.warehouseId ? { warehouseId: dto.warehouseId } : await warehouseFieldFilter()),
         variant: {
           deletedAt: null,
           ...(dto.search
@@ -229,6 +245,7 @@ export const inventoryService = {
       ? await prisma.warehouse.findFirst({ where: { id: dto.warehouseId, deletedAt: null } })
       : await this.ensureDefaultWarehouse();
     if (!warehouse) throw new NotFoundError('Warehouse');
+    await assertCanManage(warehouse.id);
     const warehouseId = warehouse.id;
 
     return prisma.$transaction(async (tx) => {
@@ -281,7 +298,18 @@ export const inventoryService = {
 
   // ── Transfers ────────────────────────────────────────────────────────────
   async listTransfers(limit = 50) {
+    const { readable } = await warehouseScope();
     return prisma.stockTransfer.findMany({
+      // A transfer is visible if either end is a warehouse the member holds —
+      // stock arriving from elsewhere is still their business.
+      where: readable
+        ? {
+            OR: [
+              { fromWarehouseId: { in: readable } },
+              { toWarehouseId: { in: readable } },
+            ],
+          }
+        : {},
       orderBy: { createdAt: 'desc' },
       take: limit,
       select: {
@@ -309,6 +337,11 @@ export const inventoryService = {
     ]);
     if (!from) throw new NotFoundError('Source warehouse');
     if (!to) throw new NotFoundError('Destination warehouse');
+    // Stock leaves one warehouse and lands in another, so a transfer needs
+    // manage rights at BOTH ends — otherwise a confined member could move
+    // stock into somewhere they were never given.
+    await assertCanManage(from.id);
+    await assertCanManage(to.id);
     const organizationId = from.organizationId;
 
     return prisma.$transaction(async (tx) => {
@@ -367,6 +400,7 @@ export const inventoryService = {
    * remaining stock would be a number nobody could rely on.
    */
   async listBatches(dto: { warehouseId?: string; expiringWithinDays?: number; limit?: number }) {
+    if (dto.warehouseId) await assertCanRead(dto.warehouseId);
     const cutoff = dto.expiringWithinDays
       ? new Date(Date.now() + dto.expiringWithinDays * 86_400_000)
       : null;
@@ -374,7 +408,7 @@ export const inventoryService = {
     const rows = await prisma.stockMovement.findMany({
       where: {
         batchNumber: { not: null },
-        ...(dto.warehouseId ? { warehouseId: dto.warehouseId } : {}),
+        ...(dto.warehouseId ? { warehouseId: dto.warehouseId } : await warehouseFieldFilter()),
         ...(cutoff ? { expiryDate: { not: null, lte: cutoff } } : {}),
       },
       orderBy: [{ expiryDate: 'asc' }, { createdAt: 'desc' }],
@@ -412,9 +446,10 @@ export const inventoryService = {
 
   // ── Movements (per-warehouse audit / report) ─────────────────────────────
   async listMovements(dto: ListMovementsDto) {
+    if (dto.warehouseId) await assertCanRead(dto.warehouseId);
     return prisma.stockMovement.findMany({
       where: {
-        ...(dto.warehouseId ? { warehouseId: dto.warehouseId } : {}),
+        ...(dto.warehouseId ? { warehouseId: dto.warehouseId } : await warehouseFieldFilter()),
         ...(dto.variantId ? { variantId: dto.variantId } : {}),
       },
       orderBy: { createdAt: 'desc' },

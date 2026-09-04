@@ -153,6 +153,7 @@ function names(row: MappedRow): { first?: string; last?: string } {
 type RowImporter = (row: MappedRow) => Promise<'created' | 'skipped'>;
 
 interface Ctx {
+  organizationId: string;
   currency: string;
   defaultCountry: string | null;
   departments: { id: string; code: string; name: string }[];
@@ -669,6 +670,110 @@ function importerFor(entity: Entity, ctx: Ctx): RowImporter {
         return 'created';
       };
 
+    case 'warehouses':
+      return async (row) => {
+        const name = val(row, 'name');
+        const code = val(row, 'code');
+        if (!name) throw new Error('Missing warehouse name');
+        if (!code) throw new Error('Missing warehouse code');
+
+        // Code is the business's own identifier and is unique per org, so a
+        // re-import updates the warehouse rather than creating a twin.
+        const existing = await prisma.warehouse.findFirst({
+          where: { code, deletedAt: null },
+          select: { id: true },
+        });
+        const data = {
+          name,
+          code,
+          addressLine1: val(row, 'addressLine1') || null,
+          addressLine2: val(row, 'addressLine2') || null,
+          city: val(row, 'city') || null,
+          state: val(row, 'state') || null,
+          postalCode: val(row, 'postalCode') || null,
+          country: (val(row, 'country') || '').slice(0, 2).toUpperCase() || null,
+          phone: val(row, 'phone') || null,
+        };
+        const isDefault = bool(val(row, 'isDefault'));
+
+        if (isDefault) {
+          await prisma.warehouse.updateMany({ where: {}, data: { isDefault: false } });
+        }
+        if (existing) {
+          await prisma.warehouse.update({
+            where: { id: existing.id },
+            data: { ...data, ...(isDefault ? { isDefault: true } : {}) },
+          });
+          // The importer reports created/skipped only; a re-import that
+          // refreshes an existing warehouse counts as written, like everywhere
+          // else in this file.
+          return 'created';
+        }
+        const created = await prisma.warehouse.create({
+          data: { organizationId: ctx.organizationId, ...data, isDefault: isDefault ?? false },
+        });
+        // Later rows in the same file may point at this warehouse by name.
+        ctx.warehouses.push({ id: created.id, name: created.name, code: created.code, isDefault: created.isDefault });
+        return 'created';
+      };
+
+    case 'stock-levels':
+      return async (row) => {
+        const sku = val(row, 'sku');
+        const quantity = num(val(row, 'quantity'));
+        if (!sku) throw new Error('Missing product SKU');
+        if (quantity === null) throw new Error('Missing quantity');
+        const variant = ctx.variantsBySku.get(sku.toLowerCase());
+        if (!variant) throw new Error(`No product with SKU "${sku}"`);
+
+        const warehouseName = val(row, 'warehouse');
+        const warehouse = warehouseName
+          ? ctx.warehouses.find(
+              (w) => w.name.toLowerCase() === warehouseName.toLowerCase() ||
+                     w.code.toLowerCase() === warehouseName.toLowerCase()
+            )
+          : ctx.warehouses.find((w) => w.isDefault) ?? ctx.warehouses[0];
+        if (!warehouse) throw new Error(warehouseName ? `No warehouse called "${warehouseName}"` : 'No warehouse');
+
+        const level = await prisma.stockLevel.upsert({
+          where: { warehouseId_variantId: { warehouseId: warehouse.id, variantId: variant.id } },
+          update: {},
+          create: {
+            organizationId: ctx.organizationId,
+            warehouseId: warehouse.id,
+            variantId: variant.id,
+            quantity: 0,
+          },
+        });
+
+        /*
+         * The CSV states what IS on the shelf, so the movement recorded is the
+         * difference — importing a count of 100 twice must not leave 200. The
+         * ledger keeps the adjustment so the number can still be explained.
+         */
+        const delta = quantity - Number(level.quantity);
+        if (delta === 0) return 'skipped';
+
+        const expiryRaw = val(row, 'expiryDate');
+        const expiryDate = expiryRaw ? new Date(expiryRaw) : null;
+        await prisma.$transaction([
+          prisma.stockLevel.update({ where: { id: level.id }, data: { quantity } }),
+          prisma.stockMovement.create({
+            data: {
+              organizationId: ctx.organizationId,
+              warehouseId: warehouse.id,
+              variantId: variant.id,
+              type: 'ADJUSTMENT',
+              quantity: delta,
+              reason: 'Opening stock import',
+              batchNumber: val(row, 'batchNumber') || null,
+              expiryDate: expiryDate && !Number.isNaN(expiryDate.getTime()) ? expiryDate : null,
+            },
+          }),
+        ]);
+        return 'created';
+      };
+
     case 'reorder-levels':
       return async (row) => {
         const sku = val(row, 'sku');
@@ -761,7 +866,7 @@ export async function importEntity(entity: Entity, csv: string, mapping?: Mappin
 
   // Load the lookups each entity needs once, not per row.
   const [org, allDepartments, members, staff, categories, brands] = await Promise.all([
-    prisma.organization.findFirstOrThrow({ select: { currency: true, country: true } }),
+    prisma.organization.findFirstOrThrow({ select: { id: true, currency: true, country: true } }),
     // Soft-deleted rows are fetched too: they still hold their code against the
     // (organizationId, code) unique constraint, so generated codes must avoid them.
     entity === 'employees'
@@ -788,8 +893,11 @@ export async function importEntity(entity: Entity, csv: string, mapping?: Mappin
 
   // Purchasing files reference suppliers by name and products by SKU, so both
   // lookups are loaded up front rather than queried per row.
+  // Anything that resolves a SKU or a warehouse name needs these lookups —
+  // including the two onboarding entities, which is why they are listed here.
   const purchasingEntity = entity === 'suppliers' || entity === 'supplier-products'
-    || entity === 'purchase-orders' || entity === 'reorder-levels';
+    || entity === 'purchase-orders' || entity === 'reorder-levels'
+    || entity === 'warehouses' || entity === 'stock-levels';
   const [supplierRows, variantRows, warehouseRows] = await Promise.all([
     purchasingEntity
       ? prisma.supplier.findMany({
@@ -821,6 +929,7 @@ export async function importEntity(entity: Entity, csv: string, mapping?: Mappin
 
   const importRow = importerFor(entity, {
     currency: org.currency,
+    organizationId: org.id,
     defaultCountry: org.country ?? null,
     suppliers: suppliersByKey,
     variantsBySku: new Map(
@@ -1109,6 +1218,53 @@ export async function exportEntity(entity: Entity): Promise<{ filename: string; 
         'quantity', 'receivedQty', 'unitCost', 'taxRate', 'lineTotal', 'currency', 'orderTotal',
         'expectedAt', 'orderedAt', 'receivedAt', 'autoGenerated', 'notes'];
       return { filename: `purchase-orders-${stamp}.csv`, csv: toCsv(headers, flat as never) };
+    }
+
+    case 'warehouses': {
+      const rows = await prisma.warehouse.findMany({
+        where: { deletedAt: null },
+        orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
+      });
+      const flat = rows.map((w) => ({
+        name: w.name,
+        code: w.code,
+        addressLine1: w.addressLine1 ?? '',
+        addressLine2: w.addressLine2 ?? '',
+        city: w.city ?? '',
+        state: w.state ?? '',
+        postalCode: w.postalCode ?? '',
+        country: w.country ?? '',
+        phone: w.phone ?? '',
+        isDefault: w.isDefault ? 'yes' : 'no',
+        isActive: w.isActive ? 'yes' : 'no',
+      }));
+      const headers = [
+        'name', 'code', 'addressLine1', 'addressLine2', 'city', 'state',
+        'postalCode', 'country', 'phone', 'isDefault', 'isActive',
+      ];
+      return { filename: `warehouses-${stamp}.csv`, csv: toCsv(headers, flat as never) };
+    }
+
+    case 'stock-levels': {
+      const rows = await prisma.stockLevel.findMany({
+        include: {
+          warehouse: { select: { name: true } },
+          variant: { select: { sku: true, product: { select: { name: true, unit: true } } } },
+        },
+        orderBy: { id: 'asc' },
+      });
+      const flat = rows.map((l) => ({
+        sku: l.variant.sku,
+        product: l.variant.product.name,
+        warehouse: l.warehouse.name,
+        quantity: l.quantity.toString(),
+        // The unit travels with the count so a spreadsheet of "1200" is not
+        // ambiguous between kilos and cases.
+        unit: l.variant.product.unit ?? '',
+        reserved: l.reserved.toString(),
+      }));
+      const headers = ['sku', 'product', 'warehouse', 'quantity', 'unit', 'reserved'];
+      return { filename: `stock-levels-${stamp}.csv`, csv: toCsv(headers, flat as never) };
     }
 
     case 'reorder-levels': {

@@ -12,6 +12,7 @@
  * holds all three to the same list.
  */
 import { readdirSync, readFileSync } from 'node:fs';
+import { ALL_PERMISSION_KEYS } from '../../src/shared/permissions';
 
 let passed = 0, failed = 0;
 const check = (n: string, ok: boolean, d = '') => {
@@ -80,6 +81,11 @@ const unguarded = routes.filter(
  * oversight. Anything not on this list must carry a permission.
  */
 const ALLOWED: Record<string, string> = {
+  'modules.routes.ts GET /':
+    'which optional modules this business has — the same fact every member ' +
+    'already receives through /auth/me to draw their menu, so gating it here ' +
+    'would only make the menu and the endpoint disagree. Changing one needs ' +
+    'settings.manage_org.',
   'settings.routes.ts GET /organization': 'the workspace every member renders from',
   'settings.routes.ts GET /workspace-config': 'the feature flags the UI itself gates on',
   'billing.routes.ts GET /plans': 'the public plan catalogue',
@@ -92,6 +98,13 @@ const ALLOWED: Record<string, string> = {
   'branding.routes.ts GET /': 'the product’s own branding, needed to render the sign-in page',
   'data-transfer.routes.ts GET /entities': 'the list of exportable types — names, not data',
   'developer.routes.ts GET /scopes': 'the static catalogue of API scopes',
+  'documents.routes.ts POST /scan':
+    'resolving a scanned QR code. Scanning is how a member finds out WHICH ' +
+    'document is in front of them — an operator holding a job card must be ' +
+    'able to read it — and the response says which actions their own role ' +
+    'permits. It changes nothing, and every action it offers is performed ' +
+    'through that action’s own guarded endpoint, which checks the same ' +
+    'permission again. Section 4 below asserts that.',
   // Authenticated by the provider's shared secret rather than by a role: an
   // HMAC over the raw body, refused outright when no secret is configured.
   'delivery.routes.ts POST /webhook/:providerId': 'verified by webhook signature',
@@ -251,6 +264,58 @@ console.log('\n=== 6. EVERY PHONE ACTION IS GATED WHERE IT IS OFFERED ===');
     /permission: 'employees.view_salary'/.test(forms));
   const sheet = read('tablet/module_form_sheet.dart');
   check('and the form honours that', sheet.includes('_auth.can(f.permission!)'));
+}
+
+/*
+ * A scanned code offers actions; none of them is a way around a permission.
+ *
+ * The scan endpoint itself is exempt above, on the promise that every action
+ * it advertises is performed through that action's own guarded endpoint and
+ * that the service behind it checks the permission again. This is that promise
+ * held to.
+ */
+console.log('\n=== 5. A SCANNED CODE IS NOT A BACK DOOR ===');
+{
+  const src = readFileSync('src/application/documents/document-qr.service.ts', 'utf8');
+
+  // Every action declares a permission and it is a real catalogue key.
+  const declared = [...src.matchAll(/permission: '([a-z_]+\.[a-z_]+)'/g)].map((m) => m[1]!);
+  check('the scan resolver offers actions at all', declared.length > 0);
+  const unknown = declared.filter((k) => !ALL_PERMISSION_KEYS.includes(k));
+  check('every offered action names a real permission', unknown.length === 0, unknown.join(', '));
+
+  // `allowed` is computed from the caller, not hard-coded true.
+  check('whether an action is allowed is asked of the caller',
+    src.includes('await callerHasPermission(a.permission)'));
+  check('and nothing marks an action allowed unconditionally',
+    !/allowed:\s*true/.test(src));
+
+  // The endpoints offered are the ordinary guarded ones, not bespoke bypasses.
+  // Only real values — a bare `endpoint: string` in the interface is a type,
+  // not a route.
+  const endpoints = [...src.matchAll(/endpoint: [`'"]\/([a-z-]+)/g)].map((m) => m[1]!);
+  check('actions route through the app’s normal endpoints',
+    endpoints.every((e) => ['manufacturing', 'purchase-orders', 'requisitions'].includes(e)),
+    [...new Set(endpoints)].join(', '));
+
+  // The shared status endpoint checks which transition is being asked for.
+  const orders = readFileSync('src/application/manufacturing/production-orders.service.ts', 'utf8');
+  check('a production order transition checks its own permission',
+    orders.includes('STATUS_PERMISSION[to]') && orders.includes('callerHasPermission(needed)'));
+  for (const [status, key] of [
+    ['APPROVED', 'production.approve'],
+    ['IN_PROGRESS', 'production.start'],
+    ['COMPLETED', 'production.complete'],
+    ['CANCELLED', 'production.cancel'],
+  ] as const) {
+    check(`${status} requires ${key}`,
+      new RegExp(`${status}: '${key.replace('.', '\\.')}'`).test(orders));
+  }
+
+  // Marking a line down is not the same right as reconfiguring it.
+  const lines = readFileSync('src/application/manufacturing/production-lines.service.ts', 'utf8');
+  check('changing a line’s status alone does not permit editing it',
+    lines.includes("callerHasPermission('manufacturing.manage_settings')"));
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

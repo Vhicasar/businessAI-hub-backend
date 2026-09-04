@@ -30,6 +30,27 @@ export const PERMISSION_MODULES = {
   quotations: ['read', 'create', 'update', 'delete', 'send'],
   contracts: ['read', 'create', 'update', 'delete'],
   catalog: ['read', 'create', 'update', 'delete', 'manage_pricing'],
+  /*
+   * Manufacturing. Split by job rather than by screen, because on a factory
+   * floor these are genuinely different people: the person who decides what to
+   * make is not the person who hands out the sugar, and neither of them should
+   * be able to pass their own quality inspection.
+   */
+  manufacturing: ['read', 'manage_settings'],
+  bom: ['read', 'create', 'update', 'delete', 'activate'],
+  production: [
+    'read', 'plan', 'create', 'approve', 'start', 'complete', 'cancel',
+    // Issuing material and recording what came off the line are separate
+    // rights from deciding a run should happen at all.
+    'issue_material', 'record_output',
+  ],
+  qc: ['read', 'inspect', 'approve', 'reject', 'quarantine', 'release'],
+  equipment: ['read', 'create', 'update', 'delete'],
+  // Physical locations the business trades from. Kept apart from
+  // `settings.manage_org` because opening or closing a branch is an
+  // operational decision a regional manager makes, while the org's own
+  // identity and security settings are not theirs to touch.
+  branches: ['read', 'create', 'update', 'delete'],
   // Requisitions are split from `transfer` because asking, agreeing and
   // physically sending are done by different people: a branch raises the
   // request, the source warehouse decides, and only then does stock move.
@@ -81,7 +102,10 @@ export const PERMISSION_MODULES = {
   leases: ['read', 'create', 'update', 'terminate'],
   bookings: ['read', 'create', 'update', 'cancel'],
   appointments: ['read', 'create', 'cancel', 'configure'],
-  maintenance: ['read', 'create', 'update', 'assign'],
+  /// Shared with property maintenance — the same job, different asset.
+  /// `complete` is manufacturing's addition: closing a work order records
+  /// downtime and the parts fitted, which is more than an update.
+  maintenance: ['read', 'create', 'update', 'assign', 'complete'],
   commissions: ['read', 'approve', 'pay'],
   // People. The HR areas below are deliberately separate modules rather than
   // `employees` actions: reading the staff directory must not imply reading
@@ -180,10 +204,72 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, { description: string; permis
     permissions: [
       'dashboard.view',
       ...keysFor('inventory', 'purchasing', 'suppliers'),
+      // Stock is held at a branch, so a warehouse hand has to be able to name
+      // one. Opening and closing them is a manager's decision.
+      'branches.read',
+      // Handing materials to a production line is a warehouse job. Deciding
+      // what gets made is not.
+      'manufacturing.read', 'production.read', 'production.issue_material',
+      'bom.read',
       'catalog.read', 'orders.read', 'orders.fulfill',
       // Dispatches parcels and moves them along, but connecting a courier
       // account is an integration change that belongs to an administrator.
       'delivery.read', 'delivery.dispatch', 'delivery.update_status',
+      'files.read', 'files.upload',
+    ],
+  },
+  'Production Manager': {
+    description: 'Plans and runs production; sees what it costs and where it went wrong',
+    permissions: [
+      'dashboard.view',
+      ...keysFor('manufacturing', 'bom', 'production'),
+      // Needs to see stock and materials to plan against them, and to raise a
+      // requisition when short — but not to change what is on the shelf.
+      'inventory.read', 'inventory.requisition_create',
+      'catalog.read', 'suppliers.read', 'purchasing.read',
+      'qc.read', 'equipment.read', 'maintenance.read',
+      'employees.read', 'analytics.view', 'files.read', 'files.upload',
+    ],
+  },
+  'QC Officer': {
+    description: 'Inspects batches, and decides what may be released',
+    permissions: [
+      'dashboard.view',
+      ...keysFor('qc'),
+      'manufacturing.read', 'production.read', 'bom.read',
+      'inventory.read', 'catalog.read',
+      'files.read', 'files.upload',
+    ],
+  },
+  'Maintenance Manager': {
+    description: 'Equipment, maintenance work orders and spare parts',
+    permissions: [
+      'dashboard.view',
+      ...keysFor('equipment', 'maintenance'),
+      'manufacturing.read', 'production.read',
+      // Fitting a part takes it out of stock, which is an inventory movement.
+      'inventory.read', 'inventory.adjust', 'catalog.read',
+      'employees.read', 'files.read', 'files.upload',
+    ],
+  },
+  'Procurement Officer': {
+    description: 'Buying: suppliers, requisitions and purchase orders',
+    permissions: [
+      'dashboard.view',
+      ...keysFor('suppliers', 'purchasing'),
+      'inventory.read', 'inventory.requisition_create',
+      'catalog.read', 'manufacturing.read', 'production.read', 'bom.read',
+      'analytics.view', 'files.read', 'files.upload',
+    ],
+  },
+  'Manufacturing Admin': {
+    description: 'Everything in manufacturing, including its settings',
+    permissions: [
+      'dashboard.view',
+      ...keysFor('manufacturing', 'bom', 'production', 'qc', 'equipment', 'maintenance'),
+      ...keysFor('inventory', 'purchasing', 'suppliers'),
+      'catalog.read', 'catalog.create', 'catalog.update',
+      'employees.read', 'analytics.view', 'audit.read',
       'files.read', 'files.upload',
     ],
   },
