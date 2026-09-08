@@ -28,6 +28,8 @@ import { startWebhookRetrySweep } from './application/api-keys/webhook-delivery.
 import { startPromotionNotifier } from './application/marketing/promotion-engine.service';
 import { startReorderWatcher } from './application/purchasing/reorder.service';
 import { startExpiryWatcher } from './application/inventory/expiry-alerts.service';
+import { startUnansweredWatcher } from './application/inbox/unanswered-sweep';
+import { startCampaignScheduler } from './application/messaging/campaign-scheduler';
 import { reconcileSystemRolePermissions } from './application/roles/reconcile-permissions';
 import { closeQueues, queueEnabled } from './infrastructure/queue/queue';
 import { createApp } from './app';
@@ -72,6 +74,8 @@ async function bootstrap(): Promise<void> {
   startPromotionNotifier(); // push scheduled promotion notifications
   startReorderWatcher(); // raise purchase orders when stock hits its reorder point
   startExpiryWatcher(); // warn warehouse staff before batches expire
+  startUnansweredWatcher(); // nudge when a customer has been left waiting
+  startCampaignScheduler(); // send campaigns their business scheduled for later
   logger.info(
     queueEnabled()
       ? '📮 Queue mode: async — workflow & campaign jobs handed to the worker (run `npm run worker`)'

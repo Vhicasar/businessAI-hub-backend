@@ -28,6 +28,39 @@ const envSchema = z
       .string()
       .regex(/^[0-9a-fA-F]{64}$/, 'ENCRYPTION_KEY must be 32 bytes hex (64 hex chars)'),
 
+    /*
+     * Meta app credentials for connecting WhatsApp, Messenger and Instagram
+     * without every business creating its own Developer App.
+     *
+     * ONE Vhicasar-owned app serves every tenant; each business authorises it
+     * and gets its own scoped token back. Optional so a deployment with no
+     * Meta app configured still boots — the channels simply cannot be
+     * connected by OAuth, and say so.
+     */
+    META_APP_ID: z.string().optional().or(z.literal('')),
+    META_APP_SECRET: z.string().optional().or(z.literal('')),
+    /** Embedded Signup configuration id from the Meta app dashboard. */
+    META_WHATSAPP_CONFIG_ID: z.string().optional().or(z.literal('')),
+    /** Overridable so a staging app can pin an older Graph version. */
+    META_GRAPH_VERSION: z.string().default('v21.0'),
+    /**
+     * Where the Graph API lives. Overridable so the integration can be pointed
+     * at a stub during tests and at Meta's sandbox during development —
+     * production leaves it alone.
+     */
+    META_GRAPH_BASE_URL: z.string().url().default('https://graph.facebook.com'),
+
+    /*
+     * SMS. Vhicasar holds one provider account centrally and resells credits,
+     * so these are the platform's own secrets — a business never sees or
+     * supplies them.
+     */
+    SMS_PROVIDER: z.enum(['termii', 'mock']).default('mock'),
+    SMS_API_KEY: z.string().default(''),
+    SMS_API_BASE_URL: z.string().url().default('https://api.ng.termii.com'),
+    /** Shared secret the provider signs delivery webhooks with, where supported. */
+    SMS_WEBHOOK_SECRET: z.string().default(''),
+
     CORS_ORIGINS: z.string().default('http://localhost:5173'),
 
     SMTP_HOST: z.string().optional().or(z.literal('')),
@@ -256,6 +289,29 @@ export const env = {
     // Needs the shared service key to authenticate to the admin's service API.
     enabled: raw.ADMIN_AI_SYNC && Boolean(raw.SERVICE_API_KEY),
     intervalMin: raw.ADMIN_SYNC_INTERVAL_MIN,
+  },
+  /**
+   * The Meta app every tenant connects through. Secrets stay server-side:
+   * only the app id and config id ever reach a browser, and only to open
+   * Meta's own dialog.
+   */
+  meta: {
+    appId: raw.META_APP_ID || '',
+    appSecret: raw.META_APP_SECRET || '',
+    whatsappConfigId: raw.META_WHATSAPP_CONFIG_ID || '',
+    graphVersion: raw.META_GRAPH_VERSION,
+    /** Base + version, which is what every Graph call actually needs. */
+    graphUrl: `${raw.META_GRAPH_BASE_URL.replace(/\/$/, '')}/${raw.META_GRAPH_VERSION}`,
+    /** OAuth is only offered when both halves are present. */
+    enabled: Boolean(raw.META_APP_ID && raw.META_APP_SECRET),
+  },
+  sms: {
+    provider: raw.SMS_PROVIDER,
+    apiKey: raw.SMS_API_KEY || '',
+    baseUrl: raw.SMS_API_BASE_URL,
+    webhookSecret: raw.SMS_WEBHOOK_SECRET || '',
+    /** A real provider needs a key; the mock never does. */
+    configured: raw.SMS_PROVIDER === 'mock' || Boolean(raw.SMS_API_KEY),
   },
   service: {
     apiKey: raw.SERVICE_API_KEY || '',

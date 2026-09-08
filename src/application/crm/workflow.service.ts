@@ -31,10 +31,28 @@ export const TRIGGERS = [
   'invoice.paid',
   'payroll.paid',
   'appointment.booked',
+  /*
+   * Messaging. A conversation arriving on WhatsApp, Instagram or Messenger is
+   * a business event like any other — until now the automation engine simply
+   * could not see them, so "when someone messages us on Instagram, make a
+   * lead" was not expressible.
+   *
+   * `conversation.started` fires once, on the first message of a thread;
+   * `message.received` fires on every inbound one. Both carry the channel and
+   * the message text, so a rule can match on either.
+   */
+  'conversation.started',
+  'message.received',
+  /** Nobody has replied for a while — see the unanswered sweep. */
+  'conversation.unanswered',
 ] as const;
 export type Trigger = (typeof TRIGGERS)[number];
 
-type EntityType = 'CUSTOMER' | 'LEAD' | 'DEAL' | 'ORDER' | 'INVOICE' | 'EMPLOYEE';
+type EntityType =
+  | 'CUSTOMER' | 'LEAD' | 'DEAL' | 'ORDER' | 'INVOICE' | 'EMPLOYEE'
+  // A conversation is what a messaging rule acts on, and it carries its own
+  // customer so notify/assign actions still know who they are about.
+  | 'CONVERSATION';
 
 const conditionSchema = z.object({
   // Validated against the Lead field catalog on save; the enum here only keeps

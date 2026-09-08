@@ -1,16 +1,23 @@
 import type { ChannelType } from '@prisma/client';
+import { env } from '../../shared/config/env';
 import type {
   ChannelAccountRef,
   ChannelAdapter,
+  DownloadedMedia,
+  InboundMedia,
   NormalizedInbound,
+  NormalizedStatus,
   OutboundPayload,
   SendResult,
   WebhookRequestLike,
 } from '../../application/inbox/channel-adapter';
+import { mediaKindFor } from '../../application/inbox/channel-adapter';
 import { AppError } from '../../shared/errors';
-import { verifyMetaSignature } from './whatsapp.adapter';
+import { extensionFor, verifyMetaSignature } from './whatsapp.adapter';
 
-const GRAPH = 'https://graph.facebook.com/v21.0';
+// Was pinned to v21.0 and ignored META_GRAPH_VERSION; read at call time so
+// a stub or a version bump reaches every adapter alike.
+const graph = () => env.meta.graphUrl;
 
 interface MetaMessagingEvent {
   sender?: { id?: string };
@@ -25,7 +32,14 @@ interface MetaMessagingEvent {
 
 interface MetaWebhookBody {
   object?: string;
-  entry?: { messaging?: MetaMessagingEvent[] }[];
+  entry?: {
+    messaging?: (MetaMessagingEvent & {
+      /// Receipts. Messenger reports these per-conversation with a watermark
+      /// timestamp rather than per-message ids, except for `message_edit`.
+      delivery?: { mids?: string[]; watermark?: number };
+      read?: { watermark?: number };
+    })[];
+  }[];
 }
 
 /**
@@ -69,6 +83,9 @@ export class MetaMessagingAdapter implements ChannelAdapter {
             contentType:
               kind === 'image' ? 'IMAGE' : kind === 'video' ? 'VIDEO' : kind === 'audio' ? 'AUDIO' : 'DOCUMENT',
             mediaUrl: msg.attachments[0]?.payload?.url,
+            media: msg.attachments[0]?.payload?.url
+              ? { url: msg.attachments[0]!.payload!.url }
+              : undefined,
           });
         }
       }
@@ -76,12 +93,114 @@ export class MetaMessagingAdapter implements ChannelAdapter {
     return out;
   }
 
+  /**
+   * Delivery and read receipts.
+   *
+   * Messenger and Instagram report delivery with an explicit list of message
+   * ids where they can, and otherwise only a watermark — "everything up to
+   * this time is delivered". Only the explicit ids are used: a watermark would
+   * mean scanning the conversation for older messages, and claiming a message
+   * was read on the strength of a timestamp is a claim worth being careful
+   * about.
+   */
+  parseStatuses(body: unknown): NormalizedStatus[] {
+    const meta = body as MetaWebhookBody;
+    if (meta.object !== this.webhookObject) return [];
+
+    const out: NormalizedStatus[] = [];
+    for (const entry of meta.entry ?? []) {
+      for (const event of entry.messaging ?? []) {
+        for (const mid of event.delivery?.mids ?? []) {
+          out.push({
+            providerMessageId: mid,
+            status: 'DELIVERED',
+            occurredAt: event.delivery?.watermark
+              ? new Date(event.delivery.watermark)
+              : undefined,
+          });
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Fetch an attachment from the CDN link Meta gave us.
+   *
+   * The link needs no token but expires, so the bytes are copied out now
+   * rather than the URL being stored and found dead a week later.
+   */
+  async downloadMedia(media: InboundMedia): Promise<DownloadedMedia | null> {
+    if (!media.url) return null;
+    const res = await fetch(media.url);
+    if (!res.ok) return null;
+    const mimeType =
+      res.headers.get('content-type')?.split(';')[0]?.trim() ??
+      media.mimeType ??
+      'application/octet-stream';
+    return {
+      buffer: Buffer.from(await res.arrayBuffer()),
+      mimeType,
+      filename: media.filename ?? `${this.channelType.toLowerCase()}-attachment${extensionFor(mimeType)}`,
+    };
+  }
+
   async sendMessage(payload: OutboundPayload, account: ChannelAccountRef): Promise<SendResult> {
     const token = account.credentials.pageAccessToken;
     if (!token) {
       throw new AppError('CHANNEL_MISCONFIGURED', 500, `${this.channelType} page token missing`);
     }
-    const res = await fetch(`${GRAPH}/me/messages?access_token=${encodeURIComponent(token)}`, {
+    /*
+     * Attachments go up first, each as its own message.
+     *
+     * Messenger's send API takes one attachment per message and no caption
+     * alongside it, so the text is sent as a separate message rather than
+     * silently dropped — which is what putting both in one payload would do.
+     */
+    const attachments = (payload.attachments ?? []).slice(0, 5);
+    for (const attachment of attachments) {
+      const kind = mediaKindFor(attachment.mimeType);
+      if (this.channelType === 'INSTAGRAM' && kind === 'document') {
+        // Instagram messaging has no document type; refusing here gives a
+        // clear error instead of a confusing one from Meta.
+        throw new AppError(
+          'CHANNEL_UNSUPPORTED_MEDIA',
+          400,
+          'Instagram cannot receive documents. Send an image or video instead.',
+        );
+      }
+      const form = new FormData();
+      form.append('recipient', JSON.stringify({ id: payload.recipientExternalId }));
+      form.append('messaging_type', 'RESPONSE');
+      form.append(
+        'message',
+        JSON.stringify({ attachment: { type: kind, payload: { is_reusable: false } } }),
+      );
+      form.append(
+        'filedata',
+        new Blob([new Uint8Array(attachment.buffer)], { type: attachment.mimeType }),
+        attachment.filename,
+      );
+      const upload = await fetch(
+        `${graph()}/me/messages?access_token=${encodeURIComponent(token)}`,
+        { method: 'POST', body: form },
+      );
+      const uploadJson = (await upload.json()) as { error?: { message?: string } };
+      if (!upload.ok) {
+        throw new AppError(
+          'CHANNEL_SEND_FAILED',
+          502,
+          `${this.channelType} attachment failed: ${uploadJson.error?.message ?? upload.status}`,
+        );
+      }
+    }
+
+    // Nothing further to say once the files are away.
+    if (attachments.length > 0 && !payload.text.trim()) {
+      return { providerMessageId: `attachment.${Date.now()}` };
+    }
+
+    const res = await fetch(`${graph()}/me/messages?access_token=${encodeURIComponent(token)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -103,7 +222,7 @@ export class MetaMessagingAdapter implements ChannelAdapter {
 
   async onAccountConnected(account: ChannelAccountRef, webhookUrl: string): Promise<string | null> {
     const res = await fetch(
-      `${GRAPH}/me?access_token=${encodeURIComponent(account.credentials.pageAccessToken ?? '')}`
+      `${graph()}/me?access_token=${encodeURIComponent(account.credentials.pageAccessToken ?? '')}`
     );
     if (!res.ok) {
       throw new AppError('CHANNEL_MISCONFIGURED', 400, 'Page access token invalid');

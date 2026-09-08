@@ -1,5 +1,6 @@
 import { Prisma, type ChannelType } from '@prisma/client';
 import { z } from 'zod';
+import { segmentsFor, totalSegments } from '../sms/sms-segments';
 import { prismaUnscoped } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { AppError, NotFoundError } from '../../shared/errors';
@@ -22,8 +23,19 @@ export interface SmsPricing {
   currency: string;
   unitCost: number;
   channels: Record<'SMS' | 'EMAIL' | 'WHATSAPP', { enabled: boolean; unitCost: number }>;
+  /** Per-route SMS prices; fall back to the SMS channel cost when unset. */
+  smsTransactionalCost?: number;
+  smsPromotionalCost?: number;
+  /** Most recipients one send may reach. Set by the platform administrator. */
+  maxCampaignSize?: number;
   lowBalanceThreshold: number;
   packages: SmsPackage[];
+}
+
+/** What one SMS segment costs on a given route. */
+export function smsUnitCostFor(config: SmsPricing, route: 'TRANSACTIONAL' | 'PROMOTIONAL'): number {
+  const perRoute = route === 'TRANSACTIONAL' ? config.smsTransactionalCost : config.smsPromotionalCost;
+  return perRoute ?? config.channels.SMS.unitCost;
 }
 
 const DEFAULT_PRICING: SmsPricing = {
@@ -51,6 +63,17 @@ const pricingSchema = z.object({
     EMAIL: z.object({ enabled: z.boolean().default(true), unitCost: z.coerce.number().nonnegative() }),
     WHATSAPP: z.object({ enabled: z.boolean().default(true), unitCost: z.coerce.number().nonnegative() }),
   }).optional(),
+  /*
+   * SMS is priced per route.
+   *
+   * Transactional traffic costs more at the provider — it takes the priority
+   * route that reaches numbers on Do-Not-Disturb — so charging one blended
+   * price either over-charges a business for its marketing or under-charges
+   * for its order confirmations. Both fall back to the SMS unit cost, so an
+   * admin who has not set them keeps today's behaviour exactly.
+   */
+  smsTransactionalCost: z.coerce.number().nonnegative().optional(),
+  smsPromotionalCost: z.coerce.number().nonnegative().optional(),
   lowBalanceThreshold: z.coerce.number().nonnegative().default(500),
   packages: z.array(z.object({
     id: z.string().min(1),
@@ -63,16 +86,34 @@ const pricingSchema = z.object({
 
 let cached: { value: SmsPricing; at: number } | null = null;
 
+/**
+ * Pin the pricing, for tests.
+ *
+ * Pricing is synced from the admin, so a suite that reads it is really testing
+ * whatever that deployment happens to be serving today — including a
+ * zero-cost configuration, under which every assertion about reservations and
+ * refunds silently passes for the wrong reason. Tests set what they mean.
+ */
+export function setPricingForTesting(value: SmsPricing | null): void {
+  cached = value ? { value, at: Number.MAX_SAFE_INTEGER } : null;
+}
+
 async function pricing(): Promise<SmsPricing> {
   if (cached && Date.now() - cached.at < 60_000) return cached.value;
   try {
     const url = `${env.adminCatalog.apiUrl}/api/v1/public/${env.adminCatalog.tenantSlug}/config`;
     const res = await fetch(url);
-    const json = (await res.json()) as { data?: { channelPricing?: unknown; sms?: unknown } };
+    const json = (await res.json()) as {
+      data?: { channelPricing?: unknown; sms?: unknown; smsLimits?: { maxCampaignSize?: number } };
+    };
     const parsed = pricingSchema.safeParse(json.data?.channelPricing ?? json.data?.sms);
     if (res.ok && parsed.success) {
       const value: SmsPricing = {
         ...parsed.data,
+        // Published separately from pricing because it is an operating limit,
+        // not a price — and because it lives in a setting that also holds
+        // secrets, so only this one figure crosses.
+        maxCampaignSize: json.data?.smsLimits?.maxCampaignSize,
         channels: parsed.data.channels ?? {
           SMS: { enabled: true, unitCost: parsed.data.unitCost },
           EMAIL: DEFAULT_PRICING.channels.EMAIL,
@@ -111,6 +152,14 @@ async function walletFor(organizationId: string, config: SmsPricing) {
 export const smsWalletService = {
   pricing,
 
+  /**
+   * What a send will cost.
+   *
+   * `quantity` is billable units, not recipients. For SMS that means segments:
+   * a 200-character message to 250 people is 500 units, and quoting it as 250
+   * — which this did before `segments` existed — understated the bill by half.
+   * Callers use `quoteSms` rather than working that out themselves.
+   */
   async quote(
     organizationId: string,
     channelType: 'SMS' | 'EMAIL' | 'WHATSAPP',
@@ -131,6 +180,35 @@ export const smsWalletService = {
       currency: wallet.currency,
       free,
       affordable: channel.enabled && (free || Number(wallet.balance) >= totalCost),
+    };
+  },
+
+  /**
+   * Quote an SMS send from the actual message bodies.
+   *
+   * Takes the resolved bodies — after variables are substituted — because
+   * "Hi Bo" and "Hi Chukwuemeka" can fall either side of a segment boundary,
+   * and pricing the whole campaign off one sample recipient would be wrong for
+   * everybody else.
+   */
+  async quoteSms(organizationId: string, bodies: string[]) {
+    const segments = totalSegments(bodies);
+    const base = await this.quote(organizationId, 'SMS', segments);
+    const perRecipient = bodies.length
+      ? segmentsFor(bodies[0]!)
+      : segmentsFor('');
+    return {
+      ...base,
+      recipients: bodies.length,
+      segments,
+      /** What one recipient costs, for the "1 segment" line in the composer. */
+      segmentsPerMessage: perRecipient.segments,
+      encoding: perRecipient.encoding,
+      /**
+       * Set when a single character has doubled the cost of the whole
+       * campaign — worth saying out loud before somebody sends it.
+       */
+      forcedUnicodeBy: perRecipient.forcedUnicodeBy,
     };
   },
 
@@ -195,6 +273,143 @@ export const smsWalletService = {
         sourceCurrency: t.currency,
       })),
     };
+  },
+
+  /**
+   * Hold the balance for a whole campaign before any of it is sent.
+   *
+   * A campaign is not a loop of single sends. Charging per message as it goes
+   * lets a business start a 5,000-recipient campaign with credit for 400 and
+   * discover the problem four hundred messages in — half-sent, and impossible
+   * to explain. So the entire cost is taken up front, in one atomic decrement,
+   * and what was not used is given back by `settleReservation`.
+   *
+   * `units` is segments, not recipients: a two-segment message to 250 people
+   * reserves 500.
+   */
+  async reserve(params: {
+    organizationId: string;
+    units: number;
+    campaignId?: string;
+    description: string;
+    /** Decides the price: the two routes cost different amounts. */
+    route?: 'TRANSACTIONAL' | 'PROMOTIONAL';
+  }): Promise<{ reference: string; unitCost: number; reserved: number }> {
+    const config = await pricing();
+    const wallet = await walletFor(params.organizationId, config);
+    const channelPricing = {
+      ...config.channels.SMS,
+      unitCost: smsUnitCostFor(config, params.route ?? 'PROMOTIONAL'),
+    };
+    if (!channelPricing.enabled) {
+      throw new AppError(
+        'CHANNEL_DELIVERY_DISABLED',
+        403,
+        'SMS delivery is currently disabled by the platform administrator.',
+      );
+    }
+    const reference = `rsv_sms_${Date.now().toString(36)}_${randomUUID()}`;
+    if (channelPricing.unitCost === 0) {
+      return { reference, unitCost: 0, reserved: 0 };
+    }
+
+    const amount = new Prisma.Decimal(channelPricing.unitCost).mul(params.units);
+    await prismaUnscoped.$transaction(async (tx) => {
+      // The balance condition lives in the WHERE clause so two campaigns
+      // starting at once cannot both pass a check and then both spend.
+      const updated = await tx.smsWallet.updateMany({
+        where: { id: wallet.id, balance: { gte: amount } },
+        data: { balance: { decrement: amount } },
+      });
+      if (updated.count !== 1) {
+        throw new AppError(
+          'INSUFFICIENT_MESSAGE_CREDITS',
+          402,
+          `This send needs ${params.units} SMS credits and your balance is lower. Top up to continue.`,
+        );
+      }
+      const current = await tx.smsWallet.findUniqueOrThrow({ where: { id: wallet.id } });
+      await tx.smsWalletTransaction.create({
+        data: {
+          organizationId: params.organizationId,
+          walletId: wallet.id,
+          type: 'SEND',
+          channelType: 'SMS',
+          amount: amount.negated(),
+          balanceAfter: current.balance,
+          currency: wallet.currency,
+          description: params.description,
+          reference,
+          campaignId: params.campaignId,
+          metadata: { reservedUnits: params.units },
+        },
+      });
+    });
+    return { reference, unitCost: channelPricing.unitCost, reserved: params.units };
+  },
+
+  /**
+   * Give back what the send did not use.
+   *
+   * A campaign always reserves what it might cost; the provider then rejects
+   * some numbers outright, and those segments were never charged by the
+   * network. Refunding the difference is what makes the reservation honest
+   * rather than a rounding-up in Vhicasar's favour.
+   *
+   * Written as a separate credit rather than by editing the original debit, so
+   * the ledger reads as what happened: reserved 500, refunded 12.
+   */
+  async settleReservation(params: {
+    organizationId: string;
+    reference: string;
+    reservedUnits: number;
+    actualUnits: number;
+    /** Must match the route the reservation was priced at. */
+    route?: 'TRANSACTIONAL' | 'PROMOTIONAL';
+  }): Promise<{ refundedUnits: number }> {
+    const unused = params.reservedUnits - params.actualUnits;
+    if (unused <= 0) return { refundedUnits: 0 };
+
+    const config = await pricing();
+    // Refunded at the price it was reserved at, or a transactional send would
+    // be refunded at the promotional rate and quietly lose the business money.
+    const unitCost = smsUnitCostFor(config, params.route ?? 'PROMOTIONAL');
+    if (unitCost === 0) return { refundedUnits: 0 };
+    const wallet = await walletFor(params.organizationId, config);
+    const amount = new Prisma.Decimal(unitCost).mul(unused);
+
+    await prismaUnscoped.$transaction(async (tx) => {
+      // Keyed off the reservation's reference so replaying a settlement — a
+      // retried job, a duplicated webhook — cannot refund twice.
+      const already = await tx.smsWalletTransaction.findFirst({
+        where: { organizationId: params.organizationId, reference: `${params.reference}_refund` },
+        select: { id: true },
+      });
+      if (already) return;
+
+      await tx.smsWallet.update({
+        where: { id: wallet.id },
+        data: { balance: { increment: amount } },
+      });
+      const current = await tx.smsWallet.findUniqueOrThrow({ where: { id: wallet.id } });
+      await tx.smsWalletTransaction.create({
+        data: {
+          organizationId: params.organizationId,
+          walletId: wallet.id,
+          // ROLLBACK is the ledger's existing word for money coming back;
+          // a partial refund is the same event as a failed send's refund.
+          type: 'ROLLBACK',
+          channelType: 'SMS',
+          amount,
+          balanceAfter: current.balance,
+          currency: wallet.currency,
+          description: `Refund for ${unused} unsent SMS credit${unused === 1 ? '' : 's'}`,
+          reference: `${params.reference}_refund`,
+          metadata: { reservedUnits: params.reservedUnits, actualUnits: params.actualUnits },
+        },
+      });
+    });
+    return { refundedUnits: unused };
   },
 
   /** Atomically reserve one configured outbound delivery before provider send. */

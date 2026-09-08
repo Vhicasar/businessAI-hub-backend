@@ -4,6 +4,14 @@ import { ConflictError, NotFoundError } from '../../shared/errors';
 import { prisma } from '../../infrastructure/database/prisma';
 import { encrypt } from '../../shared/crypto';
 import { env } from '../../shared/config/env';
+import {
+  newWebhookSecret,
+  oauthUnavailableReason,
+  supportsOAuth,
+  type ResolvedConnection,
+} from './channel-oauth.service';
+import { capabilitiesFor } from './channel-capabilities';
+import { channelPolicy } from '../settings/workspace-config';
 import { getAdapter, supportedChannels } from '../../infrastructure/channels/registry';
 import { activityService } from '../crm/activity.service';
 import { requestContext } from '../../shared/context';
@@ -79,6 +87,13 @@ const accountSelect = {
   autoReply: true,
   externalId: true,
   isActive: true,
+  // Health, so the page can say *why* a channel is not working rather than
+  // only that it is off. Deliberately alongside isActive rather than
+  // replacing it: existing callers keep working.
+  status: true,
+  lastWebhookAt: true,
+  lastError: true,
+  lastErrorAt: true,
   metadata: true,
   createdAt: true,
 } as const;
@@ -119,7 +134,6 @@ async function recordChannelEvent(
 
 export const channelsService = {
   async list(organizationId: string) {
-    const supported = supportedChannels();
     const accounts = await prisma.channelAccount.findMany({
       where: { deletedAt: null },
       select: accountSelect,
@@ -127,8 +141,47 @@ export const channelsService = {
       // Invoices" rather than one flat list.
       orderBy: [{ channelType: 'asc' }, { createdAt: 'asc' }],
     });
+
+    /*
+     * A channel the platform has switched off is not shown at all.
+     *
+     * It used to be listed with "not available on this platform" underneath,
+     * which is an odd thing to show a business — an option it can see, cannot
+     * use, and did not ask about.
+     *
+     * The exception is a channel a business already has connected. Hiding one
+     * of those would take a live, message-receiving connection off the screen
+     * and leave no way to disconnect it, so it stays visible; what disappears
+     * is the ability to add another.
+     */
+    const connectedTypes = new Set(accounts.map((a) => a.channelType));
+    const supported = supportedChannels().filter(
+      (channelType) => channelPolicy(channelType).available || connectedTypes.has(channelType),
+    );
     const allowances = await allowanceSummary(organizationId, supported);
-    return { accounts, supported, allowances, purposes: CHANNEL_PURPOSES };
+
+    /*
+     * What each channel can do, and how it can be connected.
+     *
+     * Sent with the list so the settings page and the composer can be honest
+     * without hard-coding provider rules of their own: no template picker on
+     * Instagram, no "Connect with Facebook" button on a deployment where the
+     * Meta app has not been configured.
+     */
+    const channels = supported.map((channelType) => ({
+      channelType,
+      capabilities: capabilitiesFor(channelType),
+      oauth: {
+        supported: supportsOAuth(channelType),
+        // Present only when it cannot be used, and phrased for the person who
+        // has to do something about it.
+        unavailableReason: supportsOAuth(channelType)
+          ? null
+          : oauthUnavailableReason(channelType),
+      },
+    }));
+
+    return { accounts, supported, allowances, purposes: CHANNEL_PURPOSES, channels };
   },
 
   async connect(organizationId: string, dto: ConnectChannelDto) {
@@ -208,6 +261,94 @@ export const channelsService = {
     };
   },
 
+  /**
+   * Store a connection that came back from the provider's own OAuth dialog.
+   *
+   * Deliberately separate from `connect`: that one takes credentials a person
+   * typed and validates the shape of them, while this one takes what the
+   * provider itself said the business owns. Everything after the credentials —
+   * the duplicate check, the plan allowance, encryption, the audit entry — is
+   * the same, because connecting a channel means the same thing either way.
+   *
+   * Reconnecting an account the business already has updates it in place
+   * rather than being refused as a duplicate: an expired token is the most
+   * common reason anyone runs this flow a second time.
+   */
+  async connectFromOAuth(connection: ResolvedConnection) {
+    const { organizationId, channelType, externalId } = connection;
+
+    const existing = await prisma.channelAccount.findFirst({
+      where: { channelType, externalId, deletedAt: null },
+      select: { id: true, organizationId: true, name: true },
+    });
+    if (existing && existing.organizationId !== organizationId) {
+      throw new ConflictError(
+        'That account is already connected to another business on Vhicasar.',
+      );
+    }
+
+    if (!existing) {
+      const allowance = await allowanceFor(organizationId, channelType);
+      if (!allowance.canAddMore) {
+        throw new ConflictError(allowance.blockedReason ?? 'Channel limit reached');
+      }
+    }
+
+    const webhookSecret = existing ? undefined : newWebhookSecret();
+    const account = existing
+      ? await prisma.channelAccount.update({
+          where: { id: existing.id },
+          data: {
+            credentialsEnc: encrypt(JSON.stringify(connection.credentials)),
+            metadata: connection.metadata as never,
+            // A reconnect is also how a disabled account comes back — and how
+            // an expired one is repaired, which is the whole point of showing
+            // EXPIRED in the first place.
+            isActive: true,
+            status: 'CONNECTED',
+            lastError: null,
+            lastErrorAt: null,
+          },
+        })
+      : await prisma.channelAccount.create({
+          data: {
+            organizationId,
+            channelType,
+            name: connection.displayName,
+            purpose: 'GENERAL',
+            // Off by default: what answers a customer unattended is a decision
+            // the business makes deliberately, not a side effect of connecting.
+            autoReply: false,
+            externalId,
+            credentialsEnc: encrypt(JSON.stringify(connection.credentials)),
+            metadata: connection.metadata as never,
+            webhookSecret,
+          },
+        });
+
+    await recordChannelEvent(account.id, existing ? 'Channel reconnected' : 'Channel connected', {
+      body: [
+        `Type: ${channelType}`,
+        `Account: ${connection.displayName}`,
+        'Connected through the provider sign-in, not typed-in credentials.',
+      ].join('\n'),
+      metadata: {
+        channelType,
+        externalId,
+        connectedVia: connection.metadata.connectedVia ?? 'oauth',
+      },
+    });
+
+    return {
+      id: account.id,
+      channelType: account.channelType,
+      name: account.name,
+      externalId: account.externalId,
+      isActive: account.isActive,
+      reconnected: Boolean(existing),
+    };
+  },
+
   /** Per instance — enabling it on support must not enable it on invoices. */
   async setAutoReply(accountId: string, enabled: boolean) {
     const account = await prisma.channelAccount.findFirst({
@@ -264,7 +405,14 @@ export const channelsService = {
     if (!account) throw new NotFoundError('Channel account');
     await prisma.channelAccount.update({
       where: { id: accountId },
-      data: { isActive: false, deletedAt: new Date() },
+      data: {
+        isActive: false,
+        // Somebody chose this, so it is not an error and must not read as one.
+        status: 'DISCONNECTED',
+        lastError: null,
+        lastErrorAt: null,
+        deletedAt: new Date(),
+      },
     });
     await recordChannelEvent(accountId, `Channel disconnected — ${account.name}`, {
       body: 'Messages will no longer arrive from this channel. Its conversation history is kept.',

@@ -7,6 +7,7 @@ import { logger } from '../../shared/logger';
 import { getAdapter } from '../../infrastructure/channels/registry';
 import { inboxService } from '../../application/inbox/inbox.service';
 import { decrypt } from '../../shared/crypto';
+import { markWebhookReceived } from '../../application/inbox/channel-health.service';
 
 /**
  * Public webhook receivers: /api/webhooks/:channel/:accountId
@@ -87,8 +88,14 @@ webhookRoutes.post('/:channel/:accountId', (req, res) => {
         return;
       }
 
+      // Proof the connection works — and it clears any stale error, so a
+      // channel that has recovered stops showing last week's failure.
+      await markWebhookReceived(account.id);
+
       const messages = adapter.parseInbound(req.body);
-      if (messages.length === 0) return;
+      // One delivery can carry both new messages and receipts for old ones.
+      const statuses = adapter.parseStatuses?.(req.body) ?? [];
+      if (messages.length === 0 && statuses.length === 0) return;
 
       // Bind tenant context so the inbox service is auto-scoped.
       await requestContext.run(
@@ -99,6 +106,18 @@ webhookRoutes.post('/:channel/:accountId', (req, res) => {
               { id: account.id, organizationId: account.organizationId, channelType },
               inbound
             );
+          }
+          for (const update of statuses) {
+            // One bad receipt must not discard the rest of the delivery, and
+            // the provider will not resend: it already had its 200.
+            await inboxService
+              .applyStatus({ id: account.id, organizationId: account.organizationId }, update)
+              .catch((err) =>
+                logger.warn(
+                  { err, providerMessageId: update.providerMessageId },
+                  'Delivery receipt could not be applied'
+                )
+              );
           }
         }
       );

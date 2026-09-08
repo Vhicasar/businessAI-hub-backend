@@ -14,6 +14,9 @@ import { kycService } from '../../../application/identity/kyc.service';
 import { reviewKycSchema } from '../../../application/identity/identity.dto';
 import { rewardCampaigns } from '../../../application/rewards/reward-campaign.service';
 import { walletBuckets } from '../../../application/payments/wallet-buckets.service';
+import { senderIdService } from '../../../application/sms/sender-id.service';
+import { syncWorkspaceConfigFromAdmin } from '../../../application/settings/workspace-config-sync';
+import { syncOAuthConfigFromAdmin } from '../../../application/integrations/oauth-config-sync';
 
 /**
  * Service API — for the Vhicasar Admin, not for tenants or end users.
@@ -1027,6 +1030,185 @@ serviceRoutes.post(
           ? `Granted ${body.credits} AI credits.`
           : `Removed ${Math.abs(body.credits)} AI credits.`,
       data: await aiUsageService.balance(organizationId),
+    });
+  })
+);
+
+// ── Sender IDs ─────────────────────────────────────────────────────────────
+
+/**
+ * Sender ID registrations waiting on a decision, across every organisation.
+ *
+ * Approval is a network decision that Vhicasar relays: somebody at the
+ * platform submits the name to the provider and records what comes back.
+ * Without this queue nothing can ever be approved, and no business can send.
+ *
+ * Cross-tenant on purpose, like the rest of this file, and behind the same
+ * shared secret.
+ */
+serviceRoutes.get(
+  '/sender-ids/pending',
+  wrap(async (_req, res) => {
+    res.json({ success: true, data: await senderIdService.pendingQueue() });
+  })
+);
+
+/** Every Sender ID, so the platform can also see what it has already decided. */
+serviceRoutes.get(
+  '/sender-ids',
+  validate({
+    query: z.object({
+      status: z.enum(['DRAFT', 'PENDING', 'APPROVED', 'REJECTED', 'SUSPENDED']).optional(),
+      limit: z.coerce.number().int().min(1).max(200).default(100),
+    }),
+  }),
+  wrap(async (req, res) => {
+    const q = req.query as never as { status?: string; limit: number };
+    const rows = await prismaUnscoped.senderId.findMany({
+      where: { deletedAt: null, ...(q.status ? { status: q.status as never } : {}) },
+      select: {
+        id: true, value: true, status: true, useCase: true, reviewNote: true,
+        submittedAt: true, decidedAt: true, createdAt: true, organizationId: true,
+        organization: { select: { name: true, slug: true } },
+      },
+      orderBy: [{ status: 'asc' }, { submittedAt: 'desc' }],
+      take: q.limit,
+    });
+    res.json({ success: true, data: rows });
+  })
+);
+
+/** Record the network's decision on one registration. */
+serviceRoutes.post(
+  '/sender-ids/:id/decide',
+  validate({
+    body: z.object({
+      decision: z.enum(['APPROVED', 'REJECTED', 'SUSPENDED']),
+      note: z.string().trim().max(500).optional(),
+      providerRef: z.string().trim().max(120).optional(),
+    }),
+  }),
+  wrap(async (req, res) => {
+    const data = await senderIdService.decide(req.params.id as string, req.body.decision, {
+      note: req.body.note,
+      providerRef: req.body.providerRef,
+    });
+    res.json({
+      success: true,
+      message: `Sender ID ${req.body.decision.toLowerCase()}.`,
+      data,
+    });
+  })
+);
+
+
+/**
+ * SMS margin, across every organisation.
+ *
+ * The ledger records what Vhicasar charged; the provider's own cost is a
+ * platform setting rather than a per-message fact, so the two are combined
+ * here rather than stored together. Kept out of the tenant API entirely — what
+ * Vhicasar pays its provider is not a business's business.
+ */
+serviceRoutes.get(
+  '/sms/margin',
+  validate({
+    query: z.object({
+      from: z.coerce.date().optional(),
+      to: z.coerce.date().optional(),
+      /** What the provider charges per segment, from admin configuration. */
+      providerCostPerSegment: z.coerce.number().nonnegative().default(0),
+    }),
+  }),
+  wrap(async (req, res) => {
+    const q = req.query as never as { from?: Date; to?: Date; providerCostPerSegment: number };
+    const window = q.from || q.to
+      ? { queuedAt: { ...(q.from ? { gte: q.from } : {}), ...(q.to ? { lte: q.to } : {}) } }
+      : {};
+
+    const [byRoute, byOrg] = await Promise.all([
+      prismaUnscoped.smsMessage.groupBy({
+        by: ['route'],
+        where: window,
+        _count: true,
+        _sum: { segments: true, cost: true },
+      }),
+      prismaUnscoped.smsMessage.groupBy({
+        by: ['organizationId'],
+        where: window,
+        _count: true,
+        _sum: { segments: true, cost: true },
+        orderBy: { _sum: { cost: 'desc' } },
+        take: 25,
+      }),
+    ]);
+
+    const line = (segments: number, charged: number) => {
+      const providerCost = segments * q.providerCostPerSegment;
+      return {
+        segments,
+        charged,
+        providerCost,
+        margin: charged - providerCost,
+        // Null rather than 0% when nothing was charged: a free configuration
+        // has no margin to report, which is not the same as a zero one.
+        marginPercent: charged > 0
+          ? Math.round(((charged - providerCost) / charged) * 1000) / 10
+          : null,
+      };
+    };
+
+    const totals = byRoute.reduce(
+      (acc, r) => ({
+        segments: acc.segments + (r._sum.segments ?? 0),
+        charged: acc.charged + Number(r._sum.cost ?? 0),
+      }),
+      { segments: 0, charged: 0 },
+    );
+
+    res.json({
+      success: true,
+      data: {
+        providerCostPerSegment: q.providerCostPerSegment,
+        total: line(totals.segments, totals.charged),
+        byRoute: byRoute.map((r) => ({
+          route: r.route,
+          messages: r._count,
+          ...line(r._sum.segments ?? 0, Number(r._sum.cost ?? 0)),
+        })),
+        byOrganization: byOrg.map((o) => ({
+          organizationId: o.organizationId,
+          messages: o._count,
+          ...line(o._sum.segments ?? 0, Number(o._sum.cost ?? 0)),
+        })),
+      },
+    });
+  })
+);
+
+
+/**
+ * Re-read the admin's configuration now.
+ *
+ * The product polls for workspace config every ten minutes, which is fine for
+ * a value nobody is watching and useless for one somebody just changed:
+ * switching SMS back on in the admin appeared to do nothing for ten minutes,
+ * which reads as broken rather than slow. The admin calls this after a save so
+ * the change lands immediately.
+ *
+ * Cheap and idempotent — it is the same fetch the timer performs.
+ */
+serviceRoutes.post(
+  '/config/refresh',
+  wrap(async (_req, res) => {
+    const [workspace, oauth] = await Promise.all([
+      syncWorkspaceConfigFromAdmin(),
+      syncOAuthConfigFromAdmin(),
+    ]);
+    res.json({
+      success: true,
+      message: 'Configuration reloaded.',
+      data: { workspace, oauth },
     });
   })
 );

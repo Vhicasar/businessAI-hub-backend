@@ -78,6 +78,24 @@ enum ChannelType {
   X
 }
 
+/// The health of one connected channel, as the business would describe it.
+///
+/// `isActive` alone could not say why a channel had stopped working, so an
+/// expired Meta token looked exactly like a channel somebody had switched off
+/// — and nothing in the product could tell the business to reconnect.
+enum ChannelConnectionStatus {
+  /// Working: authorised, and the provider is delivering.
+  CONNECTED
+  /// The OAuth handshake has begun but no account has been resolved yet.
+  CONNECTING
+  /// Switched off deliberately, by a person.
+  DISCONNECTED
+  /// The provider rejected our credentials. Only reconnecting fixes it.
+  EXPIRED
+  /// Something else is wrong — a send failed, or a webhook was refused.
+  ERROR
+}
+
 enum ConversationStatus {
   OPEN
   PENDING
@@ -746,6 +764,9 @@ model Organization {
 
   settlementAccounts SettlementAccount[]
   settlementRules    SettlementRule[]
+  senderIds          SenderId[]
+  smsMessages        SmsMessage[]
+  smsSuppressions    SmsSuppression[]
 
   @@index([status])
 }
@@ -1162,24 +1183,35 @@ model CustomerIdentity {
 // ============================================================
 
 model ChannelAccount {
-  id             String      @id @default(cuid())
+  id             String                  @id @default(cuid())
   organizationId String
   channelType    ChannelType
   name           String // "Main WhatsApp", "Support Page"
   /// What this instance is for: SUPPORT | INVOICES | SALES | ORDERS |
   /// MARKETING | GENERAL. Drives which channel the system reaches for, so an
   /// invoice does not go out of the support inbox.
-  purpose        String      @default("GENERAL")
+  purpose        String                  @default("GENERAL")
   /// Per instance, never global: a business can want auto-replies on its
   /// support address and silence on the one that sends invoices.
-  autoReply      Boolean     @default(true)
+  autoReply      Boolean                 @default(true)
   externalId     String // phone number id, page id, bot id…
-  credentialsEnc String?     @db.Text // AES-256-GCM encrypted provider credentials
+  credentialsEnc String?                 @db.Text // AES-256-GCM encrypted provider credentials
   webhookSecret  String?
-  isActive       Boolean     @default(true)
+  isActive       Boolean                 @default(true)
+  /// Why this channel is or is not working. Existing rows default to
+  /// CONNECTED, which is what they were before this column existed.
+  status         ChannelConnectionStatus @default(CONNECTED)
+  /// When the provider last delivered anything at all. The honest answer to
+  /// "is this still live?" — a channel authorised months ago that has heard
+  /// nothing since is worth showing differently from one that just worked.
+  lastWebhookAt  DateTime?
+  /// The last thing that went wrong, kept in the business's own words rather
+  /// than the provider's. Cleared when the channel recovers.
+  lastError      String?
+  lastErrorAt    DateTime?
   metadata       Json?
-  createdAt      DateTime    @default(now())
-  updatedAt      DateTime    @updatedAt
+  createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
   deletedAt      DateTime?
 
   conversations Conversation[]
@@ -4323,6 +4355,162 @@ model AddOnPurchase {
 }
 
 /// Prepaid SMS balance. Amounts are monetary and always use `currency`.
+/// What happened to one SMS, in Vhicasar's own words.
+///
+/// Providers each have their own vocabulary; these are what the business sees
+/// and what analytics count.
+enum SmsMessageStatus {
+  /// Accepted by us, balance reserved, not yet handed to the provider.
+  QUEUED
+  /// The provider took it.
+  SENT
+  /// The network confirmed it reached the handset.
+  DELIVERED
+  /// The provider or network could not deliver it.
+  FAILED
+  /// Refused outright — a blocked route, a number on Do-Not-Disturb.
+  REJECTED
+  /// The network gave up retrying.
+  EXPIRED
+}
+
+/// Marketing or transactional. Not cosmetic: the routes differ at the
+/// provider, they are priced differently, and only one of them has to respect
+/// an opt-out.
+enum SmsRouteType {
+  TRANSACTIONAL
+  PROMOTIONAL
+}
+
+/// One SMS to one recipient.
+///
+/// The unit everything else is built on: delivery receipts land against it,
+/// history lists it, analytics count it, and the wallet reconciles against
+/// what it actually cost rather than what was estimated.
+model SmsMessage {
+  id                String           @id @default(cuid())
+  organizationId    String
+  /// Set for a campaign send; null for a transactional one.
+  campaignId        String?
+  customerId        String?
+  senderIdId        String?
+  /// The name that appeared as the sender, copied at send time so history
+  /// stays truthful even if the Sender ID is later renamed or suspended.
+  senderValue       String
+  /// E.164. Stored normalised so history and analytics can group by person.
+  recipient         String
+  body              String           @db.Text
+  route             SmsRouteType     @default(TRANSACTIONAL)
+  status            SmsMessageStatus @default(QUEUED)
+  /// What the network charges for: not the message count.
+  segments          Int              @default(1)
+  encoding          String           @default("GSM_7BIT")
+  /// What Vhicasar charged the business. Separate from provider cost so the
+  /// margin stays auditable.
+  cost              Decimal          @default(0) @db.Decimal(14, 4)
+  /// What the provider charged us, when it tells us.
+  providerCost      Decimal?         @db.Decimal(14, 4)
+  /// The provider's id, for matching delivery receipts.
+  providerMessageId String?
+  /// Ours, sent with the message and echoed back. The idempotency key for
+  /// receipts, and how a bulk send's individual messages stay distinguishable.
+  reference         String
+  /// The provider's own words. For support, never shown to the business.
+  failureReason     String?
+  /// What kind of transactional message this was — order.confirmed,
+  /// appointment.reminder — so a business can switch one kind off.
+  eventType         String?
+  queuedAt          DateTime         @default(now())
+  sentAt            DateTime?
+  deliveredAt       DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  /// The idempotency guarantee: a redelivered webhook finds the same row.
+  @@unique([organizationId, reference])
+  @@index([organizationId, queuedAt])
+  @@index([organizationId, status])
+  @@index([campaignId])
+  @@index([providerMessageId])
+}
+
+/// Numbers that must not receive marketing SMS.
+///
+/// Separate from Customer.marketingOptIn because a suppression can arrive from
+/// someone who is not a customer at all — a STOP reply from an imported list,
+/// or a number the network told us to stop texting. Keyed by number rather
+/// than by customer for the same reason.
+model SmsSuppression {
+  id              String   @id @default(cuid())
+  organizationId  String
+  /// E.164.
+  phone           String
+  /// Why: STOP reply, manual, provider complaint, hard failure.
+  reason          String
+  /// The message that prompted it, when there was one.
+  sourceMessageId String?
+  createdAt       DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@unique([organizationId, phone])
+  @@index([organizationId, createdAt])
+}
+
+/// Where a Sender ID is in the approval process.
+///
+/// Approval is the provider's and the network's decision, not Vhicasar's, so
+/// the states have to model somebody else's queue — including it being taken
+/// away again after it was working.
+enum SenderIdStatus {
+  /// Saved but not submitted; the business is still deciding.
+  DRAFT
+  /// With the provider. Nothing can be sent under it yet.
+  PENDING
+  APPROVED
+  REJECTED
+  /// Was approved, and has since been withdrawn.
+  SUSPENDED
+}
+
+/// A name that appears as the sender of a business's SMS.
+///
+/// Networks will not deliver marketing SMS from an arbitrary string, so each
+/// business registers one and waits for approval. Kept per organisation and
+/// never shared: sending under another business's approved name is
+/// impersonation, which is exactly what the registration process exists to
+/// prevent.
+model SenderId {
+  id             String         @id @default(cuid())
+  organizationId String
+  /// What recipients see, e.g. ABCPHARM. Provider rules cap the length and
+  /// the character set; validated on the way in.
+  value          String
+  status         SenderIdStatus @default(DRAFT)
+  /// Why the network is being asked to approve it — most providers require a
+  /// stated use case, and a rejected one has to be explicable to the business.
+  useCase        String?
+  /// The provider's own id for the request, when it gives one.
+  providerRef    String?
+  /// Free text from the provider or the Vhicasar admin, shown to the business.
+  reviewNote     String?
+  submittedAt    DateTime?
+  decidedAt      DateTime?
+  /// Membership of the Vhicasar administrator who decided.
+  decidedById    String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  deletedAt      DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  /// One registration per name per business; the same name may legitimately be
+  /// requested by two businesses and is resolved by the provider, not here.
+  @@unique([organizationId, value])
+  @@index([organizationId, status])
+  @@index([status, submittedAt])
+}
+
 model SmsWallet {
   id                  String    @id @default(cuid())
   organizationId      String    @unique

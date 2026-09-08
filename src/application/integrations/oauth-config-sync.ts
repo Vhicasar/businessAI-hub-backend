@@ -37,7 +37,12 @@ export function oauthCredentials(provider: string): OAuthAppCredentials | null {
       ? { clientId: env.oauth.google.clientId, clientSecret: env.oauth.google.clientSecret }
       : provider === 'calendly'
         ? { clientId: env.oauth.calendly.clientId, clientSecret: env.oauth.calendly.clientSecret }
-        : null;
+        : // The Meta app behind WhatsApp, Messenger and Instagram. Same
+          // admin-first, env-fallback rule as the others, so rotating the app
+          // secret no longer means a redeploy.
+          provider === 'meta'
+          ? { clientId: env.meta.appId, clientSecret: env.meta.appSecret }
+          : null;
 
   return local?.clientId && local.clientSecret ? local : null;
 }

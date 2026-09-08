@@ -982,6 +982,13 @@ async function wipe() {
     () => db.membership.deleteMany({ where: { organizationId: id } }),
     () => db.role.deleteMany({ where: { organizationId: id } }),
     () => db.organizationModule.deleteMany({ where: { organizationId: id } }),
+    // SMS holds the organisation down with RESTRICT foreign keys, so a demo
+    // that ever sent a message could not be removed without these.
+    () => db.smsMessage.deleteMany({ where: { organizationId: id } }),
+    () => db.smsSuppression.deleteMany({ where: { organizationId: id } }),
+    () => db.senderId.deleteMany({ where: { organizationId: id } }),
+    () => db.smsWalletTransaction.deleteMany({ where: { organizationId: id } }),
+    () => db.smsWallet.deleteMany({ where: { organizationId: id } }),
   ]) {
     await remove().catch(() => undefined);
   }

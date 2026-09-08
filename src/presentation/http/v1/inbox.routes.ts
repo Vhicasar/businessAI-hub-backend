@@ -1,4 +1,5 @@
 import { Router, type Request, type RequestHandler, type Response } from 'express';
+import { ConflictError } from '../../../shared/errors';
 import { z } from 'zod';
 import { validate } from '../middleware/validate';
 import { authenticate, requireTenant } from '../middleware/authenticate';
@@ -14,6 +15,10 @@ import {
   updateChannelSchema,
   connectChannelSchema,
 } from '../../../application/inbox/channels.service';
+import { authorizationUrl } from '../../../application/inbox/channel-oauth.service';
+import { allowanceFor } from '../../../application/inbox/channel-allowance.service';
+import type { ChannelType } from '@prisma/client';
+import { env } from '../../../shared/config/env';
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<void>): RequestHandler =>
@@ -151,6 +156,34 @@ inboxRoutes.post(
   wrap(async (req, res) => {
     const data = await channelsService.connect(req.auth!.organizationId!, req.body);
     res.status(201).json({ success: true, data });
+  })
+);
+
+/**
+ * Start a one-click connection.
+ *
+ * Returns the provider's authorisation URL rather than redirecting, so the
+ * browser can open it in a popup and the settings page stays where it is.
+ */
+inboxRoutes.post(
+  '/channels/:channel/connect/start',
+  requirePermission('inbox.manage_channels', 'settings.manage_integrations'),
+  wrap(async (req, res) => {
+    const channelType = String(req.params.channel).toUpperCase() as ChannelType;
+    // Refuse here rather than after a round trip to Meta: the connect flow is
+    // already gated at the callback, but failing only there means sending the
+    // business off to authorise an account we were never going to accept.
+    const allowance = await allowanceFor(req.auth!.organizationId!, channelType);
+    if (!allowance.canAddMore) {
+      throw new ConflictError(allowance.blockedReason ?? 'This channel cannot be connected.');
+    }
+    const { url } = authorizationUrl({
+      channelType,
+      organizationId: req.auth!.organizationId!,
+      userId: req.auth!.userId,
+      returnTo: `${env.WEB_APP_URL}/settings/integrations?tab=channels`,
+    });
+    res.json({ success: true, data: { url } });
   })
 );
 

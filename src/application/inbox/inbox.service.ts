@@ -14,7 +14,14 @@ import { getAdapter } from '../../infrastructure/channels/registry';
 import { decrypt } from '../../shared/crypto';
 import { aiService } from '../ai/ai.service';
 import { notifyService } from '../notifications/notify.service';
-import type { ChannelAccountRef, NormalizedInbound } from './channel-adapter';
+import type {
+  ChannelAccountRef,
+  NormalizedInbound,
+  NormalizedStatus,
+} from './channel-adapter';
+import { ingestInboundMedia } from './inbox-media.service';
+import { markChannelConnected, markChannelError } from './channel-health.service';
+import { workflowService } from '../crm/workflow.service';
 
 export const listConversationsSchema = z.object({
   status: z.enum(['OPEN', 'PENDING', 'RESOLVED', 'SNOOZED', 'SPAM']).optional(),
@@ -75,6 +82,19 @@ function statedName(text: string | null | undefined): string | null {
   return [first, match[2]].filter(Boolean).join(' ');
 }
 
+/**
+ * Delivery states in the order they can only ever move forwards through.
+ *
+ * Receipts arrive out of order — a read receipt can overtake the delivery one
+ * on a busy connection — and a message that went from READ back to DELIVERED
+ * would look to an agent like the customer un-read it.
+ */
+const STATUS_RANK: Record<string, number> = {
+  QUEUED: 0, SENT: 1, DELIVERED: 2, READ: 3,
+  // Failure is terminal and can arrive at any point, so it outranks the rest.
+  FAILED: 4,
+};
+
 export const inboxService = {
   // ---------------------------------------------------------------- inbound
 
@@ -83,6 +103,55 @@ export const inboxService = {
    * identity find-or-create → customer → conversation → message → realtime.
    * Runs inside requestContext bound to the account's organization.
    */
+  /**
+   * Move an outbound message along from a provider receipt.
+   *
+   * Idempotent and monotonic: replaying a webhook changes nothing, and a
+   * receipt that arrives after a later one is ignored rather than winding the
+   * message back.
+   */
+  async applyStatus(
+    account: { id: string; organizationId: string },
+    update: NormalizedStatus
+  ): Promise<void> {
+    const message = await prisma.message.findFirst({
+      where: {
+        organizationId: account.organizationId,
+        providerMessageId: update.providerMessageId,
+        direction: 'OUTBOUND',
+      },
+      select: { id: true, status: true, conversationId: true },
+    });
+    // A receipt for something we never sent — an echo of an inbound message,
+    // or a message from before this account was connected.
+    if (!message) return;
+
+    const current = STATUS_RANK[message.status] ?? 0;
+    const next = STATUS_RANK[update.status] ?? 0;
+    if (next <= current) return;
+
+    const at = update.occurredAt ?? new Date();
+    await prisma.message.update({
+      where: { id: message.id },
+      data: {
+        status: update.status,
+        ...(update.status === 'DELIVERED' ? { deliveredAt: at } : {}),
+        ...(update.status === 'READ' ? { readAt: at, deliveredAt: at } : {}),
+        ...(update.status === 'FAILED' ? { errorMessage: update.error ?? 'Delivery failed' } : {}),
+      },
+    });
+
+    const payload = {
+      messageId: message.id,
+      conversationId: message.conversationId,
+      status: update.status,
+      at: at.toISOString(),
+      ...(update.status === 'FAILED' ? { error: update.error ?? null } : {}),
+    };
+    emitToOrg(account.organizationId, SOCKET_EVENTS.INBOX_MESSAGE_STATUS, payload);
+    emitToConversation(message.conversationId, SOCKET_EVENTS.INBOX_MESSAGE_STATUS, payload);
+  },
+
   async processInbound(
     account: { id: string; organizationId: string; channelType: ChannelType },
     inbound: NormalizedInbound
@@ -153,6 +222,7 @@ export const inboxService = {
       },
       orderBy: { createdAt: 'desc' },
     });
+    const isNewConversation = !conversation;
     conversation ??= await prisma.conversation.create({
       data: {
         organizationId: account.organizationId,
@@ -189,6 +259,52 @@ export const inboxService = {
       // database uniqueness constraint is the final idempotency boundary.
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return;
       throw error;
+    }
+
+    // Copy the attachment out of the provider before its link expires. Awaited
+    // rather than fired and forgotten, so the attachment is on the message by
+    // the time the socket event tells an agent there is something to look at.
+    if (inbound.media) {
+      await ingestInboundMedia({
+        messageId: message.id,
+        organizationId: account.organizationId,
+        channelType: account.channelType,
+        accountId: account.id,
+        media: inbound.media,
+        caption: inbound.text,
+      });
+    }
+
+    /*
+     * Let the automation engine see it.
+     *
+     * Fired after the message is safely stored and never awaited: a workflow
+     * that is slow or broken must not delay the socket event putting the
+     * message in front of an agent, and must never lose the message itself.
+     * `dispatch` already swallows its own failures.
+     */
+    {
+      const wfPayload = {
+        channel: account.channelType,
+        text: inbound.text ?? '',
+        contentType: inbound.contentType,
+        customerId: identity.customerId,
+        conversationId: conversation.id,
+        customerName: `${identity.customer.firstName} ${identity.customer.lastName ?? ''}`.trim(),
+        isFirstMessage: isNewConversation,
+      };
+      const wfTarget = {
+        entityType: 'CONVERSATION' as const,
+        entityId: conversation.id,
+        customerId: identity.customerId,
+        ownerId: conversation.assignedToId,
+      };
+      // A brand-new thread is both events: the conversation started, and a
+      // message arrived. Rules on either should fire.
+      if (isNewConversation) {
+        void workflowService.dispatch('conversation.started', wfPayload, wfTarget);
+      }
+      void workflowService.dispatch('message.received', wfPayload, wfTarget);
     }
 
     // Persist names such as “I am Victor” before AI handoff/auto-reply runs.
@@ -392,11 +508,24 @@ export const inboxService = {
         where: { id: message.id },
         data: { status: 'SENT', providerMessageId: result.providerMessageId, sentAt: new Date() },
       });
+      // A send that worked is the same proof a webhook is: the credentials are
+      // good. Clears a stale error without waiting for the customer to write in.
+      if (conversation.channelAccount.status !== 'CONNECTED') {
+        await markChannelConnected(conversation.channelAccount.id);
+      }
     } catch (e) {
+      const raw = e instanceof Error ? e.message : String(e);
       await prisma.message.update({
         where: { id: message.id },
-        data: { status: 'FAILED', errorMessage: e instanceof Error ? e.message : String(e) },
+        data: { status: 'FAILED', errorMessage: raw },
       });
+      // Decide what the failure says about the channel itself — an expired
+      // token needs the business to reconnect, a rate limit does not.
+      await markChannelError(
+        conversation.channelAccount.id,
+        conversation.channelAccount.channelType,
+        raw,
+      );
       throw e;
     }
 

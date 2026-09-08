@@ -12,6 +12,7 @@ import { USAGE_METRICS } from '../billing/usage.service';
 import { AppError } from '../../shared/errors';
 import { pickChannelFor } from '../inbox/channel-allowance.service';
 import { smsWalletService } from '../billing/sms-wallet.service';
+import { smsSendService } from '../sms/sms-send.service';
 
 function orgId(): string {
   const id = requestContext.get()?.organizationId;
@@ -158,17 +159,39 @@ export const campaignService = {
           email: { not: null },
           ...(recipientIds ? { id: { in: recipientIds } } : {}),
         },
-        select: { id: true, firstName: true },
+        // Same shape from every branch, so a caller never has to narrow.
+        select: { id: true, firstName: true, lastName: true, phone: true },
         take: MAX_RECIPIENTS,
       });
     }
+    /*
+     * SMS reaches anyone with a phone number.
+     *
+     * The identity check below is right for WhatsApp and the chat channels,
+     * where a conversation has to exist before we can message someone. SMS is
+     * not like that: a phone number is enough. Requiring an SMS CustomerIdentity
+     * meant only customers who had already texted in were reachable, which for
+     * an outbound campaign is almost nobody.
+     */
+    if (channel === 'SMS') {
+      return prisma.customer.findMany({
+        where: {
+          ...base,
+          phone: { not: null },
+          ...(recipientIds ? { id: { in: recipientIds } } : {}),
+        },
+        select: { id: true, firstName: true, lastName: true, phone: true },
+        take: MAX_RECIPIENTS,
+      });
+    }
+
     return prisma.customer.findMany({
       where: {
         ...base,
         identities: { some: { channelType: channel } },
         ...(recipientIds ? { id: { in: recipientIds } } : {}),
       },
-      select: { id: true, firstName: true },
+      select: { id: true, firstName: true, lastName: true, phone: true },
       take: MAX_RECIPIENTS,
     });
   },
@@ -195,7 +218,13 @@ export const campaignService = {
       // support inbox answering a campaign reply is not what anyone wants.
       pickChannelFor({ purpose: 'MARKETING', channelTypes: [channel] }).then((p) => p.recommended),
     ]);
-    if (!account) {
+    /*
+     * SMS goes through Vhicasar's own provider account, so there is no
+     * per-business channel to connect — what it needs instead is an approved
+     * Sender ID, checked by the send service itself. Every other channel still
+     * requires the business to have connected one.
+     */
+    if (!account && channel !== 'SMS') {
       throw new AppError(
         'CHANNEL_NOT_CONFIGURED',
         400,
@@ -212,7 +241,22 @@ export const campaignService = {
       );
     }
     const paidChannel = channel as 'SMS' | 'EMAIL' | 'WHATSAPP';
-    const quote = await smsWalletService.quote(orgId(), paidChannel, customers.length);
+    /*
+     * SMS is priced by segment, not by recipient.
+     *
+     * A 200-character campaign to 250 people is 500 billable units. Quoting it
+     * as 250 let a business start a campaign it could only half afford, and
+     * under-charged Vhicasar for the half that went.
+     */
+    const smsBody = paidChannel === 'SMS'
+      ? String((campaign.content as { body?: string })?.body ?? '')
+      : '';
+    const quote = paidChannel === 'SMS'
+      ? await smsWalletService.quoteSms(
+          orgId(),
+          customers.map(() => smsBody),
+        )
+      : await smsWalletService.quote(orgId(), paidChannel, customers.length);
     if (!quote.enabled) {
       throw new AppError(
         'CHANNEL_DELIVERY_DISABLED',
@@ -261,6 +305,65 @@ export const campaignService = {
 
     const selectedIds = content.audience === 'SELECTED' ? content.recipientIds ?? [] : undefined;
     const customers = await this.reachableCustomers(channel, selectedIds);
+
+    /*
+     * SMS goes through the SMS module rather than one message at a time.
+     *
+     * That path reserves the whole cost before anything leaves, drops anyone
+     * who has opted out, refuses an unapproved Sender ID, and refunds what the
+     * provider rejects. Looping `sendToCustomer` here would bypass every one
+     * of those — most importantly the reservation, which is what stops a
+     * campaign stranding half-sent when the balance runs out.
+     */
+    if (channel === 'SMS') {
+      const outcome = await smsSendService.send({
+        organizationId: orgId(),
+        template: body + (imageUrl ? `\n\n${imageUrl}` : ''),
+        route: 'PROMOTIONAL',
+        campaignId: id,
+        recipients: customers
+          .filter((c): c is typeof c & { phone: string } => Boolean(c.phone))
+          .map((c) => ({
+            phone: c.phone,
+            customerId: c.id,
+            variables: { firstName: c.firstName ?? '', lastName: c.lastName ?? '' },
+          })),
+      });
+
+      // Per-recipient rows so the campaign screen can show who it reached.
+      await prisma.campaignRecipient.createMany({
+        data: customers.slice(0, outcome.queued).map((c) => ({
+          campaignId: id,
+          customerId: c.id,
+          status: 'SENT' as const,
+          sentAt: new Date(),
+        })),
+        skipDuplicates: true,
+      });
+
+      const smsStats = {
+        total: customers.length,
+        sent: outcome.queued,
+        failed: outcome.rejected.length,
+        suppressed: outcome.suppressed,
+        segments: outcome.segments,
+        cost: outcome.cost,
+      };
+      if (outcome.queued > 0) {
+        const ent = await resolveEntitlements(orgId());
+        await usageService.increment(USAGE_METRICS.MARKETING_RECIPIENT, {
+          organizationId: orgId(),
+          periodStart: ent.periodStart,
+          periodEnd: ent.periodEnd,
+        }, outcome.queued);
+      }
+      return prisma.campaign.update({
+        where: { id },
+        data: { status: 'SENT', completedAt: new Date(), stats: smsStats },
+        select: campaignSelect,
+      });
+    }
+
     let sent = 0;
     let failed = 0;
     for (const c of customers) {

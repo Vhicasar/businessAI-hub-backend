@@ -71,6 +71,12 @@ export function signState(payload: StatePayload): string {
 }
 
 export function verifyState(state: string): StatePayload {
+  // A provider that redirects back without state, or a hand-made callback,
+  // must get the same clean refusal as a malformed one — not a TypeError
+  // surfacing as a 500 and looking like our bug rather than a bad callback.
+  if (typeof state !== 'string' || state.length === 0) {
+    throw new AppError('OAUTH_STATE_INVALID', 400, 'Missing sign-in state.');
+  }
   const [body, sig] = state.split('.');
   if (!body || !sig) throw new AppError('OAUTH_STATE_INVALID', 400, 'Malformed sign-in state.');
   const expected = createHmac('sha256', stateSecret()).update(body).digest('base64url');

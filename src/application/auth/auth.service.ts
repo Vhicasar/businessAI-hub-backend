@@ -21,6 +21,8 @@ import { mailer } from '../../infrastructure/mail/mailer';
 import { SYSTEM_ROLE_TEMPLATES, OWNER_ROLE_NAME } from '../../shared/permissions';
 import { PLAN_CATALOG } from '../../shared/plans';
 import { modulesFor } from '../modules/business-modules';
+import { channelPolicy, isChannelEnabled } from '../settings/workspace-config';
+import { supportedChannels } from '../../infrastructure/channels/registry';
 import { resolveEntitlements } from '../billing/entitlements';
 import { resolveLocale } from '../../shared/currency';
 import { tokenService } from './token.service';
@@ -817,12 +819,33 @@ export const authService = {
       user.memberships.map(async (m) => [m.organization.id, await modulesFor(m.organization.id)] as const),
     );
     const modulesByOrg = new Map(moduleEntries);
+    /*
+     * The communication channels the platform is offering.
+     *
+     * Same reasoning as modules: switching SMS off in the admin has to reach
+     * the menu, and a menu that works this out for itself is one that will
+     * eventually disagree with the API behind it. Platform-wide rather than
+     * per-membership, because the policy is set once for the deployment.
+     */
+    const availableChannels = supportedChannels().filter((channelType) => {
+      // Two different switches. `communication.*Enabled` says whether a medium
+      // is offered at all, which is what the menu should follow; the channel
+      // policy governs connecting inbox instances of it. A menu driven by the
+      // latter disappeared when an administrator only meant to stop new
+      // connections.
+      if (channelType === 'SMS') return isChannelEnabled('SMS');
+      if (channelType === 'EMAIL') return isChannelEnabled('EMAIL');
+      if (channelType === 'WHATSAPP') return isChannelEnabled('WHATSAPP');
+      if (channelType === 'WEB_CHAT') return isChannelEnabled('WEB_CHAT');
+      return channelPolicy(channelType).available;
+    });
     return {
       ...user,
       memberships: user.memberships.map((m) => ({
         ...m,
         features: featuresByOrg.get(m.organization.id) ?? [],
         modules: modulesByOrg.get(m.organization.id) ?? [],
+        channels: availableChannels,
         organization: {
           id: m.organization.id,
           name: m.organization.name,

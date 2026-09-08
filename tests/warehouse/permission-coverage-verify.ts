@@ -43,9 +43,20 @@ function parseRoutes(): Route[] {
   const out: Route[] = [];
   for (const file of routeFiles) {
     const src = readFileSync(`${V1}/${file}`, 'utf8');
-    const routerUse = [...src.matchAll(/\w+Routes\.use\(([^)]*)\)/g)].map((m) => m[1]).join(' ');
-    const useHasPermission = /requirePermission/.test(routerUse);
-    const serviceKeyed = /requireServiceKey/.test(routerUse);
+    /*
+     * Router-level guards, kept per router rather than pooled per file.
+     *
+     * One file can define both a tenant router and a super-admin one — SMS
+     * does — and pooling their `.use()` calls would let a guard on either mark
+     * every route in the file as protected.
+     */
+    const routerGuards = new Map<string, string>();
+    for (const use of src.matchAll(/(\w+Routes)\.use\(([^)]*)\)/g)) {
+      routerGuards.set(use[1]!, `${routerGuards.get(use[1]!) ?? ''} ${use[2]}`);
+    }
+    const serviceKeyed = /requireServiceKey/.test(
+      [...routerGuards.values()].join(' '),
+    );
     // Guards are often named and reused: `const canInvite = requirePermission(…)`.
     const guardNames = [...src.matchAll(/const (\w+)\s*=\s*requirePermission\(/g)].map((m) => m[1]);
 
@@ -55,11 +66,16 @@ function parseRoutes(): Route[] {
       const tail = src.slice(m.index, m.index + 1200);
       const handlerAt = tail.search(/wrap\(|async \(req|\bc\.\w+/);
       const chain = handlerAt > 0 ? tail.slice(0, handlerAt) : tail.slice(0, 400);
+      const onRouter = routerGuards.get(m[1]!) ?? '';
       out.push({
         file, method: m[2]!.toUpperCase(), path: m[3]!,
         permission:
           /requirePermission/.test(chain) ||
-          useHasPermission ||
+          /requirePermission/.test(onRouter) ||
+          // A super-admin router is guarded more strictly than any permission
+          // could be: platform staff only, no tenant reaches it at all.
+          /requireSuperAdmin/.test(chain) ||
+          /requireSuperAdmin/.test(onRouter) ||
           guardNames.some((n) => new RegExp(`\\b${n}\\b`).test(chain)),
         serviceKeyed,
       });

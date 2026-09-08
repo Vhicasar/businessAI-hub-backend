@@ -27,6 +27,8 @@ import { manufacturingRoutes } from './presentation/http/v1/manufacturing.routes
 import { manufacturingQualityRoutes } from './presentation/http/v1/manufacturing-quality.routes';
 import { manufacturingAssetsRoutes } from './presentation/http/v1/manufacturing-assets.routes';
 import { documentsRoutes } from './presentation/http/v1/documents.routes';
+import { smsAdminRoutes, smsRoutes } from './presentation/http/v1/sms.routes';
+import { mockMessagingRoutes } from './presentation/http/v1/mock-messaging.routes';
 import { modulesRoutes } from './presentation/http/v1/modules.routes';
 import { suppliersRoutes } from './presentation/http/v1/suppliers.routes';
 import { purchaseOrdersRoutes } from './presentation/http/v1/purchase-orders.routes';
@@ -45,6 +47,8 @@ import { employeesRoutes } from './presentation/http/v1/employees.routes';
 import { crmRoutes } from './presentation/http/v1/crm.routes';
 import { inboxRoutes } from './presentation/http/v1/inbox.routes';
 import { webhookRoutes } from './presentation/http/webhooks.routes';
+import { smsWebhookRoutes } from './presentation/http/sms-webhooks.routes';
+import { channelOAuthRoutes } from './presentation/http/channel-oauth.routes';
 import { webchatRoutes } from './presentation/http/webchat.routes';
 import { payRoutes } from './presentation/http/pay.routes';
 import { appointmentsPublicRoutes } from './presentation/http/appointments.routes';
@@ -164,6 +168,22 @@ export function createApp(): Express {
   v1.use('/manufacturing', manufacturingAssetsRoutes);
   // Scannable documents — one resolver for every QR the mobile app can read.
   v1.use('/documents', documentsRoutes);
+
+  v1.use('/sms', smsRoutes);
+  // Platform-only: the Sender ID approval queue.
+  v1.use('/admin/sms', smsAdminRoutes);
+
+  /*
+   * Provider simulation, for development and demos.
+   *
+   * Never mounted in production: the real channels are the only way messages
+   * should enter a live inbox. Inside, every route still requires a signed-in
+   * member with channel permissions — it simulates the provider, not the
+   * tenant.
+   */
+  if (!env.isProd) {
+    v1.use('/mock/messaging', mockMessagingRoutes);
+  }
   v1.use('/suppliers', suppliersRoutes);
   v1.use('/purchase-orders', purchaseOrdersRoutes);
   v1.use('/requisitions', requisitionsRoutes);
@@ -269,6 +289,14 @@ export function createApp(): Express {
   app.use('/api/webhooks/paystack', paystackWebhookRoutes);
   app.use('/api/webhooks/flutterwave', flutterwaveWebhookRoutes);
   app.use('/api/webhooks/stripe', stripeWebhookRoutes);
+
+  // Channel OAuth callbacks. Public by necessity — the provider redirects a
+  // browser here with no session; the signed `state` carries the tenant.
+  app.use('/api/v1/channels', channelOAuthRoutes);
+
+  // SMS delivery receipts. Mounted before the generic channel receiver so its
+  // specific path wins.
+  app.use('/api/webhooks/sms', smsWebhookRoutes);
 
   // Public provider webhooks (adapter-verified, not JWT-authenticated).
   app.use('/api/webhooks', webhookRoutes);

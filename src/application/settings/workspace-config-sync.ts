@@ -39,6 +39,11 @@ export async function syncWorkspaceConfigFromAdmin(): Promise<boolean> {
       storage: cfg.storage,
       limits: cfg.limits,
       integrations: cfg.integrations,
+      // Was omitted, so the admin's per-channel policy never reached the
+      // product: unticking a channel saved cleanly in admin and changed
+      // nothing here. Everything downstream — availability, included
+      // quantities, add-ons, plan gating — reads this.
+      channels: cfg.channels,
     });
     logger.info('Workspace config synced from admin');
     return true;
