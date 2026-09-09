@@ -73,6 +73,11 @@ function startGraphStub(): Promise<number> {
           }
           return json(200, { access_token: 'USER-TOKEN', token_type: 'bearer' });
         }
+        if (url.pathname.endsWith('/debug_token')) {
+          return json(200, { data: { granular_scopes: [
+            { scope: 'whatsapp_business_management', target_ids: ['waba-1'] },
+          ] } });
+        }
         // The businesses the user administers, and their WABAs.
         if (url.pathname.endsWith('/me/businesses')) {
           return json(200, { data: [{ id: 'biz-1', name: 'Eleganz Collections' }] });
@@ -151,6 +156,8 @@ async function main() {
       parsed.searchParams.get('redirect_uri') === 'https://hub.test.vhicasar.com/api/v1/channels/whatsapp/callback');
     check('with the WhatsApp scopes',
       (parsed.searchParams.get('scope') ?? '').includes('whatsapp_business_messaging'));
+    check('standard OAuth asks for business management so it can list WABAs',
+      (parsed.searchParams.get('scope') ?? '').includes('business_management'));
     check('and an unguessable state', typeof state === 'string' && state.length >= 16);
     waState = state;
 

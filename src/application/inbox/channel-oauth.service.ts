@@ -29,8 +29,10 @@ const graph = () => env.meta.graphUrl;
 /** Which channels can be connected by OAuth, and what each needs from Meta. */
 const OAUTH_CHANNELS: Partial<Record<ChannelType, { scopes: string[]; label: string }>> = {
   WHATSAPP: {
-    // Embedded Signup returns a WABA the business either has or creates inline.
-    scopes: ['whatsapp_business_management', 'whatsapp_business_messaging', 'business_management'],
+    // WABA assets are resolved from the token's granular targets. Requiring
+    // business_management merely to enumerate /me/businesses makes Embedded
+    // Signup fail for otherwise valid WhatsApp-only grants.
+    scopes: ['whatsapp_business_management', 'whatsapp_business_messaging'],
     label: 'WhatsApp Business',
   },
   FACEBOOK_MESSENGER: {
@@ -119,11 +121,19 @@ export function authorizationUrl(input: {
     issuedAt: Date.now(),
   });
 
+  const scopes = [...config.scopes];
+  // Standard Facebook OAuth does not return Embedded Signup asset target ids,
+  // so it needs Business Management access to enumerate /me/businesses and
+  // then the selected portfolio's owned WABAs. Keep that broader permission
+  // out of the Embedded Signup path, where granular targets are available.
+  if (input.channelType === 'WHATSAPP' && !env.meta.whatsappConfigId) {
+    scopes.push('business_management');
+  }
   const params = new URLSearchParams({
     client_id: metaApp().appId,
     redirect_uri: callbackUrl(input.channelType),
     state,
-    scope: config.scopes.join(','),
+    scope: scopes.join(','),
     response_type: 'code',
   });
   // WhatsApp uses Embedded Signup, which is the same OAuth dialog driven by a
@@ -229,11 +239,41 @@ async function resolveWhatsApp(
   userToken: string,
   tokenExpiresAt: string | null,
 ): Promise<Pick<ResolvedConnection, 'externalId' | 'displayName' | 'credentials' | 'metadata'>> {
-  const businesses = await graphGet<{ data?: { id: string; name?: string }[] }>(
-    '/me/businesses?fields=id,name',
-    userToken,
-  );
+  // Facebook Login for Business records the assets selected in Embedded
+  // Signup as granular-scope target ids. This is both more precise and less
+  // privileged than listing every Business portfolio the person administers.
+  const app = metaApp();
+  const debugParams = new URLSearchParams({
+    input_token: userToken,
+    access_token: `${app.appId}|${app.appSecret}`,
+  });
+  const debugRes = await fetch(`${graph()}/debug_token?${debugParams.toString()}`);
+  const debug = (await debugRes.json().catch(() => ({}))) as {
+    data?: { granular_scopes?: { scope?: string; target_ids?: string[] }[] };
+  };
+  const grantedWabaIds = debugRes.ok
+    ? [...new Set(
+        (debug.data?.granular_scopes ?? [])
+          .filter((grant) => grant.scope === 'whatsapp_business_management' || grant.scope === 'whatsapp_business_messaging')
+          .flatMap((grant) => grant.target_ids ?? []),
+      )]
+    : [];
+
+  const businesses = grantedWabaIds.length
+    ? { data: [] as { id: string; name?: string }[] }
+    : await graphGet<{ data?: { id: string; name?: string }[] }>(
+        '/me/businesses?fields=id,name',
+        userToken,
+      ).catch((error) => {
+        throw new AppError(
+          'CHANNEL_OAUTH_INCOMPLETE',
+          400,
+          'Meta did not grant a WhatsApp Business account to this connection. Add whatsapp_business_management and whatsapp_business_messaging to the Embedded Signup configuration, then reconnect.',
+          { cause: error instanceof AppError ? error.code : 'META_PERMISSION_MISSING' },
+        );
+      });
   const wabas: { id: string; name?: string; businessId: string }[] = [];
+  wabas.push(...grantedWabaIds.map((id) => ({ id, businessId: '' })));
   for (const business of businesses.data ?? []) {
     const owned = await graphGet<{ data?: { id: string; name?: string }[] }>(
       `/${business.id}/owned_whatsapp_business_accounts?fields=id,name`,
@@ -275,7 +315,7 @@ async function resolveWhatsApp(
     },
     metadata: {
       wabaId: waba.id,
-      businessId: waba.businessId,
+      businessId: waba.businessId || null,
       phoneNumberId: number.id,
       wabaName: waba.name ?? null,
       displayPhoneNumber: number.display_phone_number ?? null,
