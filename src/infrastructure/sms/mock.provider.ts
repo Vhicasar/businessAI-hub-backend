@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import type {
   BulkSendResult,
   DeliveryReport,
@@ -8,6 +8,7 @@ import type {
   SmsProvider,
   WebhookRequest,
 } from '../../application/sms/sms-provider';
+import { env } from '../../shared/config/env';
 import { logger } from '../../shared/logger';
 
 /**
@@ -77,13 +78,25 @@ export class MockSmsProvider implements SmsProvider {
   }
 
   /**
-   * Accepts any webhook.
+   * Verifies a signature when one is configured, and only then.
    *
-   * Safe only because this provider is never the one running in production —
-   * the registry refuses to select it there.
+   * It used to accept anything on the reasoning that this provider never runs
+   * in production. True, but it meant a deployment that had set
+   * SMS_WEBHOOK_SECRET — staging, a demo, a developer testing the real
+   * flow — silently had no verification at all, and a forged receipt could
+   * mark messages delivered. Now the secret is honoured wherever it is set,
+   * and the permissive path is reserved for a deployment that has genuinely
+   * configured nothing.
    */
-  verifyWebhook(_req: WebhookRequest): boolean {
-    return true;
+  verifyWebhook(req: WebhookRequest): boolean {
+    const secret = env.sms.webhookSecret;
+    if (!secret) return true;
+    const header = req.headers['x-vhicasar-signature'];
+    if (typeof header !== 'string' || !req.rawBody) return false;
+    const expected = createHmac('sha256', secret).update(req.rawBody).digest('hex');
+    const a = Buffer.from(header);
+    const b = Buffer.from(expected);
+    return a.length === b.length && timingSafeEqual(a, b);
   }
 
   parseWebhook(body: unknown): DeliveryReport[] {

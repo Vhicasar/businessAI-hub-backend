@@ -8,7 +8,18 @@ export interface AiCompletionOptions {
   temperature?: number;
   /** Hint that the answer must be a single JSON object. */
   jsonMode?: boolean;
+  /** Explicit provenance of every item used to construct this request. */
+  dataSources: AiDataSource[];
 }
+
+export const AI_DATA_SOURCES = {
+  USER_PROVIDED: 'user_provided',
+  VHICASAR_BUSINESS: 'vhicasar_business',
+  PUBLIC: 'public',
+  GOOGLE_API: 'google_api',
+} as const;
+
+export type AiDataSource = (typeof AI_DATA_SOURCES)[keyof typeof AI_DATA_SOURCES];
 
 /**
  * Provider-agnostic LLM port. Feature services depend on this interface only;

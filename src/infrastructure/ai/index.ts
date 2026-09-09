@@ -1,7 +1,8 @@
-import type { AiProvider } from '../../application/ai/ai-provider';
+import { AI_DATA_SOURCES, type AiProvider } from '../../application/ai/ai-provider';
 import { env } from '../../shared/config/env';
 import { requestContext } from '../../shared/context';
 import { logger } from '../../shared/logger';
+import { AppError } from '../../shared/errors';
 import { AnthropicProvider } from './anthropic.provider';
 import { OpenAiCompatibleProvider } from './openai.provider';
 
@@ -68,6 +69,20 @@ export function meterProvider(
     },
     async complete(messages, completionOpts) {
       const organizationId = opts.organizationId ?? requestContext.get()?.organizationId;
+      const dataSources = [...new Set(completionOpts?.dataSources ?? [])];
+      const audit = {
+        event: 'ai_data_policy_decision', organizationId, feature,
+        provider: provider.name, model: provider.model ?? 'unknown', dataSources,
+      };
+      if (dataSources.length === 0) {
+        logger.warn({ ...audit, decision: 'blocked', reason: 'unclassified_input' }, 'AI request blocked by data policy');
+        throw new AppError('AI_DATA_POLICY_BLOCKED', 422, 'AI input has not been classified and cannot be processed.');
+      }
+      if (dataSources.includes(AI_DATA_SOURCES.GOOGLE_API)) {
+        logger.warn({ ...audit, decision: 'blocked', reason: 'google_api_data' }, 'AI request blocked by data policy');
+        throw new AppError('AI_GOOGLE_DATA_RESTRICTED', 422, 'Google API data cannot be processed by the configured third-party AI provider.');
+      }
+      logger.info({ ...audit, decision: 'allowed', reason: 'eligible_non_google_data' }, 'AI request allowed by data policy');
       try {
         const text = await provider.complete(messages, completionOpts);
         if (recordUsage && organizationId) {
@@ -137,8 +152,14 @@ function build(src: AiConfigSource): AiProvider | null {
     case 'ollama':
     case 'vllm':
     case 'gemini':
+    case 'deepseek':
     case 'custom':
-      return new OpenAiCompatibleProvider(src.apiKey ?? '', src.model || 'gpt-4o-mini', src.baseUrl || undefined);
+      return new OpenAiCompatibleProvider(
+        src.apiKey ?? '',
+        src.model || (src.provider === 'deepseek' ? 'deepseek-chat' : 'gpt-4o-mini'),
+        src.baseUrl || (src.provider === 'deepseek' ? 'https://api.deepseek.com/v1' : undefined),
+        src.provider,
+      );
     default:
       return null;
   }

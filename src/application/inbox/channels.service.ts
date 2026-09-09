@@ -77,6 +77,15 @@ function deriveExternalId(dto: ConnectChannelDto): string {
   }
 }
 
+function metaRoutingFields(channelType: string, credentials: Record<string, string>) {
+  return {
+    metaWabaId: channelType === 'WHATSAPP' ? credentials.wabaId || null : null,
+    metaPhoneNumberId: channelType === 'WHATSAPP' ? credentials.phoneNumberId || null : null,
+    metaFacebookPageId: channelType === 'FACEBOOK_MESSENGER' || channelType === 'INSTAGRAM' ? credentials.pageId || null : null,
+    metaInstagramAccountId: channelType === 'INSTAGRAM' ? credentials.instagramAccountId || null : null,
+  };
+}
+
 export type ConnectChannelDto = z.infer<typeof connectChannelSchema>;
 
 const accountSelect = {
@@ -209,6 +218,7 @@ export const channelsService = {
         externalId,
         credentialsEnc: encrypt(JSON.stringify(dto.credentials)),
         webhookSecret,
+        ...metaRoutingFields(dto.channelType, dto.credentials),
       },
     });
 
@@ -225,7 +235,12 @@ export const channelsService = {
       },
     });
 
-    const webhookUrl = `${env.API_BASE_URL}/api/webhooks/${dto.channelType.toLowerCase()}/${account.id}`;
+    const stableMetaPath: Partial<Record<ConnectChannelDto['channelType'], string>> = {
+      WHATSAPP: 'whatsapp', FACEBOOK_MESSENGER: 'messenger', INSTAGRAM: 'instagram',
+    };
+    const webhookUrl = stableMetaPath[dto.channelType]
+      ? `${env.API_BASE_URL}/api/webhooks/${stableMetaPath[dto.channelType]}`
+      : `${env.API_BASE_URL}/api/webhooks/${dto.channelType.toLowerCase()}/${account.id}`;
     let setupNote: string | null = null;
     if (dto.channelType === 'WEB_CHAT') {
       setupNote =
@@ -308,6 +323,7 @@ export const channelsService = {
             status: 'CONNECTED',
             lastError: null,
             lastErrorAt: null,
+            ...metaRoutingFields(channelType, connection.credentials),
           },
         })
       : await prisma.channelAccount.create({
@@ -323,6 +339,7 @@ export const channelsService = {
             credentialsEnc: encrypt(JSON.stringify(connection.credentials)),
             metadata: connection.metadata as never,
             webhookSecret,
+            ...metaRoutingFields(channelType, connection.credentials),
           },
         });
 

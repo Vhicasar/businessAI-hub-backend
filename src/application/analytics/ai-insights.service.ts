@@ -130,7 +130,7 @@ export const aiInsightsService = {
             },
             { role: 'user', content: `Period: ${range.days} days.\nSnapshot: ${JSON.stringify(snapshot)}` },
           ],
-          { maxTokens: 600, temperature: 0.4 },
+          { maxTokens: 600, temperature: 0.4, dataSources: ['vhicasar_business'] },
         );
         const p = JSON.parse(extractJson(raw)) as typeof heuristics;
         narrative = {

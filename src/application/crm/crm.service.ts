@@ -55,7 +55,7 @@ async function summarizeClose(
               `Rep summary: ${context.outcomeSummary}`,
           },
         ],
-        { maxTokens: 120, temperature: 0.3 },
+        { maxTokens: 120, temperature: 0.3, dataSources: ['vhicasar_business'] },
       )
     ).trim();
     return summary || fallback;

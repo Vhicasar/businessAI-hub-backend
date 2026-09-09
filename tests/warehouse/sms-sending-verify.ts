@@ -231,6 +231,29 @@ async function main() {
       !provider.outbox.some((o) => o.to === '+2348030050001'));
   });
 
+  console.log('\nAn opt-out matches however the number was written');
+  await as(async () => {
+    // Recorded in local form, as an agent would type it off a phone call.
+    await smsSendService.suppress(orgId, '08030050002', 'Asked to stop');
+    const stored = await db.smsSuppression.findFirst({
+      where: { organizationId: orgId, reason: 'Asked to stop' },
+      select: { phone: true },
+    });
+    check('it is stored in the form the send path checks',
+      stored?.phone === '+2348030050002',
+      `stored as ${stored?.phone}`);
+
+    // Sent to in international form — the same person.
+    const preview = await smsSendService.preview({
+      organizationId: orgId,
+      template: 'Sale today',
+      recipients: [{ phone: '+234 803 005 0002' }],
+      route: 'PROMOTIONAL',
+    });
+    check('and the same person is still excluded', preview.suppressed === 1,
+      'stored as typed, an opt-out never matched what a send resolves to');
+  });
+
   console.log('\nBut a transactional message still reaches them');
   await as(async () => {
     provider.outbox.length = 0;

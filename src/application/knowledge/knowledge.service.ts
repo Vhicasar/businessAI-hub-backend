@@ -235,7 +235,9 @@ export const knowledgeService = {
       ...history.slice(-6),
       { role: 'user', content: question },
     ];
-    const answer = (await provider.complete(messages, { maxTokens: 400, temperature: 0.3 })).trim();
+    const answer = (await provider.complete(messages, {
+      maxTokens: 400, temperature: 0.3, dataSources: ['user_provided', 'vhicasar_business'],
+    })).trim();
     const sources = [...new Map(hits.map((h) => [h.title, { title: h.title, url: h.url }])).values()];
     return { answer, sources, grounded: hits.length > 0 };
   },

@@ -116,7 +116,7 @@ export const designService = {
         },
         { role: 'user', content: prompt },
       ],
-      { maxTokens: 300, temperature: 0.7, jsonMode: true },
+      { maxTokens: 300, temperature: 0.7, jsonMode: true, dataSources: ['user_provided', 'vhicasar_business'] },
     );
     const g = extractJson<{ bg?: string; headline?: string; subheading?: string; cta?: string; headlineColor?: string; textColor?: string; ctaBg?: string }>(raw);
     if (!g?.headline) throw new ValidationError('The AI could not generate a design — try a clearer brief');

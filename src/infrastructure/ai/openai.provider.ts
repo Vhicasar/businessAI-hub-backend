@@ -20,7 +20,7 @@ interface SendResult {
 }
 
 export class OpenAiCompatibleProvider implements AiProvider {
-  readonly name = 'openai';
+  readonly name: string;
 
   private usage: { promptTokens: number; completionTokens: number } | null = null;
   get lastUsage() {
@@ -31,14 +31,16 @@ export class OpenAiCompatibleProvider implements AiProvider {
   constructor(
     private readonly apiKey: string,
     readonly model: string,
-    baseUrl?: string
+    baseUrl?: string,
+    providerName = 'openai',
   ) {
+    this.name = providerName;
     this.baseUrl = (baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '');
   }
 
   private readonly baseUrl: string;
 
-  async complete(messages: AiMessage[], opts: AiCompletionOptions = {}): Promise<string> {
+  async complete(messages: AiMessage[], opts: AiCompletionOptions): Promise<string> {
     const maxTokens = opts.maxTokens ?? 1024;
     const base: Record<string, unknown> = {
       model: this.model,

@@ -107,6 +107,9 @@ export const calendarSync = {
           externalEventId: event.id ? String(event.id) : meeting.externalEventId,
           externalUrl: event.htmlLink ? String(event.htmlLink) : null,
           externalSyncedAt: new Date(),
+          // The event id/link came from Google's response. Keep that origin
+          // attached after storage, copying, and later database reads.
+          dataSource: 'GOOGLE_API_MIXED',
         },
       });
     } catch (err) {

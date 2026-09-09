@@ -99,7 +99,7 @@ async function gatherContext(conversationId: string) {
           where: { customerId, startAt: { gte: new Date() } },
           orderBy: { startAt: 'asc' },
           take: 3,
-          select: { title: true, startAt: true, location: true, status: true },
+          select: { title: true, startAt: true, location: true, status: true, dataSource: true },
         })
       : [],
     customerId
@@ -215,7 +215,13 @@ export const replySuggestions = {
       },
     ];
 
-    const raw = await provider.complete(messages, { maxTokens: 900, temperature: 0.55, jsonMode: true });
+    const hasGoogleData = ctx.appointments.some((appointment) => appointment.dataSource === 'GOOGLE_API_MIXED');
+    const raw = await provider.complete(messages, {
+      maxTokens: 900, temperature: 0.55, jsonMode: true,
+      dataSources: hasGoogleData
+        ? ['user_provided', 'vhicasar_business', 'google_api']
+        : ['user_provided', 'vhicasar_business'],
+    });
     const parsed = extractJson<{ replies?: { tone?: string; content?: string }[] }>(raw);
 
     const drafts = (parsed?.replies ?? [])

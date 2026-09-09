@@ -65,6 +65,9 @@ function metaApp(): { appId: string; appSecret: string } {
   };
 }
 
+/** Used by the application-level webhook receiver; never returned to clients. */
+export const metaAppSecret = (): string => metaApp().appSecret;
+
 /** Whether a Meta app is configured at all, from either source. */
 export function metaConfigured(): boolean {
   const { appId, appSecret } = metaApp();
@@ -169,7 +172,7 @@ async function graphGet<T>(path: string, token: string): Promise<T> {
 }
 
 /** Swap the one-time code for a token that belongs to this business. */
-async function exchangeCode(code: string, channelType: ChannelType): Promise<string> {
+async function exchangeCode(code: string, channelType: ChannelType): Promise<{ accessToken: string; expiresAt: string | null }> {
   const params = new URLSearchParams({
     client_id: metaApp().appId,
     client_secret: metaApp().appSecret,
@@ -177,7 +180,7 @@ async function exchangeCode(code: string, channelType: ChannelType): Promise<str
     code,
   });
   const res = await fetch(`${graph()}/oauth/access_token?${params.toString()}`);
-  const json = (await res.json()) as { access_token?: string; error?: { message?: string } };
+  const json = (await res.json()) as { access_token?: string; expires_in?: number; error?: { message?: string } };
   if (!res.ok || !json.access_token) {
     throw new AppError(
       'CHANNEL_OAUTH_FAILED',
@@ -185,7 +188,10 @@ async function exchangeCode(code: string, channelType: ChannelType): Promise<str
       json.error?.message ?? 'Meta would not complete the connection.',
     );
   }
-  return json.access_token;
+  return {
+    accessToken: json.access_token,
+    expiresAt: json.expires_in ? new Date(Date.now() + json.expires_in * 1000).toISOString() : null,
+  };
 }
 
 /**
@@ -204,7 +210,7 @@ export async function completeCallback(input: {
     throw new AppError('OAUTH_STATE_INVALID', 400, 'This connection link is for a different channel.');
   }
 
-  const userToken = await exchangeCode(input.code, input.channelType);
+  const token = await exchangeCode(input.code, input.channelType);
   const base = {
     organizationId: payload.organizationId,
     userId: payload.userId,
@@ -213,26 +219,27 @@ export async function completeCallback(input: {
   };
 
   if (input.channelType === 'WHATSAPP') {
-    return { ...base, ...(await resolveWhatsApp(userToken)) };
+    return { ...base, ...(await resolveWhatsApp(token.accessToken, token.expiresAt)) };
   }
-  return { ...base, ...(await resolvePage(userToken, input.channelType)) };
+  return { ...base, ...(await resolvePage(token.accessToken, input.channelType, token.expiresAt)) };
 }
 
 /** The WABA and phone number the business picked during Embedded Signup. */
 async function resolveWhatsApp(
   userToken: string,
+  tokenExpiresAt: string | null,
 ): Promise<Pick<ResolvedConnection, 'externalId' | 'displayName' | 'credentials' | 'metadata'>> {
   const businesses = await graphGet<{ data?: { id: string; name?: string }[] }>(
     '/me/businesses?fields=id,name',
     userToken,
   );
-  const wabas: { id: string; name?: string }[] = [];
+  const wabas: { id: string; name?: string; businessId: string }[] = [];
   for (const business of businesses.data ?? []) {
     const owned = await graphGet<{ data?: { id: string; name?: string }[] }>(
       `/${business.id}/owned_whatsapp_business_accounts?fields=id,name`,
       userToken,
     ).catch(() => ({ data: [] as { id: string; name?: string }[] }));
-    wabas.push(...(owned.data ?? []));
+    wabas.push(...(owned.data ?? []).map((waba) => ({ ...waba, businessId: business.id })));
   }
   const waba = wabas[0];
   if (!waba) {
@@ -267,8 +274,12 @@ async function resolveWhatsApp(
       appSecret: metaApp().appSecret,
     },
     metadata: {
+      wabaId: waba.id,
+      businessId: waba.businessId,
+      phoneNumberId: number.id,
       wabaName: waba.name ?? null,
       displayPhoneNumber: number.display_phone_number ?? null,
+      tokenExpiresAt,
       connectedVia: 'meta_embedded_signup',
     },
   };
@@ -278,6 +289,7 @@ async function resolveWhatsApp(
 async function resolvePage(
   userToken: string,
   channelType: ChannelType,
+  tokenExpiresAt: string | null,
 ): Promise<Pick<ResolvedConnection, 'externalId' | 'displayName' | 'credentials' | 'metadata'>> {
   const pages = await graphGet<{
     data?: {
@@ -321,8 +333,11 @@ async function resolvePage(
         appSecret: metaApp().appSecret,
       },
       metadata: {
+        facebookPageId: linked.id,
+        instagramAccountId: ig.id,
         pageName: linked.name ?? null,
         username: ig.username ?? null,
+        tokenExpiresAt,
         connectedVia: 'meta_oauth',
       },
     };
@@ -337,7 +352,7 @@ async function resolvePage(
       pageId: page.id,
       appSecret: metaApp().appSecret,
     },
-    metadata: { pageName: page.name ?? null, connectedVia: 'meta_oauth' },
+    metadata: { facebookPageId: page.id, pageName: page.name ?? null, tokenExpiresAt, connectedVia: 'meta_oauth' },
   };
 }
 

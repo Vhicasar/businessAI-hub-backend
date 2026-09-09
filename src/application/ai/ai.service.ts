@@ -419,7 +419,7 @@ export const aiService = {
           .map((m) => ({ role: m.role, content: m.content.slice(0, 2_000) })),
         { role: 'user', content: prompt },
       ],
-      { maxTokens: 450, temperature: 0.35 },
+      { maxTokens: 450, temperature: 0.35, dataSources: ['user_provided', 'vhicasar_business'] },
     )).trim();
 
     const lower = `${prompt} ${reply}`.toLowerCase();
@@ -452,7 +452,7 @@ export const aiService = {
         content: `Customer: ${conversation.customer.firstName} ${conversation.customer.lastName ?? ''} · ${conversation.customer.totalOrders} past orders.\n\nConversation:\n${transcript}`,
       },
     ];
-    const summary = (await provider.complete(messages, { maxTokens: 300 })).trim();
+    const summary = (await provider.complete(messages, { maxTokens: 300, dataSources: ['vhicasar_business'] })).trim();
 
     await prisma.conversation.update({
       where: { id: conversationId },
@@ -482,7 +482,7 @@ export const aiService = {
         content: `Channel: ${conversation.channelAccount.channelType}\nCustomer profile: ${conversation.customer.aiSummary ?? 'n/a'}\n\nConversation:\n${transcript}\n\nDraft the next agent reply.`,
       },
     ];
-    const suggestion = (await provider.complete(messages, { maxTokens: 250, temperature: 0.5 })).trim();
+    const suggestion = (await provider.complete(messages, { maxTokens: 250, temperature: 0.5, dataSources: ['vhicasar_business'] })).trim();
     return { suggestion };
   },
 
@@ -502,7 +502,7 @@ export const aiService = {
           },
           { role: 'user', content: lastMessage.slice(0, 1000) },
         ],
-        { maxTokens: 30, temperature: 0, jsonMode: true }
+        { maxTokens: 30, temperature: 0, jsonMode: true, dataSources: ['user_provided'] }
       );
       const parsed = extractJson<{ sentiment?: string }>(raw);
       const sentiment = parsed?.sentiment?.toUpperCase();
@@ -565,7 +565,7 @@ export const aiService = {
           },
           { role: 'user', content: JSON.stringify(facts) },
         ],
-        { maxTokens: 350 }
+        { maxTokens: 350, dataSources: ['vhicasar_business'] }
       )
     ).trim();
 
@@ -688,7 +688,14 @@ export const aiService = {
     // on ANY channel (spec #12) — not just the web-chat widget. Kept to a handful
     // of upcoming slots with their exact ISO start so booking is unambiguous.
     let apptCtx = '(booking not available)';
+    let availabilityUsesGoogleData = false;
     try {
+      availabilityUsesGoogleData = (await prisma.meeting.count({
+        where: {
+          dataSource: 'GOOGLE_API_MIXED', status: { not: 'CANCELLED' }, deletedAt: null,
+          startAt: { lt: new Date(Date.now() + 7 * 86_400_000) }, endAt: { gt: new Date() },
+        },
+      })) > 0;
       const av = await appointmentsService.availableSlots(conversation.organizationId, undefined, 7);
       if (av.enabled && av.slots.length > 0) {
         const typeList = av.types.length ? ` Types: ${av.types.map((t) => `${t.name} (${t.id})`).join(', ')}.` : '';
@@ -799,7 +806,12 @@ export const aiService = {
           content: `Customer: ${knownName || 'unknown name'} (${conversation.customer.totalOrders} past orders)\n\nConversation:\n${transcript}`,
         },
       ],
-      { maxTokens: 250, temperature: 0.4, jsonMode: true }
+      {
+        maxTokens: 250, temperature: 0.4, jsonMode: true,
+        dataSources: availabilityUsesGoogleData
+          ? ['user_provided', 'vhicasar_business', 'google_api']
+          : ['user_provided', 'vhicasar_business'],
+      }
     );
 
     const parsed = extractJson<{
@@ -1061,7 +1073,7 @@ export const aiService = {
           }),
         },
       ],
-      { maxTokens: 120, temperature: 0, jsonMode: true }
+      { maxTokens: 120, temperature: 0, jsonMode: true, dataSources: ['vhicasar_business'] }
     );
 
     const parsed = extractJson<{ score?: number; reason?: string }>(raw);
@@ -1119,7 +1131,7 @@ export const aiService = {
           }),
         },
       ],
-      { maxTokens: 120, temperature: 0, jsonMode: true }
+      { maxTokens: 120, temperature: 0, jsonMode: true, dataSources: ['vhicasar_business'] }
     );
 
     const parsed = extractJson<{ winProbability?: number; reason?: string }>(raw);
@@ -1192,7 +1204,7 @@ export const aiService = {
         },
         { role: 'user', content: JSON.stringify({ ...facts, engagement }) },
       ],
-      { maxTokens: 150, temperature: 0.3, jsonMode: true }
+      { maxTokens: 150, temperature: 0.3, jsonMode: true, dataSources: ['vhicasar_business'] }
     );
 
     const parsed = extractJson<{ action?: string; rationale?: string }>(raw);
@@ -1218,7 +1230,7 @@ export const aiService = {
           },
           { role: 'user', content: transcript },
         ],
-        { maxTokens: 250 },
+        { maxTokens: 250, dataSources: ['vhicasar_business'] },
       )
     ).trim();
     return { summary };
@@ -1246,7 +1258,7 @@ export const aiService = {
             content: `Ticket:\n${transcript}\n\nRelevant KB articles: ${articles.map((a) => a.title).join('; ') || 'none'}\n\nDraft the next reply.`,
           },
         ],
-        { maxTokens: 300, temperature: 0.5 },
+        { maxTokens: 300, temperature: 0.5, dataSources: ['vhicasar_business'] },
       )
     ).trim();
     return { suggestion, articles: articles.map((a) => ({ id: a.id, title: a.title })) };
@@ -1295,7 +1307,7 @@ export const aiService = {
           }),
         },
       ],
-      { maxTokens: 150, temperature: 0, jsonMode: true },
+      { maxTokens: 150, temperature: 0, jsonMode: true, dataSources: ['vhicasar_business'] },
     );
 
     const parsed = extractJson<{ score?: number; reason?: string }>(raw);

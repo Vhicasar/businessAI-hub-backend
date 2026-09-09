@@ -317,7 +317,7 @@ export const siteService = {
         },
         { role: 'user', content: prompt },
       ],
-      { maxTokens: 900, temperature: 0.6, jsonMode: true },
+      { maxTokens: 900, temperature: 0.6, jsonMode: true, dataSources: ['user_provided', 'vhicasar_business'] },
     );
     const parsed = extractJson<{ blocks?: { type?: string; props?: Record<string, unknown> }[] }>(raw);
     const allowed = new Set(['hero', 'features', 'richtext', 'cta', 'contactForm', 'image']);

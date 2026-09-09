@@ -200,7 +200,15 @@ export const concierge = {
             .map((m) => ({ role: m.role, content: m.content.slice(0, 1_500) })),
           { role: 'user', content: question },
         ],
-        { maxTokens: 350, temperature: 0.2 }
+        {
+          maxTokens: 350,
+          temperature: 0.2,
+          dataSources: [...grounding.upcoming.items, ...grounding.timeline.items].some(
+            (item) => 'dataSource' in item && item.dataSource === 'GOOGLE_API_MIXED',
+          )
+            ? ['user_provided', 'vhicasar_business', 'google_api']
+            : ['user_provided', 'vhicasar_business'],
+        }
       )
     ).trim();
 

@@ -15,7 +15,7 @@ export class AnthropicProvider implements AiProvider {
     readonly model: string
   ) {}
 
-  async complete(messages: AiMessage[], opts: AiCompletionOptions = {}): Promise<string> {
+  async complete(messages: AiMessage[], opts: AiCompletionOptions): Promise<string> {
     const system = messages
       .filter((m) => m.role === 'system')
       .map((m) => m.content)

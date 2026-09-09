@@ -1,4 +1,5 @@
 import type { ChannelType } from '@prisma/client';
+import { createHash } from 'crypto';
 import { env } from '../../shared/config/env';
 import type {
   ChannelAccountRef,
@@ -28,6 +29,7 @@ interface MetaMessagingEvent {
     is_echo?: boolean;
     attachments?: { type?: string; payload?: { url?: string } }[];
   };
+  postback?: { title?: string; payload?: string };
 }
 
 interface MetaWebhookBody {
@@ -66,6 +68,19 @@ export class MetaMessagingAdapter implements ChannelAdapter {
       for (const event of entry.messaging ?? []) {
         const senderId = event.sender?.id;
         const msg = event.message;
+        if (senderId && event.postback) {
+          const content = event.postback.payload || event.postback.title || 'postback';
+          const digest = createHash('sha256').update(`${senderId}:${event.timestamp ?? 0}:${content}`).digest('hex').slice(0, 32);
+          out.push({
+            providerMessageId: `postback.${digest}`,
+            senderExternalId: senderId,
+            sentAt: event.timestamp ? new Date(event.timestamp) : undefined,
+            contentType: 'TEXT',
+            text: event.postback.title || event.postback.payload || 'Postback',
+            raw: event,
+          });
+          continue;
+        }
         if (!senderId || !msg?.mid || msg.is_echo) continue; // echoes = our own sends
 
         const base = {
@@ -220,7 +235,7 @@ export class MetaMessagingAdapter implements ChannelAdapter {
     return { providerMessageId: json.message_id };
   }
 
-  async onAccountConnected(account: ChannelAccountRef, webhookUrl: string): Promise<string | null> {
+  async onAccountConnected(account: ChannelAccountRef, _webhookUrl: string): Promise<string | null> {
     const res = await fetch(
       `${graph()}/me?access_token=${encodeURIComponent(account.credentials.pageAccessToken ?? '')}`
     );
@@ -228,10 +243,6 @@ export class MetaMessagingAdapter implements ChannelAdapter {
       throw new AppError('CHANNEL_MISCONFIGURED', 400, 'Page access token invalid');
     }
     const me = (await res.json()) as { name?: string };
-    return (
-      `Connected to "${me.name ?? 'page'}". In the Meta app dashboard (Webhooks → ${this.webhookObject}) ` +
-      `set Callback URL to ${webhookUrl} and Verify token to ${account.webhookSecret}, then ` +
-      `subscribe to the "messages" field.`
-    );
+    return `Connected to "${me.name ?? 'page'}". Vhicasar uses the platform-level ${this.webhookObject} webhook; no business-specific callback setup is required.`;
   }
 }

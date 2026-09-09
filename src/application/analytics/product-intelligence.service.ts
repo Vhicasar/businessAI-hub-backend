@@ -250,7 +250,7 @@ export const productIntelligenceService = {
           },
           { role: 'user', content: JSON.stringify({ product: dash.product.name, ...dash.sales, ...dash.inventory, healthScore: dash.healthScore, days: dash.period.days }) },
         ],
-        { maxTokens: 400, temperature: 0.4 },
+        { maxTokens: 400, temperature: 0.4, dataSources: ['vhicasar_business'] },
       );
       const parsed = JSON.parse(extractJson(raw)) as Record<string, string>;
       return {

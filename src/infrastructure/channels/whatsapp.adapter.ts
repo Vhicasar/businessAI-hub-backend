@@ -328,7 +328,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
     return { providerMessageId };
   }
 
-  async onAccountConnected(account: ChannelAccountRef, webhookUrl: string): Promise<string | null> {
+  async onAccountConnected(account: ChannelAccountRef, _webhookUrl: string): Promise<string | null> {
     // Validate the token/number by fetching the phone number resource.
     const res = await fetch(`${graph()}/${account.credentials.phoneNumberId}`, {
       headers: { Authorization: `Bearer ${account.credentials.accessToken}` },
@@ -336,11 +336,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
     if (!res.ok) {
       throw new AppError('CHANNEL_MISCONFIGURED', 400, 'WhatsApp token or phone number id invalid');
     }
-    return (
-      `Credentials verified. Now in the Meta app dashboard (WhatsApp → Configuration) set ` +
-      `Callback URL to ${webhookUrl} and Verify token to ${account.webhookSecret}, then ` +
-      `subscribe to the "messages" webhook field.`
-    );
+    return 'Credentials verified. Vhicasar uses the platform-level WhatsApp webhook; no business-specific callback setup is required.';
   }
 }
 

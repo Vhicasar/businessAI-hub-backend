@@ -17,7 +17,7 @@ import type { AiProvider } from './ai-provider';
  * `Organization.settings.aiProvider`; the key is encrypted at rest (AES-256-GCM).
  */
 
-const PROVIDERS = ['openai', 'anthropic', 'gemini', 'azure', 'ollama', 'openrouter', 'custom'] as const;
+const PROVIDERS = ['openai', 'anthropic', 'gemini', 'deepseek', 'azure', 'ollama', 'openrouter', 'custom'] as const;
 
 export const aiAccountSchema = z.object({
   provider: z.enum(PROVIDERS),
@@ -162,4 +162,3 @@ export async function resolveAi(feature = 'assistant'): Promise<{ provider: AiPr
 export async function resolveAiOptional(feature = 'assistant'): Promise<{ provider: AiProvider | null; ownKey: boolean }> {
   return resolveOrgAi(undefined, feature);
 }
-

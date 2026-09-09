@@ -193,7 +193,7 @@ export const activityCenter = {
         where: { customerId: { in: customerIds }, createdAt: { lt: before } },
         orderBy: { createdAt: 'desc' },
         take: limit,
-        select: { id: true, organizationId: true, title: true, status: true, startAt: true, createdAt: true },
+        select: { id: true, organizationId: true, title: true, status: true, startAt: true, createdAt: true, dataSource: true },
       }),
       customerIds.length
         ? prismaUnscoped.loyaltyTransaction.findMany({
@@ -271,6 +271,7 @@ export const activityCenter = {
         currency: null,
         deeplink: `vhicasar://business/${m.organizationId}/booking/${m.id}`,
         at: m.createdAt,
+        dataSource: m.dataSource,
       })),
       ...loyalty.map((l) => {
         const orgId = customerOrg(l.account.customerId);
@@ -355,7 +356,7 @@ export const activityCenter = {
             where: { customerId: { in: customerIds }, startAt: { gte: now, lte: in7 }, status: { not: 'CANCELLED' } },
             orderBy: { startAt: 'asc' },
             take: 10,
-            select: { id: true, organizationId: true, title: true, startAt: true },
+            select: { id: true, organizationId: true, title: true, startAt: true, dataSource: true },
           })
         : [],
       prismaUnscoped.rewardGrant.findMany({
@@ -417,6 +418,7 @@ export const activityCenter = {
           action: 'VIEW',
           organizationId: b.organizationId,
           deeplink: `vhicasar://business/${b.organizationId}/booking/${b.id}`,
+          dataSource: b.dataSource,
         };
       }),
       ...expiringRewards.map((r) => ({

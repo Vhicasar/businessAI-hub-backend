@@ -39,6 +39,7 @@ const envSchema = z
      */
     META_APP_ID: z.string().optional().or(z.literal('')),
     META_APP_SECRET: z.string().optional().or(z.literal('')),
+    META_WEBHOOK_VERIFY_TOKEN: z.string().min(16).optional().or(z.literal('')),
     /** Embedded Signup configuration id from the Meta app dashboard. */
     META_WHATSAPP_CONFIG_ID: z.string().optional().or(z.literal('')),
     /** Overridable so a staging app can pin an older Graph version. */
@@ -104,7 +105,7 @@ const envSchema = z
     MAX_UPLOAD_MB: z.coerce.number().int().min(1).max(50).default(10),
 
     // --- AI (provider-agnostic; 'none' disables all AI features gracefully) ---
-    AI_PROVIDER: z.enum(['none', 'anthropic', 'openai']).default('none'),
+    AI_PROVIDER: z.enum(['none', 'anthropic', 'openai', 'deepseek']).default('none'),
     AI_API_KEY: z.string().optional().or(z.literal('')),
     AI_MODEL: z.string().optional().or(z.literal('')),
     /** For OpenAI-compatible servers (Ollama, vLLM, OpenRouter…). */
@@ -298,6 +299,7 @@ export const env = {
   meta: {
     appId: raw.META_APP_ID || '',
     appSecret: raw.META_APP_SECRET || '',
+    webhookVerifyToken: raw.META_WEBHOOK_VERIFY_TOKEN || '',
     whatsappConfigId: raw.META_WHATSAPP_CONFIG_ID || '',
     graphVersion: raw.META_GRAPH_VERSION,
     /** Base + version, which is what every Graph call actually needs. */

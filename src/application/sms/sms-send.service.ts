@@ -4,7 +4,7 @@ import { smsProvider } from '../../infrastructure/sms/registry';
 import { smsWalletService } from '../billing/sms-wallet.service';
 import { senderIdService } from './sender-id.service';
 import { segmentsFor, totalSegments } from './sms-segments';
-import { resolveRecipients } from './phone-numbers';
+import { normalizePhone, resolveRecipients } from './phone-numbers';
 import { logger } from '../../shared/logger';
 import { ValidationError } from '../../shared/errors';
 import { isChannelEnabled } from '../settings/workspace-config';
@@ -92,8 +92,22 @@ export const smsSendService = {
     return new Set(rows.map((r) => r.phone));
   },
 
-  /** Record that a number must not be marketed to again. */
-  async suppress(organizationId: string, phone: string, reason: string, sourceMessageId?: string) {
+  /**
+   * Record that a number must not be marketed to again.
+   *
+   * Normalised on the way in, because the check on the way out is against
+   * E.164. Stored as typed, an opt-out added by hand as "08030008888" never
+   * matched the "+2348030008888" a send resolves to — the number sat on the
+   * suppression list and kept receiving marketing.
+   */
+  async suppress(organizationId: string, rawPhone: string, reason: string, sourceMessageId?: string) {
+    const phone = normalizePhone(rawPhone).e164;
+    if (!phone) {
+      // Nothing to suppress: an unusable number cannot be sent to anyway, and
+      // storing it as typed would only look like it had been actioned.
+      logger.warn({ rawPhone }, 'Could not record SMS suppression — unrecognisable number');
+      return;
+    }
     await prismaUnscoped.smsSuppression
       .upsert({
         where: { organizationId_phone: { organizationId, phone } },

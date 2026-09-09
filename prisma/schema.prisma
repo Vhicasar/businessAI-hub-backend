@@ -1195,6 +1195,11 @@ model ChannelAccount {
   /// support address and silence on the one that sends invoices.
   autoReply      Boolean                 @default(true)
   externalId     String // phone number id, page id, bot id…
+  /// Stable Meta routing identifiers. Global uniqueness prevents cross-tenant delivery.
+  metaWabaId             String? @unique
+  metaPhoneNumberId      String? @unique
+  metaFacebookPageId     String? @unique
+  metaInstagramAccountId String? @unique
   credentialsEnc String?                 @db.Text // AES-256-GCM encrypted provider credentials
   webhookSecret  String?
   isActive       Boolean                 @default(true)
@@ -1577,6 +1582,8 @@ model Meeting {
   externalUrl      String?
   /// Last successful mirror, for spotting a sync that has stopped working.
   externalSyncedAt DateTime?
+  /// Durable provenance. GOOGLE_API_MIXED means at least one field came from Google.
+  dataSource       String      @default("VHICASAR")
   createdAt        DateTime    @default(now())
   updatedAt        DateTime    @updatedAt
   deletedAt        DateTime?

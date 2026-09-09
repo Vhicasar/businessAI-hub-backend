@@ -58,8 +58,7 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderDef> = {
     revokeUrl: 'https://oauth2.googleapis.com/revoke',
     // Only what booking sync needs: read and write the user's own events.
     scopes: [
-      'https://www.googleapis.com/auth/calendar.events',
-      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/calendar.events.owned',
     ],
     clientId: () => oauthCredentials('google_calendar')?.clientId ?? '',
     clientSecret: () => oauthCredentials('google_calendar')?.clientSecret ?? '',
@@ -71,9 +70,10 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderDef> = {
       access_type: 'offline',
       prompt: 'consent',
     },
-    async identify(accessToken) {
-      const me = await getJson('https://www.googleapis.com/oauth2/v2/userinfo', accessToken);
-      return { label: String(me.email ?? 'Google account'), externalId: me.id ? String(me.id) : null };
+    async identify() {
+      // Do not request profile scopes merely to decorate the connection UI.
+      // Calendar sync needs no Google identity fields.
+      return { label: 'Google Calendar', externalId: null };
     },
   },
 
