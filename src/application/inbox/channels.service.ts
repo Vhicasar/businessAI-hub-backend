@@ -200,31 +200,54 @@ export const channelsService = {
     const webhookSecret = randomUUID().replace(/-/g, '');
     const externalId = deriveExternalId(dto);
 
-    const dup = await prisma.channelAccount.findFirst({
-      where: { channelType: dto.channelType, externalId, deletedAt: null },
+    // Include soft-deleted rows. The database unique key still reserves their
+    // organization/channel/external-id tuple, so creating a replacement would
+    // fail with P2002. A disconnected channel is restored in place instead,
+    // preserving its inbox history and webhook identity.
+    const existing = await prisma.channelAccount.findFirst({
+      where: { channelType: dto.channelType, externalId },
     });
-    if (dup) throw new ConflictError('This account is already connected');
+    if (existing && !existing.deletedAt) throw new ConflictError('This account is already connected');
 
     // Enforced here, not only in the UI: how many instances a business may run
     // is a billing decision, and the endpoint is reachable without the screen.
-    const allowance = await allowanceFor(organizationId, dto.channelType);
-    if (!allowance.canAddMore) throw new ConflictError(allowance.blockedReason ?? 'Channel limit reached');
+    if (!existing) {
+      const allowance = await allowanceFor(organizationId, dto.channelType);
+      if (!allowance.canAddMore) throw new ConflictError(allowance.blockedReason ?? 'Channel limit reached');
+    }
 
-    const account = await prisma.channelAccount.create({
-      data: {
-        organizationId,
-        channelType: dto.channelType,
-        name: dto.name,
-        purpose: dto.purpose,
-        autoReply: dto.autoReply,
-        externalId,
-        credentialsEnc: encrypt(JSON.stringify(dto.credentials)),
-        webhookSecret,
-        ...metaRoutingFields(dto.channelType, dto.credentials),
-      },
-    });
+    const account = existing
+      ? await prisma.channelAccount.update({
+          where: { id: existing.id },
+          data: {
+            name: dto.name,
+            purpose: dto.purpose,
+            autoReply: dto.autoReply,
+            credentialsEnc: encrypt(JSON.stringify(dto.credentials)),
+            webhookSecret: existing.webhookSecret || webhookSecret,
+            isActive: true,
+            status: 'CONNECTED',
+            lastError: null,
+            lastErrorAt: null,
+            deletedAt: null,
+            ...metaRoutingFields(dto.channelType, dto.credentials),
+          },
+        })
+      : await prisma.channelAccount.create({
+          data: {
+            organizationId,
+            channelType: dto.channelType,
+            name: dto.name,
+            purpose: dto.purpose,
+            autoReply: dto.autoReply,
+            externalId,
+            credentialsEnc: encrypt(JSON.stringify(dto.credentials)),
+            webhookSecret,
+            ...metaRoutingFields(dto.channelType, dto.credentials),
+          },
+        });
 
-    await recordChannelEvent(account.id, 'Channel connected', {
+    await recordChannelEvent(account.id, existing ? 'Channel reconnected' : 'Channel connected', {
       body: [
         `Type: ${dto.channelType}`,
         `Name: ${dto.name}`,
@@ -256,7 +279,7 @@ export const channelsService = {
           organizationId,
           externalId,
           credentials: dto.credentials,
-          webhookSecret,
+          webhookSecret: account.webhookSecret,
         },
         webhookUrl
       );
@@ -295,7 +318,11 @@ export const channelsService = {
     const { organizationId, channelType, externalId } = connection;
 
     const existing = await prisma.channelAccount.findFirst({
-      where: { channelType, externalId, deletedAt: null },
+      // Disconnection is a soft delete. Include that row here: the database
+      // unique key still reserves (organization, channel, externalId), so
+      // attempting to create a new row would fail with P2002. Reconnecting
+      // restores the original row and keeps its conversation history.
+      where: { channelType, externalId },
       select: { id: true, organizationId: true, name: true },
     });
     if (existing && existing.organizationId !== organizationId) {
@@ -323,6 +350,7 @@ export const channelsService = {
             // EXPIRED in the first place.
             isActive: true,
             status: 'CONNECTED',
+            deletedAt: null,
             lastError: null,
             lastErrorAt: null,
             ...metaRoutingFields(channelType, connection.credentials),
