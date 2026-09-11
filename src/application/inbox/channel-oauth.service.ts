@@ -95,9 +95,9 @@ export function oauthUnavailableReason(channelType: ChannelType): string | null 
   if (!(channelType in OAUTH_CHANNELS)) {
     return `${channelType} cannot be connected automatically — it is set up with its own credentials.`;
   }
-  if (channelType === 'INSTAGRAM' ? !(instagramApp().appId && instagramApp().appSecret) : !metaConfigured()) {
-    return 'One-click connection is not configured on this deployment yet. Connect with your own credentials, or ask your administrator to finish the Meta app setup.';
-  }
+  // if (channelType === 'INSTAGRAM' ? !(instagramApp().appId && instagramApp().appSecret) : !metaConfigured()) {
+  //   return 'One-click connection is not configured on this deployment yet. Connect with your own credentials, or ask your administrator to finish the Meta app setup.';
+  // }
   return null;
 }
 
