@@ -432,6 +432,23 @@ export const inboxService = {
     const reply = await aiService.autoReplyDraft(conversationId);
     if (!reply) return; // handoff or AI disabled — a human takes it
 
+    // AI generation is asynchronous and can take several seconds. The owner
+    // may switch auto-reply off while it is running, so enforce the setting a
+    // second time at the actual send boundary. This applies identically to
+    // email and every webhook-backed channel.
+    const stillEnabled = await prisma.channelAccount.findFirst({
+      where: { id: accountId, autoReply: true, isActive: true, deletedAt: null },
+      select: { id: true },
+    });
+    if (!stillEnabled) return;
+
+    const stillLatest = await prisma.message.findFirst({
+      where: { conversationId },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+    });
+    if (stillLatest?.id !== inboundMessageId) return;
+
     await this.sendMessage(
       conversationId,
       typeof reply === 'string' ? reply : reply.text,

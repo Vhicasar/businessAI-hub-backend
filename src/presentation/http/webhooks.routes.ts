@@ -9,8 +9,6 @@ import { inboxService } from '../../application/inbox/inbox.service';
 import { decrypt } from '../../shared/crypto';
 import { markWebhookReceived } from '../../application/inbox/channel-health.service';
 import { env } from '../../shared/config/env';
-import { metaWebhookAppSecret } from '../../application/inbox/channel-oauth.service';
-import { verifyMetaSignature } from '../../infrastructure/channels/whatsapp.adapter';
 
 /**
  * Stable Meta receivers live at /whatsapp, /messenger and /instagram.
@@ -99,11 +97,6 @@ webhookRoutes.post('/:meta(whatsapp|messenger|instagram)', (req, res) => {
   const channelType = META_ROUTES[meta];
   const body = req.body as { entry?: Array<Record<string, unknown>> };
   const rawBody = (req as unknown as { rawBody?: Buffer }).rawBody;
-  if (!verifyMetaSignature({ headers: req.headers, body, query: req.query as Record<string, unknown>, rawBody }, metaWebhookAppSecret(channelType))) {
-    logger.warn({ channelType }, 'Meta webhook signature verification failed');
-    res.sendStatus(401);
-    return;
-  }
   if (!body || !Array.isArray(body.entry)) {
     res.sendStatus(400);
     return;
@@ -132,6 +125,10 @@ webhookRoutes.post('/:meta(whatsapp|messenger|instagram)', (req, res) => {
         continue;
       }
       const singleBody = { ...(body as Record<string, unknown>), entry: [entry] };
+      // Signature verification occurs inside processForAccount using this
+      // connection's encrypted app secret. A platform-wide check here used to
+      // reject customer-owned WhatsApp apps before their account could even be
+      // identified; Page/Instagram platform apps happened to pass it.
       await processForAccount(account, singleBody, req.headers, req.query as Record<string, unknown>, rawBody);
     }
   })().catch((err) => logger.error({ err, channelType }, 'Meta webhook processing failed'));
