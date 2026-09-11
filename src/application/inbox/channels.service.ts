@@ -88,6 +88,22 @@ function metaRoutingFields(channelType: string, credentials: Record<string, stri
   };
 }
 
+/** Provider details safe to return to the settings UI. Never copy secrets. */
+function safeManualMetadata(channelType: string, credentials: Record<string, string>): Record<string, unknown> {
+  const common = { connectedVia: 'manual_credentials', connectedAt: new Date().toISOString() };
+  switch (channelType) {
+    case 'WHATSAPP': return { ...common, phoneNumberId: credentials.phoneNumberId ?? null };
+    case 'FACEBOOK_MESSENGER': return { ...common, facebookPageId: credentials.pageId ?? null };
+    case 'INSTAGRAM': return { ...common, instagramAccountId: credentials.instagramAccountId ?? null };
+    case 'TELEGRAM': return { ...common, botId: credentials.botToken?.split(':')[0] ?? null };
+    case 'EMAIL': return { ...common, emailAddress: credentials.imapUser ?? null, imapHost: credentials.imapHost ?? null };
+    case 'SMS': return { ...common, fromNumber: credentials.fromNumber ?? null, messagingServiceSid: credentials.messagingServiceSid ?? null };
+    case 'TIKTOK': return { ...common, openId: credentials.openId ?? null };
+    case 'WEB_CHAT': return { ...common };
+    default: return common;
+  }
+}
+
 export type ConnectChannelDto = z.infer<typeof connectChannelSchema>;
 
 const accountSelect = {
@@ -224,6 +240,7 @@ export const channelsService = {
             purpose: dto.purpose,
             autoReply: dto.autoReply,
             credentialsEnc: encrypt(JSON.stringify(dto.credentials)),
+            metadata: safeManualMetadata(dto.channelType, dto.credentials) as never,
             webhookSecret: existing.webhookSecret || webhookSecret,
             isActive: true,
             status: 'CONNECTED',
@@ -242,6 +259,7 @@ export const channelsService = {
             autoReply: dto.autoReply,
             externalId,
             credentialsEnc: encrypt(JSON.stringify(dto.credentials)),
+            metadata: safeManualMetadata(dto.channelType, dto.credentials) as never,
             webhookSecret,
             ...metaRoutingFields(dto.channelType, dto.credentials),
           },

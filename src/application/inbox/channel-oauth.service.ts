@@ -319,9 +319,9 @@ async function resolveInstagramViaFacebook(
   const pages = await graphGet<{
     data?: Array<{
       id: string; name?: string; access_token?: string;
-      instagram_business_account?: { id: string; username?: string };
+      instagram_business_account?: { id: string; username?: string; name?: string; profile_picture_url?: string };
     }>;
-  }>('/me/accounts?fields=id,name,access_token,instagram_business_account{id,username}', userToken);
+  }>('/me/accounts?fields=id,name,access_token,instagram_business_account{id,username,name,profile_picture_url}', userToken);
   const page = (pages.data ?? []).find((candidate) => candidate.instagram_business_account?.id);
   const instagram = page?.instagram_business_account;
   if (!page || !instagram || !page.access_token) {
@@ -340,6 +340,8 @@ async function resolveInstagramViaFacebook(
       instagramAccountId: instagram.id,
       facebookPageId: page.id,
       username: instagram.username ?? null,
+      profileName: instagram.name ?? null,
+      profilePictureUrl: instagram.profile_picture_url ?? null,
       tokenExpiresAt,
       tokenType: 'bearer',
       connectedAt: new Date().toISOString(),
@@ -353,10 +355,10 @@ async function resolveInstagram(
   tokenExpiresAt: string | null,
   grantedScopes: string[] = [],
 ): Promise<Pick<ResolvedConnection, 'externalId' | 'displayName' | 'credentials' | 'metadata'>> {
-  const fields = new URLSearchParams({ fields: 'user_id,username,account_type', access_token: accessToken });
+  const fields = new URLSearchParams({ fields: 'user_id,username,name,account_type,profile_picture_url', access_token: accessToken });
   const res = await fetch(`${env.instagram.graphUrl}/me?${fields.toString()}`);
   const profile = await res.json().catch(() => ({})) as {
-    id?: string; user_id?: string; username?: string; account_type?: string; error?: { message?: string };
+    id?: string; user_id?: string; username?: string; name?: string; account_type?: string; profile_picture_url?: string; error?: { message?: string };
   };
   const accountId = profile.user_id ?? profile.id;
   if (!res.ok || !accountId) {
@@ -372,6 +374,8 @@ async function resolveInstagram(
     metadata: {
       instagramAccountId: accountId,
       username: profile.username ?? null,
+      profileName: profile.name ?? null,
+      profilePictureUrl: profile.profile_picture_url ?? null,
       accountType: profile.account_type ?? null,
       tokenExpiresAt,
       grantedScopes,
@@ -468,6 +472,7 @@ async function resolveWhatsApp(
       wabaName: waba.name ?? null,
       displayPhoneNumber: number.display_phone_number ?? null,
       tokenExpiresAt,
+      connectedAt: new Date().toISOString(),
       connectedVia: 'meta_embedded_signup',
     },
   };
@@ -507,7 +512,13 @@ async function resolvePage(
       pageId: page.id,
       appSecret: metaApp().appSecret,
     },
-    metadata: { facebookPageId: page.id, pageName: page.name ?? null, tokenExpiresAt, connectedVia: 'meta_oauth' },
+    metadata: {
+      facebookPageId: page.id,
+      pageName: page.name ?? null,
+      tokenExpiresAt,
+      connectedAt: new Date().toISOString(),
+      connectedVia: 'meta_oauth',
+    },
   };
 }
 
