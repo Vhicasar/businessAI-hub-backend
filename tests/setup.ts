@@ -14,6 +14,8 @@ process.env.ENCRYPTION_KEY ??=
 process.env.LOG_LEVEL ??= 'error';
 process.env.AI_PROVIDER ??= 'none';
 process.env.SMTP_HOST ??= '';
+process.env.INSTAGRAM_APP_ID ??= 'test-instagram-app';
+process.env.INSTAGRAM_APP_SECRET ??= 'test-instagram-secret';
 
 if (process.env.TEST_DATABASE_URL) {
   process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;

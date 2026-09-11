@@ -40,14 +40,7 @@ const OAUTH_CHANNELS: Partial<Record<ChannelType, { scopes: string[]; label: str
     label: 'Facebook Page',
   },
   INSTAGRAM: {
-    // Instagram messaging is granted through the Page the account is linked to.
-    scopes: [
-      'instagram_basic',
-      'instagram_manage_messages',
-      'pages_show_list',
-      'pages_manage_metadata',
-      'business_management',
-    ],
+    scopes: ['instagram_business_basic', 'instagram_business_manage_messages'],
     label: 'Instagram professional account',
   },
 };
@@ -67,8 +60,24 @@ function metaApp(): { appId: string; appSecret: string } {
   };
 }
 
+function instagramApp(): { appId: string; appSecret: string } {
+  const configured = oauthCredentials('instagram');
+  return {
+    appId: configured?.clientId || env.instagram.appId,
+    appSecret: configured?.clientSecret || env.instagram.appSecret,
+  };
+}
+
+function instagramLoginMode(): 'DIRECT_INSTAGRAM' | 'FACEBOOK_PAGE' {
+  return oauthCredentials('instagram')?.loginMode === 'FACEBOOK_PAGE'
+    ? 'FACEBOOK_PAGE'
+    : 'DIRECT_INSTAGRAM';
+}
+
 /** Used by the application-level webhook receiver; never returned to clients. */
 export const metaAppSecret = (): string => metaApp().appSecret;
+export const metaWebhookAppSecret = (channelType: ChannelType): string =>
+  channelType === 'INSTAGRAM' ? instagramApp().appSecret : metaApp().appSecret;
 
 /** Whether a Meta app is configured at all, from either source. */
 export function metaConfigured(): boolean {
@@ -77,7 +86,8 @@ export function metaConfigured(): boolean {
 }
 
 export function supportsOAuth(channelType: ChannelType): boolean {
-  return channelType in OAUTH_CHANNELS && metaConfigured();
+  return channelType in OAUTH_CHANNELS &&
+    (channelType === 'INSTAGRAM' ? Boolean(instagramApp().appId && instagramApp().appSecret) : metaConfigured());
 }
 
 /** Why OAuth is unavailable, phrased for whoever has to fix it. */
@@ -85,7 +95,7 @@ export function oauthUnavailableReason(channelType: ChannelType): string | null 
   if (!(channelType in OAUTH_CHANNELS)) {
     return `${channelType} cannot be connected automatically — it is set up with its own credentials.`;
   }
-  if (!metaConfigured()) {
+  if (channelType === 'INSTAGRAM' ? !(instagramApp().appId && instagramApp().appSecret) : !metaConfigured()) {
     return 'One-click connection is not configured on this deployment yet. Connect with your own credentials, or ask your administrator to finish the Meta app setup.';
   }
   return null;
@@ -121,7 +131,9 @@ export function authorizationUrl(input: {
     issuedAt: Date.now(),
   });
 
-  const scopes = [...config.scopes];
+  const scopes = input.channelType === 'INSTAGRAM' && instagramLoginMode() === 'FACEBOOK_PAGE'
+    ? ['instagram_basic', 'instagram_manage_messages', 'pages_show_list', 'pages_manage_metadata']
+    : [...config.scopes];
   // Standard Facebook OAuth does not return Embedded Signup asset target ids,
   // so it needs Business Management access to enumerate /me/businesses and
   // then the selected portfolio's owned WABAs. Keep that broader permission
@@ -129,8 +141,9 @@ export function authorizationUrl(input: {
   if (input.channelType === 'WHATSAPP' && !env.meta.whatsappConfigId) {
     scopes.push('business_management');
   }
+  const app = input.channelType === 'INSTAGRAM' ? instagramApp() : metaApp();
   const params = new URLSearchParams({
-    client_id: metaApp().appId,
+    client_id: app.appId,
     redirect_uri: callbackUrl(input.channelType),
     state,
     scope: scopes.join(','),
@@ -142,6 +155,12 @@ export function authorizationUrl(input: {
   if (input.channelType === 'WHATSAPP' && env.meta.whatsappConfigId) {
     params.set('config_id', env.meta.whatsappConfigId);
     params.set('override_default_response_type', 'true');
+  }
+
+  if (input.channelType === 'INSTAGRAM' && instagramLoginMode() === 'DIRECT_INSTAGRAM') {
+    params.set('enable_fb_login', '0');
+    params.set('force_authentication', '1');
+    return { url: `${env.instagram.authBaseUrl}/oauth/authorize?${params.toString()}`, state };
   }
 
   return {
@@ -182,10 +201,12 @@ async function graphGet<T>(path: string, token: string): Promise<T> {
 }
 
 /** Swap the one-time code for a token that belongs to this business. */
-async function exchangeCode(code: string, channelType: ChannelType): Promise<{ accessToken: string; expiresAt: string | null }> {
+async function exchangeCode(code: string, channelType: ChannelType): Promise<{ accessToken: string; expiresAt: string | null; scopes?: string[] }> {
+  if (channelType === 'INSTAGRAM' && instagramLoginMode() === 'DIRECT_INSTAGRAM') return exchangeInstagramCode(code);
+  const app = channelType === 'INSTAGRAM' ? instagramApp() : metaApp();
   const params = new URLSearchParams({
-    client_id: metaApp().appId,
-    client_secret: metaApp().appSecret,
+    client_id: app.appId,
+    client_secret: app.appSecret,
     redirect_uri: callbackUrl(channelType),
     code,
   });
@@ -204,6 +225,47 @@ async function exchangeCode(code: string, channelType: ChannelType): Promise<{ a
   };
 }
 
+async function exchangeInstagramCode(code: string): Promise<{ accessToken: string; expiresAt: string | null; scopes?: string[] }> {
+  const app = instagramApp();
+  const body = new URLSearchParams({
+    client_id: app.appId,
+    client_secret: app.appSecret,
+    grant_type: 'authorization_code',
+    redirect_uri: callbackUrl('INSTAGRAM'),
+    code,
+  });
+  const shortRes = await fetch(`${env.instagram.apiBaseUrl}/oauth/access_token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+  const short = await shortRes.json().catch(() => ({})) as { access_token?: string; permissions?: string[]; error_message?: string; error?: { message?: string } };
+  if (!shortRes.ok || !short.access_token) {
+    throw new AppError('INSTAGRAM_TOKEN_EXCHANGE_FAILED', 400, short.error_message ?? short.error?.message ?? 'Instagram could not exchange the authorization code.');
+  }
+  const granted = short.permissions;
+  const required = OAUTH_CHANNELS.INSTAGRAM?.scopes ?? [];
+  if (granted && required.some((scope) => !granted.includes(scope))) {
+    throw new AppError('INSTAGRAM_PERMISSION_MISSING', 400, 'Instagram did not grant all required profile and messaging permissions.');
+  }
+
+  const longParams = new URLSearchParams({
+    grant_type: 'ig_exchange_token',
+    client_secret: app.appSecret,
+    access_token: short.access_token,
+  });
+  const longRes = await fetch(`${env.instagram.graphBaseUrl}/access_token?${longParams.toString()}`);
+  const long = await longRes.json().catch(() => ({})) as { access_token?: string; expires_in?: number; error?: { message?: string } };
+  if (!longRes.ok || !long.access_token) {
+    throw new AppError('INSTAGRAM_TOKEN_EXCHANGE_FAILED', 400, long.error?.message ?? 'Instagram could not issue a long-lived access token.');
+  }
+  return {
+    accessToken: long.access_token,
+    expiresAt: long.expires_in ? new Date(Date.now() + long.expires_in * 1000).toISOString() : null,
+    scopes: granted ?? required,
+  };
+}
+
 /**
  * Finish the flow: verify the state, exchange the code, and find out what the
  * business actually authorised.
@@ -213,11 +275,19 @@ export async function completeCallback(input: {
   code: string;
   state: string;
 }): Promise<ResolvedConnection> {
-  const payload = verifyState(input.state);
+  let payload: ReturnType<typeof verifyState>;
+  try {
+    payload = verifyState(input.state);
+  } catch (error) {
+    if (input.channelType === 'INSTAGRAM') {
+      throw new AppError('INSTAGRAM_STATE_MISMATCH', 400, 'The Instagram connection state is invalid or expired.', { cause: error });
+    }
+    throw error;
+  }
   // The state says which channel it was issued for; a state minted for one
   // channel must not complete another.
   if (payload.provider !== `channel:${input.channelType}`) {
-    throw new AppError('OAUTH_STATE_INVALID', 400, 'This connection link is for a different channel.');
+    throw new AppError(input.channelType === 'INSTAGRAM' ? 'INSTAGRAM_STATE_MISMATCH' : 'OAUTH_STATE_INVALID', 400, 'This connection link is for a different channel.');
   }
 
   const token = await exchangeCode(input.code, input.channelType);
@@ -231,7 +301,85 @@ export async function completeCallback(input: {
   if (input.channelType === 'WHATSAPP') {
     return { ...base, ...(await resolveWhatsApp(token.accessToken, token.expiresAt)) };
   }
-  return { ...base, ...(await resolvePage(token.accessToken, input.channelType, token.expiresAt)) };
+  if (input.channelType === 'INSTAGRAM') {
+    return {
+      ...base,
+      ...(instagramLoginMode() === 'DIRECT_INSTAGRAM'
+        ? await resolveInstagram(token.accessToken, token.expiresAt, token.scopes)
+        : await resolveInstagramViaFacebook(token.accessToken, token.expiresAt)),
+    };
+  }
+  return { ...base, ...(await resolvePage(token.accessToken, token.expiresAt)) };
+}
+
+async function resolveInstagramViaFacebook(
+  userToken: string,
+  tokenExpiresAt: string | null,
+): Promise<Pick<ResolvedConnection, 'externalId' | 'displayName' | 'credentials' | 'metadata'>> {
+  const pages = await graphGet<{
+    data?: Array<{
+      id: string; name?: string; access_token?: string;
+      instagram_business_account?: { id: string; username?: string };
+    }>;
+  }>('/me/accounts?fields=id,name,access_token,instagram_business_account{id,username}', userToken);
+  const page = (pages.data ?? []).find((candidate) => candidate.instagram_business_account?.id);
+  const instagram = page?.instagram_business_account;
+  if (!page || !instagram || !page.access_token) {
+    throw new AppError('INSTAGRAM_ACCOUNT_NOT_ELIGIBLE', 400, 'No Page-linked Instagram Professional account was available. Link the account to a Facebook Page or switch the admin setting to direct Instagram Login.');
+  }
+  return {
+    externalId: instagram.id,
+    displayName: instagram.username ? `@${instagram.username}` : 'Instagram',
+    credentials: {
+      pageAccessToken: page.access_token,
+      pageId: page.id,
+      instagramAccountId: instagram.id,
+      appSecret: instagramApp().appSecret,
+    },
+    metadata: {
+      instagramAccountId: instagram.id,
+      facebookPageId: page.id,
+      username: instagram.username ?? null,
+      tokenExpiresAt,
+      tokenType: 'bearer',
+      connectedAt: new Date().toISOString(),
+      connectedVia: 'facebook_page_login',
+    },
+  };
+}
+
+async function resolveInstagram(
+  accessToken: string,
+  tokenExpiresAt: string | null,
+  grantedScopes: string[] = [],
+): Promise<Pick<ResolvedConnection, 'externalId' | 'displayName' | 'credentials' | 'metadata'>> {
+  const fields = new URLSearchParams({ fields: 'user_id,username,account_type', access_token: accessToken });
+  const res = await fetch(`${env.instagram.graphUrl}/me?${fields.toString()}`);
+  const profile = await res.json().catch(() => ({})) as {
+    id?: string; user_id?: string; username?: string; account_type?: string; error?: { message?: string };
+  };
+  const accountId = profile.user_id ?? profile.id;
+  if (!res.ok || !accountId) {
+    throw new AppError('INSTAGRAM_PROFILE_FETCH_FAILED', 400, profile.error?.message ?? 'Instagram could not load the selected professional account.');
+  }
+  if (profile.account_type && !['BUSINESS', 'MEDIA_CREATOR'].includes(profile.account_type)) {
+    throw new AppError('INSTAGRAM_ACCOUNT_NOT_ELIGIBLE', 400, 'Select an Instagram Business or Creator account. Personal accounts are not eligible.');
+  }
+  return {
+    externalId: accountId,
+    displayName: profile.username ? `@${profile.username}` : 'Instagram',
+    credentials: { accessToken, instagramAccountId: accountId, appSecret: instagramApp().appSecret },
+    metadata: {
+      instagramAccountId: accountId,
+      username: profile.username ?? null,
+      accountType: profile.account_type ?? null,
+      tokenExpiresAt,
+      grantedScopes,
+      tokenType: 'bearer',
+      connectedAt: new Date().toISOString(),
+      connectedVia: 'instagram_direct_login',
+    },
+  };
 }
 
 /** The WABA and phone number the business picked during Embedded Signup. */
@@ -325,10 +473,9 @@ async function resolveWhatsApp(
   };
 }
 
-/** The Page (and for Instagram, the account linked to it) that was authorised. */
+/** The Facebook Page authorised for Messenger. Instagram never enters here. */
 async function resolvePage(
   userToken: string,
-  channelType: ChannelType,
   tokenExpiresAt: string | null,
 ): Promise<Pick<ResolvedConnection, 'externalId' | 'displayName' | 'credentials' | 'metadata'>> {
   const pages = await graphGet<{
@@ -336,10 +483,9 @@ async function resolvePage(
       id: string;
       name?: string;
       access_token?: string;
-      instagram_business_account?: { id: string; username?: string };
     }[];
   }>(
-    '/me/accounts?fields=id,name,access_token,instagram_business_account{id,username}',
+    '/me/accounts?fields=id,name,access_token',
     userToken,
   );
 
@@ -350,37 +496,6 @@ async function resolvePage(
       400,
       'No Facebook Page came back from Meta. Make sure you granted access to the Page you want to connect.',
     );
-  }
-
-  if (channelType === 'INSTAGRAM') {
-    const linked = candidates.find((p) => p.instagram_business_account?.id);
-    if (!linked?.instagram_business_account) {
-      throw new AppError(
-        'CHANNEL_OAUTH_INCOMPLETE',
-        400,
-        'None of your Pages has an Instagram professional account linked. Link one in Meta Business Suite, then connect again.',
-      );
-    }
-    const ig = linked.instagram_business_account;
-    return {
-      externalId: ig.id,
-      displayName: ig.username ? `@${ig.username}` : 'Instagram',
-      credentials: {
-        // Instagram DMs are sent with the linked Page's token, not a separate one.
-        pageAccessToken: linked.access_token ?? '',
-        pageId: linked.id,
-        instagramAccountId: ig.id,
-        appSecret: metaApp().appSecret,
-      },
-      metadata: {
-        facebookPageId: linked.id,
-        instagramAccountId: ig.id,
-        pageName: linked.name ?? null,
-        username: ig.username ?? null,
-        tokenExpiresAt,
-        connectedVia: 'meta_oauth',
-      },
-    };
   }
 
   const page = candidates[0]!;
@@ -419,10 +534,31 @@ export async function subscribeWebhooks(connection: ResolvedConnection): Promise
     return;
   }
 
-  const fields =
-    channelType === 'INSTAGRAM'
-      ? ['messages', 'messaging_seen', 'messaging_postbacks']
-      : ['messages', 'message_deliveries', 'message_reads', 'messaging_postbacks'];
+  if (channelType === 'INSTAGRAM') {
+    if (instagramLoginMode() === 'FACEBOOK_PAGE') {
+      const fields = ['messages', 'messaging_seen', 'messaging_postbacks'];
+      const res = await fetch(
+        `${graph()}/${credentials.pageId}/subscribed_apps?access_token=${encodeURIComponent(credentials.pageAccessToken ?? '')}`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ subscribed_fields: fields.join(',') }) },
+      );
+      if (!res.ok) throw new AppError('INSTAGRAM_WEBHOOK_SUBSCRIPTION_FAILED', 502, 'Instagram connected through Facebook, but message webhook delivery could not be enabled.');
+      return;
+    }
+    const params = new URLSearchParams({
+      subscribed_fields: ['messages', 'messaging_seen', 'messaging_postbacks'].join(','),
+      access_token: credentials.accessToken ?? '',
+    });
+    const res = await fetch(
+      `${env.instagram.graphUrl}/${credentials.instagramAccountId}/subscribed_apps?${params.toString()}`,
+      { method: 'POST' },
+    );
+    if (!res.ok) {
+      throw new AppError('INSTAGRAM_WEBHOOK_SUBSCRIPTION_FAILED', 502, 'Instagram connected, but message webhook delivery could not be enabled. Reconnect and confirm the messaging permission.');
+    }
+    return;
+  }
+
+  const fields = ['messages', 'message_deliveries', 'message_reads', 'messaging_postbacks'];
   const res = await fetch(
     `${graph()}/${credentials.pageId}/subscribed_apps?access_token=${encodeURIComponent(credentials.pageAccessToken ?? '')}`,
     {

@@ -47,7 +47,8 @@ interface MetaWebhookBody {
 /**
  * Facebook Messenger & Instagram DM share the Meta Graph messaging shape;
  * this adapter is parametrized by channel + webhook object type.
- * Credentials: { pageAccessToken, appSecret, pageId }.
+ * Messenger credentials: { pageAccessToken, appSecret, pageId }.
+ * Direct Instagram credentials: { accessToken, appSecret, instagramAccountId }.
  */
 export class MetaMessagingAdapter implements ChannelAdapter {
   constructor(
@@ -161,10 +162,15 @@ export class MetaMessagingAdapter implements ChannelAdapter {
   }
 
   async sendMessage(payload: OutboundPayload, account: ChannelAccountRef): Promise<SendResult> {
-    const token = account.credentials.pageAccessToken;
+    const instagram = this.channelType === 'INSTAGRAM';
+    const directInstagram = instagram && Boolean(account.credentials.accessToken);
+    const token = directInstagram ? account.credentials.accessToken : account.credentials.pageAccessToken;
     if (!token) {
-      throw new AppError('CHANNEL_MISCONFIGURED', 500, `${this.channelType} page token missing`);
+      throw new AppError('CHANNEL_MISCONFIGURED', 500, `${this.channelType} access token missing`);
     }
+    const messagesUrl = directInstagram
+      ? `${env.instagram.graphUrl}/${account.credentials.instagramAccountId}/messages?access_token=${encodeURIComponent(token)}`
+      : `${graph()}/me/messages?access_token=${encodeURIComponent(token)}`;
     /*
      * Attachments go up first, each as its own message.
      *
@@ -197,7 +203,7 @@ export class MetaMessagingAdapter implements ChannelAdapter {
         attachment.filename,
       );
       const upload = await fetch(
-        `${graph()}/me/messages?access_token=${encodeURIComponent(token)}`,
+        messagesUrl,
         { method: 'POST', body: form },
       );
       const uploadJson = (await upload.json()) as { error?: { message?: string } };
@@ -215,7 +221,7 @@ export class MetaMessagingAdapter implements ChannelAdapter {
       return { providerMessageId: `attachment.${Date.now()}` };
     }
 
-    const res = await fetch(`${graph()}/me/messages?access_token=${encodeURIComponent(token)}`, {
+    const res = await fetch(messagesUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -236,13 +242,16 @@ export class MetaMessagingAdapter implements ChannelAdapter {
   }
 
   async onAccountConnected(account: ChannelAccountRef, _webhookUrl: string): Promise<string | null> {
+    const instagram = this.channelType === 'INSTAGRAM';
+    const directInstagram = instagram && Boolean(account.credentials.accessToken);
+    const token = directInstagram ? account.credentials.accessToken : account.credentials.pageAccessToken;
     const res = await fetch(
-      `${graph()}/me?access_token=${encodeURIComponent(account.credentials.pageAccessToken ?? '')}`
+      `${directInstagram ? env.instagram.graphUrl : graph()}/me?access_token=${encodeURIComponent(token ?? '')}`
     );
     if (!res.ok) {
-      throw new AppError('CHANNEL_MISCONFIGURED', 400, 'Page access token invalid');
+      throw new AppError('CHANNEL_MISCONFIGURED', 400, `${instagram ? 'Instagram' : 'Page'} access token invalid`);
     }
-    const me = (await res.json()) as { name?: string };
-    return `Connected to "${me.name ?? 'page'}". Vhicasar uses the platform-level ${this.webhookObject} webhook; no business-specific callback setup is required.`;
+    const me = (await res.json()) as { name?: string; username?: string };
+    return `Connected to "${me.username ? `@${me.username}` : me.name ?? (instagram ? 'Instagram account' : 'page')}". Vhicasar uses the platform-level ${this.webhookObject} webhook; no business-specific callback setup is required.`;
   }
 }

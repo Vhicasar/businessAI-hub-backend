@@ -9,7 +9,7 @@ import { inboxService } from '../../application/inbox/inbox.service';
 import { decrypt } from '../../shared/crypto';
 import { markWebhookReceived } from '../../application/inbox/channel-health.service';
 import { env } from '../../shared/config/env';
-import { metaAppSecret } from '../../application/inbox/channel-oauth.service';
+import { metaWebhookAppSecret } from '../../application/inbox/channel-oauth.service';
 import { verifyMetaSignature } from '../../infrastructure/channels/whatsapp.adapter';
 
 /**
@@ -99,7 +99,7 @@ webhookRoutes.post('/:meta(whatsapp|messenger|instagram)', (req, res) => {
   const channelType = META_ROUTES[meta];
   const body = req.body as { entry?: Array<Record<string, unknown>> };
   const rawBody = (req as unknown as { rawBody?: Buffer }).rawBody;
-  if (!verifyMetaSignature({ headers: req.headers, body, query: req.query as Record<string, unknown>, rawBody }, metaAppSecret())) {
+  if (!verifyMetaSignature({ headers: req.headers, body, query: req.query as Record<string, unknown>, rawBody }, metaWebhookAppSecret(channelType))) {
     logger.warn({ channelType }, 'Meta webhook signature verification failed');
     res.sendStatus(401);
     return;

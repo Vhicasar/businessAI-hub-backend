@@ -50,6 +50,12 @@ const envSchema = z
      * production leaves it alone.
      */
     META_GRAPH_BASE_URL: z.string().url().default('https://graph.facebook.com'),
+    INSTAGRAM_APP_ID: z.string().optional().or(z.literal('')),
+    INSTAGRAM_APP_SECRET: z.string().optional().or(z.literal('')),
+    INSTAGRAM_AUTH_BASE_URL: z.string().url().default('https://www.instagram.com'),
+    INSTAGRAM_API_BASE_URL: z.string().url().default('https://api.instagram.com'),
+    INSTAGRAM_GRAPH_BASE_URL: z.string().url().default('https://graph.instagram.com'),
+    INSTAGRAM_LOGIN_MODE: z.enum(['DIRECT_INSTAGRAM', 'FACEBOOK_PAGE']).default('DIRECT_INSTAGRAM'),
 
     /*
      * SMS. Vhicasar holds one provider account centrally and resells credits,
@@ -306,6 +312,16 @@ export const env = {
     graphUrl: `${raw.META_GRAPH_BASE_URL.replace(/\/$/, '')}/${raw.META_GRAPH_VERSION}`,
     /** OAuth is only offered when both halves are present. */
     enabled: Boolean(raw.META_APP_ID && raw.META_APP_SECRET),
+  },
+  instagram: {
+    appId: raw.INSTAGRAM_APP_ID || raw.META_APP_ID || '',
+    appSecret: raw.INSTAGRAM_APP_SECRET || raw.META_APP_SECRET || '',
+    authBaseUrl: raw.INSTAGRAM_AUTH_BASE_URL.replace(/\/$/, ''),
+    apiBaseUrl: raw.INSTAGRAM_API_BASE_URL.replace(/\/$/, ''),
+    graphBaseUrl: raw.INSTAGRAM_GRAPH_BASE_URL.replace(/\/$/, ''),
+    graphUrl: `${raw.INSTAGRAM_GRAPH_BASE_URL.replace(/\/$/, '')}/${raw.META_GRAPH_VERSION}`,
+    loginMode: raw.INSTAGRAM_LOGIN_MODE,
+    enabled: Boolean((raw.INSTAGRAM_APP_ID || raw.META_APP_ID) && (raw.INSTAGRAM_APP_SECRET || raw.META_APP_SECRET)),
   },
   sms: {
     provider: raw.SMS_PROVIDER,

@@ -39,6 +39,7 @@ export const connectChannelSchema = z.object({
     SMS: ['accountSid', 'authToken'],
     TIKTOK: ['clientKey', 'clientSecret', 'accessToken', 'openId'],
     WHATSAPP: ['accessToken', 'phoneNumberId', 'appSecret'],
+    INSTAGRAM: ['accessToken', 'instagramAccountId'],
     EMAIL: ['imapHost', 'imapUser', 'imapPass', 'smtpHost'],
   };
   for (const key of required[dto.channelType] ?? []) {
@@ -63,8 +64,9 @@ function deriveExternalId(dto: ConnectChannelDto): string {
     case 'WHATSAPP':
       return dto.credentials.phoneNumberId || randomUUID();
     case 'FACEBOOK_MESSENGER':
-    case 'INSTAGRAM':
       return dto.credentials.pageId || randomUUID();
+    case 'INSTAGRAM':
+      return dto.credentials.instagramAccountId || randomUUID();
     case 'EMAIL':
       return (dto.credentials.imapUser ?? '').toLowerCase() || randomUUID();
     case 'SMS':
@@ -81,7 +83,7 @@ function metaRoutingFields(channelType: string, credentials: Record<string, stri
   return {
     metaWabaId: channelType === 'WHATSAPP' ? credentials.wabaId || null : null,
     metaPhoneNumberId: channelType === 'WHATSAPP' ? credentials.phoneNumberId || null : null,
-    metaFacebookPageId: channelType === 'FACEBOOK_MESSENGER' || channelType === 'INSTAGRAM' ? credentials.pageId || null : null,
+    metaFacebookPageId: channelType === 'FACEBOOK_MESSENGER' ? credentials.pageId || null : null,
     metaInstagramAccountId: channelType === 'INSTAGRAM' ? credentials.instagramAccountId || null : null,
   };
 }

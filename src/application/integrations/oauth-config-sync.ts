@@ -15,6 +15,7 @@ import { logger } from '../../shared/logger';
 export interface OAuthAppCredentials {
   clientId: string;
   clientSecret: string;
+  loginMode?: 'DIRECT_INSTAGRAM' | 'FACEBOOK_PAGE';
 }
 
 /** Admin-supplied apps, keyed by provider. Null until the first sync. */
@@ -42,6 +43,8 @@ export function oauthCredentials(provider: string): OAuthAppCredentials | null {
           // secret no longer means a redeploy.
           provider === 'meta'
           ? { clientId: env.meta.appId, clientSecret: env.meta.appSecret }
+          : provider === 'instagram'
+            ? { clientId: env.instagram.appId, clientSecret: env.instagram.appSecret, loginMode: env.instagram.loginMode }
           : null;
 
   return local?.clientId && local.clientSecret ? local : null;
@@ -68,7 +71,13 @@ export async function syncOAuthConfigFromAdmin(): Promise<boolean> {
     const clean: Record<string, OAuthAppCredentials> = {};
     for (const [provider, creds] of Object.entries(apps)) {
       if (creds?.clientId && creds.clientSecret) {
-        clean[provider] = { clientId: creds.clientId, clientSecret: creds.clientSecret };
+        clean[provider] = {
+          clientId: creds.clientId,
+          clientSecret: creds.clientSecret,
+          ...(creds.loginMode === 'FACEBOOK_PAGE' || creds.loginMode === 'DIRECT_INSTAGRAM'
+            ? { loginMode: creds.loginMode }
+            : {}),
+        };
       }
     }
 

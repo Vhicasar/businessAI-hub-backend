@@ -38,8 +38,8 @@ channelOAuthRoutes.get(
   wrap(async (req, res) => {
     const channelType = String(req.params.channel).toUpperCase() as ChannelType;
     const settings = `${env.WEB_APP_URL}/settings/integrations?tab=channels`;
-    const fail = (message: string) => {
-      res.redirect(`${settings}&connect=error&reason=${encodeURIComponent(message)}`);
+    const fail = (message: string, code?: string) => {
+      res.redirect(`${settings}&connect=error${code ? `&connect_code=${encodeURIComponent(code)}` : ''}&reason=${encodeURIComponent(message)}`);
     };
 
     // The user pressed Cancel on the provider's dialog, or it refused outright.
@@ -47,7 +47,8 @@ channelOAuthRoutes.get(
       fail(
         typeof req.query.error_description === 'string'
           ? req.query.error_description
-          : 'The connection was cancelled.'
+          : 'The connection was cancelled.',
+        channelType === 'INSTAGRAM' ? 'INSTAGRAM_AUTH_DENIED' : undefined,
       );
       return;
     }
@@ -55,7 +56,7 @@ channelOAuthRoutes.get(
     const code = req.query.code;
     const state = req.query.state;
     if (typeof code !== 'string' || typeof state !== 'string') {
-      fail('That connection link was incomplete. Please try connecting again.');
+      fail('That connection link was incomplete. Please try connecting again.', channelType === 'INSTAGRAM' ? 'INSTAGRAM_CODE_MISSING' : undefined);
       return;
     }
 
@@ -64,14 +65,22 @@ channelOAuthRoutes.get(
 
       // Bind the tenant the signed state named, so everything below is
       // auto-scoped to the business that actually started this flow.
-      const account = await requestContext.run(
-        {
-          requestId: randomUUID(),
-          organizationId: connection.organizationId,
-          userId: connection.userId,
-        },
-        () => channelsService.connectFromOAuth(connection)
-      );
+      let account: Awaited<ReturnType<typeof channelsService.connectFromOAuth>>;
+      try {
+        account = await requestContext.run(
+          {
+            requestId: randomUUID(),
+            organizationId: connection.organizationId,
+            userId: connection.userId,
+          },
+          () => channelsService.connectFromOAuth(connection)
+        );
+      } catch (saveError) {
+        if (channelType === 'INSTAGRAM' && !(saveError instanceof AppError)) {
+          throw new AppError('INSTAGRAM_DATABASE_SAVE_FAILED', 500, 'Instagram authorized successfully, but Vhicasar could not save the connection. Please try again.', { cause: saveError });
+        }
+        throw saveError;
+      }
 
       /*
        * Subscribing is what makes messages actually arrive. Done after the
@@ -108,7 +117,8 @@ channelOAuthRoutes.get(
       fail(
         err instanceof AppError
           ? err.message
-          : 'We could not finish connecting that account. Please try again.'
+          : 'We could not finish connecting that account. Please try again.',
+        err instanceof AppError ? err.code : channelType === 'INSTAGRAM' ? 'INSTAGRAM_PROVIDER_ERROR' : undefined,
       );
     }
   })
