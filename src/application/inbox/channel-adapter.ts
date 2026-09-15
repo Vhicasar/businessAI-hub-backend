@@ -7,6 +7,14 @@ export interface NormalizedInbound {
   /** Provider-side sender identity (phone, chat id, page-scoped id…). */
   senderExternalId: string;
   senderDisplayName?: string;
+  senderProfile?: {
+    firstName?: string;
+    lastName?: string;
+    username?: string;
+    email?: string;
+    phone?: string;
+    profileUrl?: string;
+  };
   contentType: MessageContentType;
   text?: string;
   /** Original thread subject for subject-based channels such as email. */
@@ -133,6 +141,9 @@ export interface ChannelAdapter {
 
   /** Extract zero..n messages from one webhook delivery. */
   parseInbound(body: unknown): NormalizedInbound[];
+
+  /** Fetch profile fields omitted from webhook payloads (notably Meta PSIDs). */
+  enrichInbound?(inbound: NormalizedInbound, account: ChannelAccountRef): Promise<NormalizedInbound>;
 
   /**
    * Extract delivery receipts from the same webhook delivery.

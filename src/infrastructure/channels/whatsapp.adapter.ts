@@ -97,6 +97,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
             providerMessageId: msg.id,
             senderExternalId: msg.from,
             senderDisplayName: name,
+            senderProfile: { phone: msg.from, ...(name ? { firstName: name.split(/\s+/)[0], lastName: name.split(/\s+/).slice(1).join(' ') || undefined } : {}) },
             sentAt: msg.timestamp ? new Date(Number(msg.timestamp) * 1000) : undefined,
             raw: msg,
           };

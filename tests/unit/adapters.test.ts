@@ -1,5 +1,5 @@
 import { createHmac } from 'crypto';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { TelegramAdapter } from '../../src/infrastructure/channels/telegram.adapter';
 import { WhatsAppAdapter, verifyMetaSignature } from '../../src/infrastructure/channels/whatsapp.adapter';
 import { MetaMessagingAdapter } from '../../src/infrastructure/channels/meta.adapter';
@@ -130,6 +130,7 @@ describe('WhatsAppAdapter.parseInbound', () => {
 
 describe('MetaMessagingAdapter', () => {
   const messenger = new MetaMessagingAdapter('FACEBOOK_MESSENGER', 'page');
+  afterEach(() => vi.restoreAllMocks());
 
   it('parses messenger text and filters echoes', () => {
     const body = {
@@ -151,5 +152,18 @@ describe('MetaMessagingAdapter', () => {
     const pageBody = { object: 'page', entry: [{ messaging: [{ sender: { id: 'x' }, message: { mid: 'm' , text: 't' } }] }] };
     expect(instagram.parseInbound(pageBody)).toEqual([]);
     expect(messenger.parseInbound(pageBody)).toHaveLength(1);
+  });
+
+  it('enriches a sender id with the Meta profile used by the contact record', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ first_name: 'Ada', last_name: 'Okafor', name: 'Ada Okafor', profile_pic: 'https://example.test/ada.jpg' }),
+    }));
+    const inbound = messenger.parseInbound({ object: 'page', entry: [{ messaging: [{ sender: { id: 'psid-1' }, message: { mid: 'm1', text: 'Hello' } }] }] })[0]!;
+    const enriched = await messenger.enrichInbound(inbound, account({ credentials: { pageAccessToken: 'page-token' } }));
+    expect(enriched).toMatchObject({
+      senderDisplayName: 'Ada Okafor',
+      senderProfile: { firstName: 'Ada', lastName: 'Okafor', profileUrl: 'https://example.test/ada.jpg' },
+    });
   });
 });

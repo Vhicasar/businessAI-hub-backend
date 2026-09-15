@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { Prisma, type ChannelType } from '@prisma/client';
+import { Prisma, type ChannelType, type Customer } from '@prisma/client';
 import { ConflictError, NotFoundError } from '../../shared/errors';
 import { prisma } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
@@ -80,6 +80,84 @@ function statedName(text: string | null | undefined): string | null {
   ]);
   if (notNames.has(first.toLowerCase())) return null;
   return [first, match[2]].filter(Boolean).join(' ');
+}
+
+function usefulName(value: string | null | undefined): string | null {
+  const name = value?.replace(/\s+/g, ' ').trim().slice(0, 160);
+  if (!name || /^[^\s@]+@[^\s@]+$/.test(name) || /^\+?\d{6,}$/.test(name)) return null;
+  if (/^(customer|contact|user)\s+[a-z0-9_.:-]+$/i.test(name)) return null;
+  return name;
+}
+
+function placeholderCustomer(customer: Pick<Customer, 'firstName' | 'displayName' | 'isProvisional'>): boolean {
+  const name = customer.displayName || customer.firstName;
+  return customer.isProvisional || !usefulName(name) || /^(unknown|website visitor|visitor|guest|anonymous)$/i.test(name.trim());
+}
+
+function contactPhone(value: string | undefined): string | null {
+  const phone = value?.trim();
+  if (!phone) return null;
+  if (/^\d{7,15}$/.test(phone)) return `+${phone}`;
+  return /^\+\d{7,15}$/.test(phone) ? phone : null;
+}
+
+async function syncInboundCustomerProfile(
+  identity: { id: string; customerId: string; displayName: string | null; profileUrl: string | null; customer: Customer },
+  channelType: ChannelType,
+  inbound: NormalizedInbound,
+): Promise<void> {
+  const profile = inbound.senderProfile;
+  const structured = usefulName([profile?.firstName, profile?.lastName].filter(Boolean).join(' '));
+  const displayName = structured || usefulName(inbound.senderDisplayName) || usefulName(profile?.username ? `@${profile.username}` : null);
+  const split = displayName?.replace(/^@/, '').split(/\s+/) ?? [];
+  const shouldReplaceName = Boolean(displayName && placeholderCustomer(identity.customer));
+  const email = profile?.email?.trim().toLowerCase();
+  const validEmail = email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : null;
+  const phone = contactPhone(profile?.phone);
+  const oldCustom = identity.customer.customFields && typeof identity.customer.customFields === 'object' && !Array.isArray(identity.customer.customFields)
+    ? identity.customer.customFields as Record<string, unknown> : {};
+  const oldProfiles = oldCustom.channelProfiles && typeof oldCustom.channelProfiles === 'object' && !Array.isArray(oldCustom.channelProfiles)
+    ? oldCustom.channelProfiles as Record<string, unknown> : {};
+  const channelProfile = Object.fromEntries(Object.entries({
+    username: profile?.username || undefined,
+    displayName: displayName || undefined,
+    profileUrl: profile?.profileUrl || undefined,
+    updatedAt: new Date().toISOString(),
+  }).filter(([, value]) => value !== undefined));
+
+  await prisma.customerIdentity.update({
+    where: { id: identity.id },
+    data: {
+      ...(displayName ? { displayName } : {}),
+      ...(profile?.profileUrl ? { profileUrl: profile.profileUrl } : {}),
+    },
+  });
+  const updated = await prisma.customer.update({
+      where: { id: identity.customerId },
+      data: {
+        ...(shouldReplaceName ? {
+          firstName: profile?.firstName?.trim().slice(0, 80) || split[0] || 'Unknown',
+          lastName: profile?.lastName?.trim().slice(0, 80) || split.slice(1).join(' ') || null,
+          displayName,
+          isProvisional: false,
+        } : {}),
+        customFields: { ...oldCustom, channelProfiles: { ...oldProfiles, [channelType]: channelProfile } } as Prisma.InputJsonValue,
+        lastContactAt: new Date(),
+      },
+    });
+  identity.customer = updated;
+  identity.displayName = displayName || identity.displayName;
+  identity.profileUrl = profile?.profileUrl || identity.profileUrl;
+  for (const data of [
+    !updated.email && validEmail ? { email: validEmail } : null,
+    !updated.phone && phone ? { phone } : null,
+  ].filter((value): value is { email: string } | { phone: string } => Boolean(value))) {
+    await prisma.customer.update({ where: { id: identity.customerId }, data }).then((customer) => { identity.customer = customer; }).catch((error) => {
+      // That address belongs to another CRM record. Keep the name/profile and
+      // message rather than failing the webhook.
+      logger.warn({ error, customerId: identity.customerId, channelType, field: 'email' in data ? 'email' : 'phone' }, 'Could not backfill inbound customer contact field');
+    });
+  }
 }
 
 /**
@@ -166,15 +244,19 @@ export const inboxService = {
     });
 
     if (!identity) {
-      const displayName = inbound.senderDisplayName ?? `Customer ${inbound.senderExternalId}`;
+      const profileName = [inbound.senderProfile?.firstName, inbound.senderProfile?.lastName].filter(Boolean).join(' ');
+      const displayName = usefulName(profileName) || usefulName(inbound.senderDisplayName) || usefulName(inbound.senderProfile?.username ? `@${inbound.senderProfile.username}` : null) || `${account.channelType.replace(/_/g, ' ')} contact`;
       const [firstName, ...rest] = displayName.split(' ');
       const senderEmail = account.channelType === 'EMAIL' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(inbound.senderExternalId)
         ? inbound.senderExternalId.trim().toLowerCase()
-        : null;
-      // An email address is a stable customer identity. Reuse a CRM customer
-      // that already has it instead of creating a duplicate contact.
-      let customer = senderEmail
-        ? await prisma.customer.findFirst({ where: { email: senderEmail, deletedAt: null } })
+        : inbound.senderProfile?.email?.trim().toLowerCase() ?? null;
+      const senderPhone = contactPhone(inbound.senderProfile?.phone);
+      // Stable email/phone identities reuse an existing CRM contact instead
+      // of creating a second customer for the same person.
+      let customer = senderEmail || senderPhone
+        ? await prisma.customer.findFirst({
+            where: { deletedAt: null, OR: [...(senderEmail ? [{ email: senderEmail }] : []), ...(senderPhone ? [{ phone: senderPhone }] : [])] },
+          })
         : null;
       customer ??= await prisma.customer.create({
           data: {
@@ -183,6 +265,7 @@ export const inboxService = {
             lastName: rest.join(' ') || null,
             displayName,
             email: senderEmail,
+            phone: senderPhone,
             isProvisional: account.channelType === 'WEB_CHAT' && /^(website visitor|visitor|guest|anonymous)$/i.test(displayName.trim()),
             lastContactAt: new Date(),
           },
@@ -199,6 +282,8 @@ export const inboxService = {
         include: { customer: true },
       });
     }
+
+    await syncInboundCustomerProfile(identity, account.channelType, inbound);
 
     // Backfill contacts created by older versions where the sender address was
     // kept only in CustomerIdentity.externalId.
@@ -666,7 +751,7 @@ export const inboxService = {
     const [identities, conversations, accounts] = await Promise.all([
       prisma.customerIdentity.findMany({
         where: { customerId },
-        select: { channelType: true, displayName: true, externalId: true, channelAccountId: true },
+        select: { channelType: true, displayName: true, externalId: true, profileUrl: true, channelAccountId: true },
       }),
       prisma.conversation.findMany({
         where: { customerId },
@@ -683,6 +768,8 @@ export const inboxService = {
       channels: identities.map((i) => ({
         channelType: i.channelType,
         handle: i.displayName ?? i.externalId,
+        externalId: i.externalId,
+        profileUrl: i.profileUrl,
         connected: connected.includes(i.channelType),
       })),
       connectedChannels: connected,

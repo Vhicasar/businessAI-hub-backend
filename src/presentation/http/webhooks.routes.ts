@@ -53,20 +53,24 @@ type WebhookAccount = Awaited<ReturnType<typeof prismaUnscoped.channelAccount.fi
 async function processForAccount(account: NonNullable<WebhookAccount>, body: unknown, headers: Record<string, string | string[] | undefined>, query: Record<string, unknown>, rawBody?: Buffer) {
   const channelType = account.channelType;
   const adapter = getAdapter(channelType);
+  const accountRef = {
+    id: account.id, organizationId: account.organizationId, externalId: account.externalId,
+    credentials: account.credentialsEnc ? JSON.parse(decrypt(account.credentialsEnc)) as Record<string, string> : {},
+    webhookSecret: account.webhookSecret,
+  };
   const verified = adapter.verifyWebhook(
     { headers, body, query, rawBody },
-    {
-      id: account.id, organizationId: account.organizationId, externalId: account.externalId,
-      credentials: account.credentialsEnc ? JSON.parse(decrypt(account.credentialsEnc)) as Record<string, string> : {},
-      webhookSecret: account.webhookSecret,
-    },
+    accountRef,
   );
   if (!verified) {
     logger.warn({ channelType }, 'Webhook signature verification failed');
     return;
   }
   await markWebhookReceived(account.id);
-  const messages = adapter.parseInbound(body);
+  const parsedMessages = adapter.parseInbound(body);
+  const messages = adapter.enrichInbound
+    ? await Promise.all(parsedMessages.map((message) => adapter.enrichInbound!(message, accountRef)))
+    : parsedMessages;
   const statuses = adapter.parseStatuses?.(body) ?? [];
   await requestContext.run(
     { requestId: randomUUID(), organizationId: account.organizationId },
@@ -181,6 +185,15 @@ webhookRoutes.post('/:channel/:accountId', (req, res) => {
       }
 
       const adapter = getAdapter(channelType);
+      const accountRef = {
+        id: account.id,
+        organizationId: account.organizationId,
+        externalId: account.externalId,
+        credentials: account.credentialsEnc
+          ? (JSON.parse(decrypt(account.credentialsEnc)) as Record<string, string>)
+          : {},
+        webhookSecret: account.webhookSecret,
+      };
       const verified = adapter.verifyWebhook(
         {
           headers: req.headers,
@@ -188,15 +201,7 @@ webhookRoutes.post('/:channel/:accountId', (req, res) => {
           query: req.query as Record<string, unknown>,
           rawBody: (req as unknown as { rawBody?: Buffer }).rawBody,
         },
-        {
-          id: account.id,
-          organizationId: account.organizationId,
-          externalId: account.externalId,
-          credentials: account.credentialsEnc
-            ? (JSON.parse(decrypt(account.credentialsEnc)) as Record<string, string>)
-            : {},
-          webhookSecret: account.webhookSecret,
-        }
+        accountRef
       );
       if (!verified) {
         logger.warn({ accountId: account.id, channelType }, 'Webhook signature verification failed');
@@ -207,7 +212,10 @@ webhookRoutes.post('/:channel/:accountId', (req, res) => {
       // channel that has recovered stops showing last week's failure.
       await markWebhookReceived(account.id);
 
-      const messages = adapter.parseInbound(req.body);
+      const parsedMessages = adapter.parseInbound(req.body);
+      const messages = adapter.enrichInbound
+        ? await Promise.all(parsedMessages.map((message) => adapter.enrichInbound!(message, accountRef)))
+        : parsedMessages;
       // One delivery can carry both new messages and receipts for old ones.
       const statuses = adapter.parseStatuses?.(req.body) ?? [];
       if (messages.length === 0 && statuses.length === 0) return;

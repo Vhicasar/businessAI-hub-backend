@@ -211,6 +211,10 @@ async function pollAccount(account: {
                 providerMessageId: parsed.messageId ?? `mail_${uid}_${account.id}`,
                 senderExternalId: fromAddress,
                 senderDisplayName: parsed.from?.value?.[0]?.name || fromAddress,
+                senderProfile: {
+                  email: fromAddress,
+                  ...(parsed.from?.value?.[0]?.name ? { firstName: parsed.from.value[0].name.split(/\s+/)[0], lastName: parsed.from.value[0].name.split(/\s+/).slice(1).join(' ') || undefined } : {}),
+                },
                 contentType: 'TEXT',
                 text,
                 subject: subject || undefined,

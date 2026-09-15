@@ -27,6 +27,7 @@ export class SmsAdapter implements ChannelAdapter {
     return [{
       providerMessageId: id,
       senderExternalId: message.From,
+      senderProfile: { phone: message.From },
       contentType: Number(message.NumMedia ?? 0) > 0 ? 'IMAGE' : 'TEXT',
       text: message.Body,
       raw: body,

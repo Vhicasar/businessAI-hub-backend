@@ -55,6 +55,11 @@ export class TelegramAdapter implements ChannelAdapter {
       providerMessageId: String(msg.message_id),
       senderExternalId: String(msg.chat.id),
       senderDisplayName: name,
+      senderProfile: {
+        firstName: msg.from.first_name,
+        lastName: msg.from.last_name,
+        username: msg.from.username,
+      },
       sentAt: new Date(msg.date * 1000),
       raw: update,
     };
