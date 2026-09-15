@@ -16,6 +16,7 @@ import {
   connectChannelSchema,
 } from '../../../application/inbox/channels.service';
 import { authorizationUrl } from '../../../application/inbox/channel-oauth.service';
+import { isAutomaticChannelConnectEnabled } from '../../../application/settings/workspace-config';
 import { allowanceFor } from '../../../application/inbox/channel-allowance.service';
 import type { ChannelType } from '@prisma/client';
 import { env } from '../../../shared/config/env';
@@ -170,6 +171,9 @@ inboxRoutes.post(
   requirePermission('inbox.manage_channels', 'settings.manage_integrations'),
   wrap(async (req, res) => {
     const channelType = String(req.params.channel).toUpperCase() as ChannelType;
+    if (!isAutomaticChannelConnectEnabled(channelType)) {
+      throw new ConflictError('Automatic WhatsApp Business connection is currently disabled by Vhicasar.');
+    }
     // Refuse here rather than after a round trip to Meta: the connect flow is
     // already gated at the callback, but failing only there means sending the
     // business off to authorise an account we were never going to accept.

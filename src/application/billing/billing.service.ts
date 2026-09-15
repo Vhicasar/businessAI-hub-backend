@@ -13,6 +13,9 @@ import { ensureFreshPlans } from './plan-sync';
 import { smsWalletService } from './sms-wallet.service';
 import { addOnsService } from './add-ons.service';
 import { ensureFreshPaymentConfig } from './payment-config-sync';
+import { getWorkspaceConfig } from '../settings/workspace-config';
+import { mailer } from '../../infrastructure/mail/mailer';
+import { env } from '../../shared/config/env';
 
 export const checkoutSchema = z.object({
   planSlug: z.string().min(1),
@@ -27,6 +30,15 @@ function addInterval(from: Date, interval: Interval): Date {
   if (interval === 'YEARLY') d.setUTCFullYear(d.getUTCFullYear() + 1);
   else d.setUTCMonth(d.getUTCMonth() + 1);
   return d;
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]!);
+}
+
+function failedPaymentReason(value?: string): string {
+  const reason = value?.replace(/\s+/g, ' ').trim().slice(0, 300);
+  return reason || 'The payment provider did not approve the scheduled subscription charge. Your bank or card issuer may have declined it, or the payment method may need to be updated.';
 }
 
 function planDto(p: Plan) {
@@ -409,6 +421,10 @@ export const billingService = {
         await this.linkSubscriptionCode(event);
         return;
       }
+      if (event.type === 'charge_failed' && event.subscriptionCode) {
+        await this.markPastDueByCode(event);
+        return;
+      }
       if (event.type === 'subscription_disable' && event.subscriptionCode) {
         await this.markCancelledByCode(event.subscriptionCode);
         return;
@@ -457,7 +473,7 @@ export const billingService = {
     const end = addInterval(now, sub.interval as Interval);
     await prismaUnscoped.subscription.update({
       where: { id: sub.id },
-      data: { status: 'ACTIVE', currentPeriodStart: now, currentPeriodEnd: end },
+      data: { status: 'ACTIVE', pastDueAt: null, currentPeriodStart: now, currentPeriodEnd: end },
     });
     await prismaUnscoped.billingRecord.create({
       data: {
@@ -473,6 +489,52 @@ export const billingService = {
       },
     });
     logger.info({ subscriptionId: sub.id }, 'Subscription renewed from webhook');
+  },
+
+  async markPastDueByCode(event: NormalizedWebhookEvent) {
+    const subscriptionCode = event.subscriptionCode!;
+    const sub = await prismaUnscoped.subscription.findFirst({
+      where: { providerSubscriptionCode: subscriptionCode },
+      include: { plan: { select: { name: true } }, organization: { select: { name: true, email: true, timezone: true } } },
+    });
+    if (!sub) return;
+    const pastDueAt = sub.pastDueAt ?? new Date();
+    await prismaUnscoped.subscription.update({
+      where: { id: sub.id },
+      data: { status: 'PAST_DUE', pastDueAt },
+    });
+    logger.warn({ subscriptionId: sub.id, organizationId: sub.organizationId }, 'Subscription payment failed; grace period started');
+
+    const noticeId = `${event.provider}:${event.reference ?? `${subscriptionCode}:${pastDueAt.toISOString()}`}`;
+    const alreadyNotified = await prismaUnscoped.auditLog.findFirst({
+      where: { organizationId: sub.organizationId, action: 'billing.subscription_payment_failed_notice', entityId: noticeId },
+      select: { id: true },
+    });
+    if (alreadyNotified) return;
+
+    const owners = await prismaUnscoped.membership.findMany({
+      where: { organizationId: sub.organizationId, isOwner: true, isActive: true, deletedAt: null },
+      select: { user: { select: { email: true, firstName: true } } },
+    });
+    const recipients = [...new Set([sub.organization.email, ...owners.map((owner) => owner.user.email)].filter((email): email is string => Boolean(email)))];
+    const graceDays = Math.max(0, Math.floor(getWorkspaceConfig().billing.failedSubscriptionGraceDays));
+    const graceEndsAt = new Date(pastDueAt.getTime() + graceDays * 86_400_000);
+    const reason = failedPaymentReason(event.failureReason);
+    const deadline = graceEndsAt.toLocaleString('en', {
+      dateStyle: 'long', timeStyle: 'short', timeZone: sub.organization.timezone || 'UTC',
+    });
+    const billingUrl = `${env.WEB_APP_URL.replace(/\/$/, '')}/billing`;
+    const body = `<p>We could not renew the <strong>${escapeHtml(sub.plan.name)}</strong> subscription for <strong>${escapeHtml(sub.organization.name)}</strong>.</p>
+      <p><strong>Reason:</strong> ${escapeHtml(reason)}</p>
+      <p>Your ${graceDays === 0 ? 'grace period has ended' : `${graceDays}-day grace period ends on ${escapeHtml(deadline)}`}. During the grace period your current plan remains available.</p>
+      <p>If payment is not completed before the grace period ends, the workspace will automatically move to the free plan. Features and limits from the paid plan will be restricted, team members will temporarily lose workspace access, and contacts or products above the free-plan limits will be retained safely as subscription drafts.</p>
+      <p><a href="${escapeHtml(billingUrl)}">Update billing and retry payment</a></p>
+      <p style="font-size:12px;color:#6b778c">No business data is deleted when the workspace moves to the free plan.</p>`;
+    const text = `We could not renew the ${sub.plan.name} subscription for ${sub.organization.name}.\n\nReason: ${reason}\n\nYour ${graceDays === 0 ? 'grace period has ended' : `${graceDays}-day grace period ends on ${deadline}`}. If payment is not completed, the workspace will automatically move to the free plan. Paid features and limits will be restricted, team members will temporarily lose access, and excess contacts/products will be retained as subscription drafts. No business data will be deleted.\n\nUpdate billing: ${billingUrl}`;
+    await Promise.all(recipients.map((email) => mailer.sendNotice(email, `Action required: ${sub.organization.name} subscription payment failed`, 'Subscription payment failed', body, text, { organizationId: sub.organizationId })));
+    await prismaUnscoped.auditLog.create({
+      data: { organizationId: sub.organizationId, actorType: 'SYSTEM', action: 'billing.subscription_payment_failed_notice', entityType: 'Subscription', entityId: noticeId, after: { provider: event.provider, recipientCount: recipients.length, graceDays, graceEndsAt } },
+    });
   },
 
   /** Schedules cancellation when the gateway reports a subscription disabled. */

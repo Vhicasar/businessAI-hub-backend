@@ -5,6 +5,7 @@ export const listProductsSchema = z.object({
   categoryId: z.string().optional(),
   brandId: z.string().optional(),
   status: z.enum(['DRAFT', 'ACTIVE', 'ARCHIVED']).optional(),
+  subscriptionState: z.enum(['active', 'draft']).default('active'),
   /**
    * Cursor paging orders by id under the hood, so every sort has to end in a
    * unique tiebreak or a page boundary can repeat or skip a row.

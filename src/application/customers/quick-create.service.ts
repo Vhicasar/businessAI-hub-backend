@@ -110,7 +110,7 @@ export const quickCreate = {
    * is reused and quietly enriched, and an existing Vhicasar identity is linked
    * so the business appears in that person's Super App straight away.
    */
-  async resolve(organizationId: string, input: QuickCreateInput): Promise<QuickCreateResult> {
+  async resolve(organizationId: string, input: QuickCreateInput, subscriptionDraftReason?: string): Promise<QuickCreateResult> {
     const org = await prismaUnscoped.organization.findUnique({
       where: { id: organizationId },
       select: { country: true, name: true },
@@ -143,6 +143,9 @@ export const quickCreate = {
       },
       org?.country
     );
+    if (result.created && subscriptionDraftReason) {
+      await prisma.customer.update({ where: { id: result.customer.id }, data: { subscriptionDraftAt: new Date(), subscriptionDraftReason, subscriptionDraftPreviousBlocked: false, isBlocked: true } });
+    }
 
     // Optional extras that don't participate in matching.
     if (input.address || input.notes) {

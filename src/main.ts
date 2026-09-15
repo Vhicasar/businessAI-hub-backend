@@ -33,6 +33,7 @@ import { startCampaignScheduler } from './application/messaging/campaign-schedul
 import { reconcileSystemRolePermissions } from './application/roles/reconcile-permissions';
 import { closeQueues, queueEnabled } from './infrastructure/queue/queue';
 import { createApp } from './app';
+import { startSubscriptionRestrictionSweep } from './application/billing/subscription-drafts.service';
 
 async function bootstrap(): Promise<void> {
   await connectDatabase();
@@ -76,6 +77,7 @@ async function bootstrap(): Promise<void> {
   startExpiryWatcher(); // warn warehouse staff before batches expire
   startUnansweredWatcher(); // nudge when a customer has been left waiting
   startCampaignScheduler(); // send campaigns their business scheduled for later
+  startSubscriptionRestrictionSweep(); // classify/restore over-limit subscription drafts
   logger.info(
     queueEnabled()
       ? '📮 Queue mode: async — workflow & campaign jobs handed to the worker (run `npm run worker`)'

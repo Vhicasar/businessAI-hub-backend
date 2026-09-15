@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { validate } from '../middleware/validate';
 import { authenticate, requireTenant } from '../middleware/authenticate';
 import { requirePermission } from '../middleware/require-permission';
+import { requireFeature } from '../middleware/plan-guard';
 import {
   campaignService,
   createCampaignSchema,
@@ -18,7 +19,7 @@ const wrap =
   };
 
 export const marketingRoutes = Router();
-marketingRoutes.use(authenticate, requireTenant);
+marketingRoutes.use(authenticate, requireTenant, requireFeature('marketing'));
 
 marketingRoutes.get('/coupons', requirePermission('marketing.read'), wrap(async (_req, res) => { res.json({ success: true, data: await promotionsService.listCoupons() }); }));
 marketingRoutes.post('/coupons', requirePermission('marketing.create'), validate({ body: couponSchema }), wrap(async (req, res) => { res.status(201).json({ success: true, data: await promotionsService.createCoupon(req.body) }); }));

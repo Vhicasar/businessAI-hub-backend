@@ -280,22 +280,30 @@ export class PaystackClient implements PaymentProvider, PayoutCapableProvider {
       data?: {
         reference?: string;
         subscription_code?: string;
+        subscription?: { subscription_code?: string };
+        transaction?: { reference?: string; gateway_response?: string; message?: string };
         plan?: { plan_code?: string } | string;
         customer?: { email?: string };
+        gateway_response?: string;
+        message?: string;
       };
     };
     const data = e.data ?? {};
     const planCode = typeof data.plan === 'object' ? data.plan?.plan_code : undefined;
     const base = {
       provider: this.name,
-      reference: data.reference,
-      subscriptionCode: data.subscription_code,
+      reference: data.reference ?? data.transaction?.reference,
+      subscriptionCode: data.subscription_code ?? data.subscription?.subscription_code,
       planCode,
       customerEmail: data.customer?.email,
+      failureReason: data.gateway_response ?? data.transaction?.gateway_response ?? data.message ?? data.transaction?.message,
     };
     switch (e.event) {
       case 'charge.success':
         return { ...base, type: 'charge_success' };
+      case 'invoice.payment_failed':
+      case 'charge.failed':
+        return { ...base, type: 'charge_failed' };
       case 'subscription.create':
         return { ...base, type: 'subscription_create' };
       case 'subscription.disable':

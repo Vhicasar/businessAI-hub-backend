@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 export const listCustomersSchema = z.object({
   search: z.string().trim().max(120).optional(),
+  subscriptionState: z.enum(['active', 'draft']).default('active'),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(100).default(25),
 });

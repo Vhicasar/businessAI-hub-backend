@@ -8,6 +8,8 @@ import type {
   ListCustomersDto,
   UpdateCustomerDto,
 } from './customers.dto';
+import { resolveEntitlements } from '../billing/entitlements';
+import { reconcileSubscriptionDrafts } from '../billing/subscription-drafts.service';
 
 const listSelect = {
   id: true,
@@ -19,6 +21,8 @@ const listSelect = {
   totalOrders: true,
   lastOrderAt: true,
   isBlocked: true,
+  subscriptionDraftAt: true,
+  subscriptionDraftReason: true,
   createdAt: true,
 } as const;
 
@@ -77,8 +81,11 @@ async function ensureUniqueContact(
 
 export const customersService = {
   async list(dto: ListCustomersDto) {
+    const entitlements = await resolveEntitlements();
+    await reconcileSubscriptionDrafts(entitlements);
     const where = {
       deletedAt: null,
+      subscriptionDraftAt: dto.subscriptionState === 'draft' ? { not: null } : null,
       ...(dto.search
         ? {
             OR: [
@@ -101,9 +108,14 @@ export const customersService = {
 
     const hasMore = rows.length > dto.limit;
     const items = hasMore ? rows.slice(0, dto.limit) : rows;
+    const subscriptionDraftCount = await prisma.customer.count({
+      where: { deletedAt: null, subscriptionDraftAt: { not: null } },
+    });
     return {
       items,
       nextCursor: hasMore ? items[items.length - 1]?.id ?? null : null,
+      subscriptionDraftCount,
+      subscriptionRestricted: Boolean(entitlements.accessRestriction),
     };
   },
 
@@ -191,7 +203,7 @@ export const customersService = {
     };
   },
 
-  async create(dto: CreateCustomerDto) {
+  async create(dto: CreateCustomerDto, subscriptionDraftReason?: string) {
     await ensureUniqueContact(dto.email, dto.phone);
     return prisma.customer.create({
       data: {
@@ -203,6 +215,10 @@ export const customersService = {
         language: dto.language ?? null,
         marketingOptIn: dto.marketingOptIn ?? true,
         customFields: dto.customFields ?? undefined,
+        subscriptionDraftAt: subscriptionDraftReason ? new Date() : null,
+        subscriptionDraftReason: subscriptionDraftReason ?? null,
+        subscriptionDraftPreviousBlocked: subscriptionDraftReason ? false : null,
+        isBlocked: Boolean(subscriptionDraftReason),
       },
       select: detailSelect,
     });

@@ -2,6 +2,7 @@ import type { Plan, Subscription, SubscriptionStatus } from '@prisma/client';
 import { prismaUnscoped } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import type { FeatureKey } from '../../shared/plans';
+import { getWorkspaceConfig } from '../settings/workspace-config';
 
 /**
  * Resolves what an organization is entitled to — its current plan limits and
@@ -35,6 +36,7 @@ export interface Entitlements {
   periodStart: Date;
   periodEnd: Date;
   subscription: Subscription | null;
+  accessRestriction: null | { code: 'SUBSCRIPTION_PAYMENT_FAILED'; graceEndsAt: Date; message: string };
 }
 
 const ACTIVE_STATUSES: SubscriptionStatus[] = ['TRIALING', 'ACTIVE', 'PAST_DUE'];
@@ -57,6 +59,32 @@ function featureSet(plan: Plan): Set<string> {
   return new Set(arr.filter((f): f is string => typeof f === 'string'));
 }
 
+export interface AdminEntitlementOverride {
+  planSlug?: string | null;
+  limits?: Partial<PlanLimits>;
+  reason?: string;
+  setBy?: string;
+  setAt?: string;
+  expiresAt?: string;
+  features?: Partial<Record<'marketing' | 'api', boolean>>;
+}
+
+/** Platform-admin overrides live with the organisation and never alter gateway billing. */
+export function adminEntitlementOverride(settings: unknown): AdminEntitlementOverride | null {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return null;
+  const value = (settings as Record<string, unknown>).platformEntitlements;
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as AdminEntitlementOverride
+    : null;
+}
+
+export function isAdminOverrideActive(value: AdminEntitlementOverride | null, now = new Date()): boolean {
+  if (!value) return false;
+  if (!value.expiresAt) return false;
+  const expires = new Date(value.expiresAt);
+  return Number.isFinite(expires.getTime()) && expires > now;
+}
+
 /** Calendar-month window [firstOfMonth, firstOfNextMonth) in UTC. */
 function calendarMonthWindow(now = new Date()): { start: Date; end: Date } {
   const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
@@ -74,6 +102,13 @@ export function currentOrgId(): string {
 export async function resolveEntitlements(orgId?: string): Promise<Entitlements> {
   const organizationId = orgId ?? currentOrgId();
 
+  const organization = await prismaUnscoped.organization.findUnique({
+    where: { id: organizationId },
+    select: { settings: true },
+  });
+  const adminOverride = adminEntitlementOverride(organization?.settings);
+  const activeOverride = isAdminOverrideActive(adminOverride) ? adminOverride : null;
+
   let subscription = await prismaUnscoped.subscription.findFirst({
     where: { organizationId, status: { in: ACTIVE_STATUSES } },
     orderBy: { createdAt: 'desc' },
@@ -82,7 +117,7 @@ export async function resolveEntitlements(orgId?: string): Promise<Entitlements>
   if (
     subscription &&
     (
-      subscription.currentPeriodEnd <= new Date() ||
+      (subscription.status !== 'PAST_DUE' && subscription.currentPeriodEnd <= new Date()) ||
       (subscription.status === 'TRIALING' && subscription.trialEndsAt && subscription.trialEndsAt <= new Date())
     )
   ) {
@@ -93,8 +128,16 @@ export async function resolveEntitlements(orgId?: string): Promise<Entitlements>
     subscription = null;
   }
 
-  const plan =
-    subscription?.plan ??
+  const graceDays = Math.max(0, Math.floor(getWorkspaceConfig().billing.failedSubscriptionGraceDays));
+  const graceEndsAt = subscription?.status === 'PAST_DUE' && subscription.pastDueAt
+    ? new Date(subscription.pastDueAt.getTime() + graceDays * 86_400_000)
+    : null;
+  const paymentRestricted = Boolean(graceEndsAt && graceEndsAt <= new Date());
+  const usableOverride = paymentRestricted ? null : activeOverride;
+  const overriddenPlan = usableOverride?.planSlug
+    ? await prismaUnscoped.plan.findUnique({ where: { slug: usableOverride.planSlug } })
+    : null;
+  const plan = overriddenPlan ?? (paymentRestricted ? null : subscription?.plan) ??
     (await prismaUnscoped.plan.findUnique({ where: { slug: 'starter' } }));
 
   if (!plan) {
@@ -119,6 +162,7 @@ export async function resolveEntitlements(orgId?: string): Promise<Entitlements>
       periodStart: start,
       periodEnd: end,
       subscription: null,
+      accessRestriction: null,
     };
   }
 
@@ -126,7 +170,7 @@ export async function resolveEntitlements(orgId?: string): Promise<Entitlements>
     ? { start: subscription.currentPeriodStart, end: subscription.currentPeriodEnd }
     : calendarMonthWindow();
 
-  const purchases = await prismaUnscoped.addOnPurchase.findMany({
+  const purchases = paymentRestricted ? [] : await prismaUnscoped.addOnPurchase.findMany({
     where: { organizationId, OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
     select: { entitlements: true },
   });
@@ -147,8 +191,17 @@ export async function resolveEntitlements(orgId?: string): Promise<Entitlements>
   if (limits.maxUsers !== null) limits.maxUsers += additions.users;
   if (limits.maxChannels !== null) limits.maxChannels += additions.channels;
   if (limits.aiCreditsMonthly !== null) limits.aiCreditsMonthly += additions.aiCredits;
+  for (const [key, value] of Object.entries(usableOverride?.limits ?? {})) {
+    if (key in limits && (value === null || (typeof value === 'number' && value >= 0))) {
+      limits[key as keyof PlanLimits] = value;
+    }
+  }
   const features = featureSet(plan);
   for (const feature of additions.features) features.add(feature);
+  for (const [feature, enabled] of Object.entries(usableOverride?.features ?? {})) {
+    if (enabled) features.add(feature);
+    else features.delete(feature);
+  }
 
   return {
     organizationId,
@@ -161,6 +214,11 @@ export async function resolveEntitlements(orgId?: string): Promise<Entitlements>
     periodStart: window.start,
     periodEnd: window.end,
     subscription: subscription ?? null,
+    accessRestriction: paymentRestricted && graceEndsAt ? {
+      code: 'SUBSCRIPTION_PAYMENT_FAILED',
+      graceEndsAt,
+      message: 'This workspace is restricted because its subscription payment was not completed. Ask the workspace owner to update billing.',
+    } : null,
   };
 }
 

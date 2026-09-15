@@ -4,6 +4,8 @@ import { requestContext } from '../../shared/context';
 import { inventoryService } from '../inventory/inventory.service';
 import { filesService } from '../files/files.service';
 import { exchangeRates } from '../../shared/exchange-rates';
+import { resolveEntitlements } from '../billing/entitlements';
+import { reconcileSubscriptionDrafts } from '../billing/subscription-drafts.service';
 
 /** Nested creates bypass the tenant extension's data injection. */
 function orgId(): string {
@@ -58,6 +60,8 @@ const productSelect = {
   shelfLifeDays: true,
   expiryAlertDays: true,
   createdAt: true,
+  subscriptionDraftAt: true,
+  subscriptionDraftReason: true,
   category: { select: { id: true, name: true } },
   brand: { select: { id: true, name: true } },
   images: {
@@ -168,9 +172,12 @@ const PRODUCT_SORTS = {
 export const catalogService = {
   // ------------------------------------------------------------- products
   async listProducts(dto: ListProductsDto) {
+    const entitlements = await resolveEntitlements();
+    await reconcileSubscriptionDrafts(entitlements);
     const rows = await prisma.product.findMany({
       where: {
         deletedAt: null,
+        subscriptionDraftAt: dto.subscriptionState === 'draft' ? { not: null } : null,
         ...(dto.status ? { status: dto.status } : {}),
         ...(dto.categoryId ? { categoryId: dto.categoryId } : {}),
         ...(dto.brandId ? { brandId: dto.brandId } : {}),
@@ -193,7 +200,13 @@ export const catalogService = {
     const items = await withImages(await inPreferredCurrency(
       (hasMore ? rows.slice(0, dto.limit) : rows).map(withStockTotals),
     ));
-    return { items, nextCursor: hasMore ? items[items.length - 1]?.id ?? null : null };
+    const subscriptionDraftCount = await prisma.product.count({ where: { deletedAt: null, subscriptionDraftAt: { not: null } } });
+    return {
+      items,
+      nextCursor: hasMore ? items[items.length - 1]?.id ?? null : null,
+      subscriptionDraftCount,
+      subscriptionRestricted: Boolean(entitlements.accessRestriction),
+    };
   },
 
   async getProduct(id: string) {
@@ -206,7 +219,7 @@ export const catalogService = {
     return resolved!;
   },
 
-  async createProduct(dto: CreateProductDto, currency: string) {
+  async createProduct(dto: CreateProductDto, currency: string, subscriptionDraftReason?: string) {
     const skus = dto.variants.map((v) => v.sku);
     const dupSku = await prisma.productVariant.findFirst({
       where: { sku: { in: skus }, deletedAt: null },
@@ -243,7 +256,7 @@ export const catalogService = {
           description: dto.description ?? null,
           categoryId: dto.categoryId ?? null,
           brandId: dto.brandId ?? null,
-          status: dto.status,
+          status: subscriptionDraftReason ? 'DRAFT' : dto.status,
           taxRate: dto.taxRate,
           unit: dto.unit ?? null,
           batchTracked: dto.batchTracked ?? false,
@@ -251,6 +264,9 @@ export const catalogService = {
           shelfLifeDays: dto.shelfLifeDays ?? null,
           ...(dto.expiryAlertDays !== undefined ? { expiryAlertDays: dto.expiryAlertDays } : {}),
           customFields: dto.customFields ?? undefined,
+          subscriptionDraftAt: subscriptionDraftReason ? new Date() : null,
+          subscriptionDraftReason: subscriptionDraftReason ?? null,
+          subscriptionDraftPreviousStatus: subscriptionDraftReason ? dto.status : null,
           variants: {
             create: dto.variants.map((v, i) => ({
               organizationId: org,

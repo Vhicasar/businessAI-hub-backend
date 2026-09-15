@@ -41,7 +41,7 @@ customersRoutes.post(
   enforceLimit('contacts'),
   validate({ body: createCustomerSchema }),
   wrap(async (req, res) => {
-    const data = await customersService.create(req.body);
+    const data = await customersService.create(req.body, req.subscriptionDraftReason);
     res.status(201).json({ success: true, data });
   })
 );
@@ -184,7 +184,7 @@ customersRoutes.post(
     }).refine((v) => v.phone || v.email, { message: 'Provide a phone number or an email address' }),
   }),
   wrap(async (req, res) => {
-    const data = await quickCreate.resolve(req.auth!.organizationId as string, req.body);
+    const data = await quickCreate.resolve(req.auth!.organizationId as string, req.body, req.subscriptionDraftReason);
     res.status(data.created ? 201 : 200).json({
       success: true,
       message: data.created

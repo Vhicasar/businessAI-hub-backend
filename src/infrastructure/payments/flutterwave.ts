@@ -269,6 +269,7 @@ export class FlutterwaveClient implements PaymentProvider, PayoutCapableProvider
         id?: number;
         plan?: number;
         customer?: { email?: string };
+        processor_response?: string;
       };
     };
     const data = e.data ?? {};
@@ -278,11 +279,12 @@ export class FlutterwaveClient implements PaymentProvider, PayoutCapableProvider
       subscriptionCode: data.id != null ? String(data.id) : undefined,
       planCode: data.plan != null ? String(data.plan) : undefined,
       customerEmail: data.customer?.email,
+      failureReason: data.processor_response,
     };
     switch (e.event) {
       case 'charge.completed':
         // Only successful charges advance billing.
-        return { ...base, type: data.status === 'successful' ? 'charge_success' : 'other' };
+        return { ...base, type: data.status === 'successful' ? 'charge_success' : 'charge_failed' };
       case 'subscription.cancelled':
         return { ...base, type: 'subscription_disable' };
       default:

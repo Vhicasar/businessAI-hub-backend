@@ -59,11 +59,13 @@ export interface EnsurePlanResult {
 /** Normalized webhook event the billing service can act on regardless of gateway. */
 export interface NormalizedWebhookEvent {
   provider: PaymentProviderName;
-  type: 'charge_success' | 'subscription_create' | 'subscription_disable' | 'other';
+  type: 'charge_success' | 'charge_failed' | 'subscription_create' | 'subscription_disable' | 'other';
   reference?: string;
   subscriptionCode?: string;
   planCode?: string;
   customerEmail?: string;
+  /** Provider-supplied, customer-safe reason for a failed recurring charge. */
+  failureReason?: string;
 }
 
 export interface PaymentProvider {

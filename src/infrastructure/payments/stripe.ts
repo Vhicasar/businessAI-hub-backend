@@ -223,6 +223,8 @@ export class StripeClient implements PaymentProvider {
       reference: (o.client_reference_id as string) || ((o.metadata as Record<string, string>)?.ref),
       subscriptionCode: (o.subscription as string) || (e.type?.startsWith('customer.subscription') ? (o.id as string) : undefined),
       customerEmail: ((o.customer_details as { email?: string })?.email) || (o.customer_email as string) || undefined,
+      failureReason: ((o.last_payment_error as { message?: string } | undefined)?.message)
+        ?? ((o.last_finalization_error as { message?: string } | undefined)?.message),
     };
     switch (e.type) {
       case 'checkout.session.completed':
@@ -230,6 +232,8 @@ export class StripeClient implements PaymentProvider {
       case 'invoice.paid':
         // Recurring renewal — route by subscription.
         return { provider: this.name, type: 'charge_success', reference: o.id as string, subscriptionCode: o.subscription as string };
+      case 'invoice.payment_failed':
+        return { ...base, type: 'charge_failed', reference: o.id as string, subscriptionCode: o.subscription as string };
       case 'customer.subscription.deleted':
         return { ...base, type: 'subscription_disable' };
       default:

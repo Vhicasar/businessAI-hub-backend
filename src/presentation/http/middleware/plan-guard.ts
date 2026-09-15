@@ -64,9 +64,9 @@ async function currentCount(kind: CountableLimit, orgId: string): Promise<number
         where: { organizationId: orgId, deletedAt: null },
       });
     case 'contacts':
-      return prismaUnscoped.customer.count({ where: { organizationId: orgId, deletedAt: null } });
+      return prismaUnscoped.customer.count({ where: { organizationId: orgId, deletedAt: null, subscriptionDraftAt: null } });
     case 'products':
-      return prismaUnscoped.product.count({ where: { organizationId: orgId } });
+      return prismaUnscoped.product.count({ where: { organizationId: orgId, deletedAt: null, subscriptionDraftAt: null } });
     case 'branches':
       return prismaUnscoped.branch.count({ where: { organizationId: orgId } });
   }
@@ -107,6 +107,11 @@ export function enforceLimit(kind: CountableLimit): RequestHandler {
           });
         }
         if (used >= limit) {
+          if (kind === 'contacts' || kind === 'products') {
+            req.subscriptionDraftReason = `Saved as a subscription draft because the ${ent.planName} limit of ${limit} ${LABEL[kind]} has been reached.`;
+            next();
+            return;
+          }
           next(
             new AppError(
               'PLAN_LIMIT_REACHED',

@@ -50,7 +50,7 @@ catalogRoutes.post(
   validate({ body: createProductSchema }),
   wrap(async (req, res) => {
     const currency = await orgCurrency(req.auth!.organizationId!);
-    res.status(201).json({ success: true, data: await catalogService.createProduct(req.body, currency) });
+    res.status(201).json({ success: true, data: await catalogService.createProduct(req.body, currency, req.subscriptionDraftReason) });
   })
 );
 

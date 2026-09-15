@@ -17,6 +17,7 @@ import { walletBuckets } from '../../../application/payments/wallet-buckets.serv
 import { senderIdService } from '../../../application/sms/sender-id.service';
 import { syncWorkspaceConfigFromAdmin } from '../../../application/settings/workspace-config-sync';
 import { syncOAuthConfigFromAdmin } from '../../../application/integrations/oauth-config-sync';
+import { adminEntitlementOverride, resolveEntitlements, type PlanLimits } from '../../../application/billing/entitlements';
 
 /**
  * Service API — for the Vhicasar Admin, not for tenants or end users.
@@ -114,7 +115,7 @@ serviceRoutes.get(
       },
       select: {
         id: true, name: true, slug: true, businessType: true, status: true, deletedAt: true,
-        email: true, phone: true, country: true, currency: true, timezone: true,
+        email: true, phone: true, country: true, currency: true, timezone: true, settings: true,
         createdAt: true,
         memberships: {
           where: { isOwner: true, deletedAt: null },
@@ -147,7 +148,8 @@ serviceRoutes.get(
     // counted separately — grouped for the whole page rather than per row, to
     // keep this at two queries instead of 2N.
     const ids = page.map((o) => o.id);
-    const [customerCounts, orderCounts] = await Promise.all([
+    const overrideSlugs = [...new Set(page.map((o) => adminEntitlementOverride(o.settings)?.planSlug).filter((slug): slug is string => Boolean(slug)))];
+    const [customerCounts, orderCounts, overridePlans] = await Promise.all([
       prismaUnscoped.customer.groupBy({
         by: ['organizationId'],
         where: { organizationId: { in: ids }, deletedAt: null },
@@ -158,6 +160,9 @@ serviceRoutes.get(
         where: { organizationId: { in: ids } },
         _count: { _all: true },
       }),
+      overrideSlugs.length
+        ? prismaUnscoped.plan.findMany({ where: { slug: { in: overrideSlugs } }, select: { slug: true, name: true } })
+        : Promise.resolve([]),
     ]);
     const countOf = (list: { organizationId: string; _count: { _all: number } }[], id: string) =>
       list.find((c) => c.organizationId === id)?._count._all ?? 0;
@@ -165,6 +170,8 @@ serviceRoutes.get(
     const items = page.map((o) => {
       const owner = o.memberships[0];
       const sub = o.subscriptions[0];
+      const overrideSlug = adminEntitlementOverride(o.settings)?.planSlug;
+      const overridePlan = overrideSlug ? overridePlans.find((plan) => plan.slug === overrideSlug) : null;
       return {
         id: o.id,
         name: o.name,
@@ -185,7 +192,15 @@ serviceRoutes.get(
               lastLoginAt: owner.user.lastLoginAt,
             }
           : null,
-        subscription: sub
+        subscription: overridePlan
+          ? {
+              plan: overridePlan.name,
+              planSlug: overridePlan.slug,
+              status: 'ADMIN_OVERRIDE',
+              trialEndsAt: null,
+              renewsAt: sub?.currentPeriodEnd ?? null,
+            }
+          : sub
           ? {
               plan: sub.plan.name,
               planSlug: sub.plan.slug,
@@ -490,6 +505,121 @@ serviceRoutes.get(
         })),
       },
     });
+  }),
+);
+
+const entitlementLimitsSchema = z.object({
+  maxUsers: z.number().int().min(0).nullable().optional(),
+  maxBranches: z.number().int().min(0).nullable().optional(),
+  maxProducts: z.number().int().min(0).nullable().optional(),
+  maxChannels: z.number().int().min(0).nullable().optional(),
+  maxContacts: z.number().int().min(0).nullable().optional(),
+  maxMarketingReach: z.number().int().min(0).nullable().optional(),
+  aiCreditsMonthly: z.number().int().min(0).nullable().optional(),
+});
+
+/** Current effective access plus editable admin overrides; no payment data or secrets. */
+serviceRoutes.get('/organizations/:id/entitlements', wrap(async (req, res) => {
+  const organizationId = req.params.id as string;
+  const organization = await prismaUnscoped.organization.findFirst({
+    where: { id: organizationId, deletedAt: null },
+    select: { id: true, name: true, settings: true },
+  });
+  if (!organization) throw new NotFoundError('Organization');
+  const entitlements = await resolveEntitlements(organizationId);
+  const [plans, usage] = await Promise.all([
+    prismaUnscoped.plan.findMany({
+      where: { isActive: true },
+      orderBy: { position: 'asc' },
+      select: { id: true, slug: true, name: true },
+    }),
+    prismaUnscoped.usageCounter.findMany({
+      where: { organizationId, periodStart: entitlements.periodStart, periodEnd: entitlements.periodEnd },
+      orderBy: { metric: 'asc' },
+      select: { metric: true, value: true },
+    }),
+  ]);
+  res.json({ success: true, data: {
+    organization: { id: organization.id, name: organization.name },
+    effective: {
+      planSlug: entitlements.planSlug,
+      planName: entitlements.planName,
+      status: entitlements.status,
+      limits: entitlements.limits,
+      usage,
+      periodStart: entitlements.periodStart,
+      periodEnd: entitlements.periodEnd,
+      accessRestriction: entitlements.accessRestriction,
+    },
+    override: adminEntitlementOverride(organization.settings),
+    plans,
+  } });
+}));
+
+/**
+ * Grant or revise access without creating a charge or modifying the payment
+ * provider subscription. The effective entitlement resolver applies this
+ * override after the paid plan, so normal billing remains intact underneath.
+ */
+serviceRoutes.put(
+  '/organizations/:id/entitlements',
+  validate({ body: z.object({
+    planSlug: z.string().trim().min(1).nullable().optional(),
+    limits: entitlementLimitsSchema.nullable().optional(),
+    usage: z.record(z.number().int().min(0)).optional(),
+    reason: z.string().trim().min(3).max(500),
+    performedBy: z.string().trim().max(160).optional(),
+    expiresAt: z.coerce.date(),
+    features: z.object({ marketing: z.boolean().optional(), api: z.boolean().optional() }).optional(),
+  }) }),
+  wrap(async (req, res) => {
+    const organizationId = req.params.id as string;
+    const organization = await prismaUnscoped.organization.findFirst({
+      where: { id: organizationId, deletedAt: null },
+      select: { id: true, settings: true },
+    });
+    if (!organization) throw new NotFoundError('Organization');
+    if (req.body.planSlug) {
+      const plan = await prismaUnscoped.plan.findFirst({ where: { slug: req.body.planSlug, isActive: true }, select: { id: true } });
+      if (!plan) throw new NotFoundError('Plan');
+    }
+
+    const before = adminEntitlementOverride(organization.settings);
+    const existingSettings = (organization.settings && typeof organization.settings === 'object' && !Array.isArray(organization.settings))
+      ? organization.settings as Record<string, unknown> : {};
+    const nextOverride = {
+      planSlug: req.body.planSlug === undefined ? before?.planSlug ?? null : req.body.planSlug,
+      limits: req.body.limits === undefined ? before?.limits ?? {} : req.body.limits ?? {},
+      reason: req.body.reason,
+      setBy: req.body.performedBy ?? 'Vhicasar admin',
+      setAt: new Date().toISOString(),
+      expiresAt: req.body.expiresAt.toISOString(),
+      features: req.body.features === undefined ? before?.features ?? {} : req.body.features,
+    };
+    await prismaUnscoped.organization.update({
+      where: { id: organizationId },
+      data: { settings: { ...existingSettings, platformEntitlements: nextOverride } as never },
+    });
+
+    const entitlements = await resolveEntitlements(organizationId);
+    const usageUpdates = (req.body.usage ?? {}) as Record<string, number>;
+    for (const [metric, value] of Object.entries(usageUpdates)) {
+      await prismaUnscoped.usageCounter.upsert({
+        where: { organizationId_metric_periodStart: { organizationId, metric, periodStart: entitlements.periodStart } },
+        update: { value, periodEnd: entitlements.periodEnd },
+        create: { organizationId, metric, periodStart: entitlements.periodStart, periodEnd: entitlements.periodEnd, value },
+      });
+    }
+    await prismaUnscoped.auditLog.create({
+      data: {
+        organizationId, actorType: 'SYSTEM', action: 'organization.entitlements.override',
+        entityType: 'Organization', entityId: organizationId,
+        before: (before ?? {}) as never,
+        after: { ...nextOverride, usage: req.body.usage ?? {} } as never,
+      },
+    });
+    logger.info({ organizationId, planSlug: nextOverride.planSlug, limitKeys: Object.keys(nextOverride.limits as Partial<PlanLimits>), usageMetrics: Object.keys(req.body.usage ?? {}) }, 'service API: organization entitlements overridden');
+    res.json({ success: true, data: { updated: true } });
   }),
 );
 

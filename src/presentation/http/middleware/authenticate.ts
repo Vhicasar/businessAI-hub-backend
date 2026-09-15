@@ -1,8 +1,9 @@
 import type { RequestHandler } from 'express';
-import { UnauthorizedError } from '../../../shared/errors';
+import { AppError, UnauthorizedError } from '../../../shared/errors';
 import { requestContext } from '../../../shared/context';
 import { tokenService } from '../../../application/auth/token.service';
 import { prismaUnscoped } from '../../../infrastructure/database/prisma';
+import { resolveEntitlements } from '../../../application/billing/entitlements';
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
@@ -15,6 +16,7 @@ declare global {
         roleId: string | null;
         isSuperAdmin: boolean;
       };
+      subscriptionDraftReason?: string;
     }
   }
 }
@@ -81,10 +83,20 @@ export const authenticate: RequestHandler = async (req, _res, next) => {
 };
 
 /** Requires an active organization on the token (most business routes). */
-export const requireTenant: RequestHandler = (req, _res, next) => {
+export const requireTenant: RequestHandler = async (req, _res, next) => {
   if (!req.auth?.organizationId) {
     next(new UnauthorizedError('No active organization on this session', 'NO_ORGANIZATION'));
     return;
   }
-  next();
+  try {
+    const entitlements = await resolveEntitlements(req.auth.organizationId);
+    if (entitlements.accessRestriction && req.auth.membershipId) {
+      const membership = await prismaUnscoped.membership.findUnique({ where: { id: req.auth.membershipId }, select: { isOwner: true } });
+      if (!membership?.isOwner) {
+        next(new AppError(entitlements.accessRestriction.code, 402, entitlements.accessRestriction.message, { graceEndsAt: entitlements.accessRestriction.graceEndsAt }));
+        return;
+      }
+    }
+    next();
+  } catch (error) { next(error); }
 };

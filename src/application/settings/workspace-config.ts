@@ -15,6 +15,8 @@ export interface WorkspaceConfig {
     emailEnabled: boolean;
     smsEnabled: boolean;
     whatsappEnabled: boolean;
+    /** Show and permit the provider-hosted "Connect WhatsApp Business" flow. */
+    whatsappAutomaticConnectEnabled: boolean;
     webChatEnabled: boolean;
     defaultChannel: string | null;
   };
@@ -26,6 +28,7 @@ export interface WorkspaceConfig {
   };
   /** Admin limit overrides applied on top of the plan entitlements. */
   limits: Record<string, number>;
+  billing: { failedSubscriptionGraceDays: number };
   /** { [integrationId]: { enabled } } — admin can disable an integration. */
   integrations: Record<string, { enabled: boolean }>;
   /**
@@ -70,11 +73,13 @@ const DEFAULTS: WorkspaceConfig = {
     emailEnabled: true,
     smsEnabled: true,
     whatsappEnabled: true,
+    whatsappAutomaticConnectEnabled: true,
     webChatEnabled: true,
     defaultChannel: null,
   },
   storage: { maxUploadMb: 25, totalStorageGb: null, allowedTypes: [] },
   limits: {},
+  billing: { failedSubscriptionGraceDays: 7 },
   integrations: {},
   channels: {},
 };
@@ -85,6 +90,7 @@ export interface WorkspaceConfigOverride {
   communication?: Partial<WorkspaceConfig['communication']>;
   storage?: Partial<WorkspaceConfig['storage']>;
   limits?: Record<string, number>;
+  billing?: Partial<WorkspaceConfig['billing']>;
   integrations?: Record<string, { enabled: boolean }>;
   channels?: Record<string, Partial<ChannelPolicy>>;
 }
@@ -104,6 +110,7 @@ export function getWorkspaceConfig(): WorkspaceConfig {
     communication: { ...DEFAULTS.communication, ...(override.communication ?? {}) },
     storage: { ...DEFAULTS.storage, ...(override.storage ?? {}) },
     limits: { ...DEFAULTS.limits, ...(override.limits ?? {}) },
+    billing: { ...DEFAULTS.billing, ...(override.billing ?? {}) },
     integrations: { ...DEFAULTS.integrations, ...(override.integrations ?? {}) },
     // Each type is merged over the default individually, so the admin can set
     // just a price or just a ceiling without restating the whole policy.
@@ -137,6 +144,12 @@ export function isChannelEnabled(channel: 'EMAIL' | 'SMS' | 'WHATSAPP' | 'WEB_CH
     case 'WEB_CHAT': return c.webChatEnabled;
     default: return true;
   }
+}
+
+/** Manual credentials remain available when the automatic WhatsApp flow is disabled. */
+export function isAutomaticChannelConnectEnabled(channel: string): boolean {
+  if (channel !== 'WHATSAPP') return true;
+  return getWorkspaceConfig().communication.whatsappAutomaticConnectEnabled;
 }
 
 /** Whether an integration is enabled by the admin (unknown = enabled). */

@@ -805,10 +805,10 @@ export const authService = {
     // Resolve every org's logo in one batch rather than per-membership.
     const logoUrls = await filesService.urlMap(user.memberships.map((m) => m.organization.logoFileId));
     // Each org's plan features, so the UI can gate modules by plan (not just RBAC).
-    const featureEntries = await Promise.all(
-      user.memberships.map(async (m) => [m.organization.id, [...(await resolveEntitlements(m.organization.id)).features]] as const),
+    const entitlementEntries = await Promise.all(
+      user.memberships.map(async (m) => [m.organization.id, await resolveEntitlements(m.organization.id)] as const),
     );
-    const featuresByOrg = new Map(featureEntries);
+    const entitlementsByOrg = new Map(entitlementEntries);
     /*
      * And each org's optional modules, decided from its business type and any
      * administrator override. Sent rather than derived on the client: a menu
@@ -843,7 +843,8 @@ export const authService = {
       ...user,
       memberships: user.memberships.map((m) => ({
         ...m,
-        features: featuresByOrg.get(m.organization.id) ?? [],
+        features: [...(entitlementsByOrg.get(m.organization.id)?.features ?? [])],
+        accessRestriction: entitlementsByOrg.get(m.organization.id)?.accessRestriction ?? null,
         modules: modulesByOrg.get(m.organization.id) ?? [],
         channels: availableChannels,
         organization: {

@@ -1098,6 +1098,9 @@ model Customer {
   marketingOptIn Boolean   @default(true)
   isBlocked      Boolean   @default(false)
   isProvisional  Boolean   @default(false) // anonymous web-chat identity; promoted when contact details are saved
+  subscriptionDraftAt DateTime?
+  subscriptionDraftReason String?
+  subscriptionDraftPreviousBlocked Boolean?
   customFields   Json?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
@@ -1132,6 +1135,7 @@ model Customer {
   @@unique([organizationId, phone])
   @@index([organizationId, createdAt])
   @@index([organizationId, isProvisional])
+  @@index([organizationId, subscriptionDraftAt])
   @@index([companyId])
 }
 
@@ -1806,6 +1810,9 @@ model Product {
   createdAt            DateTime           @default(now())
   updatedAt            DateTime           @updatedAt
   deletedAt            DateTime?
+  subscriptionDraftAt  DateTime?
+  subscriptionDraftReason String?
+  subscriptionDraftPreviousStatus ProductStatus?
 
   category         ProductCategory?   @relation(fields: [categoryId], references: [id])
   brand            Brand?             @relation(fields: [brandId], references: [id])
@@ -1821,6 +1828,7 @@ model Product {
 
   @@unique([organizationId, slug])
   @@index([organizationId, status])
+  @@index([organizationId, subscriptionDraftAt])
   @@index([categoryId])
   @@index([brandId])
 }
@@ -4303,6 +4311,7 @@ model Subscription {
   currentPeriodEnd         DateTime
   cancelAtPeriodEnd        Boolean            @default(false)
   cancelledAt              DateTime?
+  pastDueAt                DateTime?
   // Payment-provider linkage (e.g. Paystack customer / subscription codes).
   provider                 String?
   providerCustomerCode     String?

@@ -11,7 +11,7 @@ import {
   type ResolvedConnection,
 } from './channel-oauth.service';
 import { capabilitiesFor } from './channel-capabilities';
-import { channelPolicy } from '../settings/workspace-config';
+import { channelPolicy, isAutomaticChannelConnectEnabled } from '../settings/workspace-config';
 import { getAdapter, supportedChannels } from '../../infrastructure/channels/registry';
 import { activityService } from '../crm/activity.service';
 import { requestContext } from '../../shared/context';
@@ -199,12 +199,12 @@ export const channelsService = {
       channelType,
       capabilities: capabilitiesFor(channelType),
       oauth: {
-        supported: supportsOAuth(channelType),
+        supported: supportsOAuth(channelType) && isAutomaticChannelConnectEnabled(channelType),
         // Present only when it cannot be used, and phrased for the person who
         // has to do something about it.
-        unavailableReason: supportsOAuth(channelType)
-          ? null
-          : oauthUnavailableReason(channelType),
+        unavailableReason: !isAutomaticChannelConnectEnabled(channelType)
+          ? 'Automatic WhatsApp Business connection is currently disabled by Vhicasar. You can still use your own credentials.'
+          : supportsOAuth(channelType) ? null : oauthUnavailableReason(channelType),
       },
     }));
 
