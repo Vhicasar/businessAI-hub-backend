@@ -4,7 +4,7 @@ import {
   getWorkspaceConfig,
   setWorkspaceConfigOverride,
 } from '../../src/application/settings/workspace-config';
-import { adminEntitlementOverride, isAdminOverrideActive } from '../../src/application/billing/entitlements';
+import { adminEntitlementOverride, adminOverrideSupersedesRestriction, isAdminOverrideActive } from '../../src/application/billing/entitlements';
 
 describe('platform admin controls', () => {
   afterEach(() => setWorkspaceConfigOverride(null));
@@ -50,5 +50,17 @@ describe('platform admin controls', () => {
     expect(getWorkspaceConfig().billing.failedSubscriptionGraceDays).toBe(7);
     setWorkspaceConfigOverride({ billing: { failedSubscriptionGraceDays: 4 } });
     expect(getWorkspaceConfig().billing.failedSubscriptionGraceDays).toBe(4);
+  });
+
+  it('lets a fresh admin recovery override supersede an expired payment grace period', () => {
+    const graceEndsAt = new Date('2026-09-16T10:00:00Z');
+    expect(adminOverrideSupersedesRestriction({ setAt: '2026-09-16T10:01:00Z' }, graceEndsAt)).toBe(true);
+    expect(adminOverrideSupersedesRestriction({ setAt: '2026-09-16T09:59:00Z' }, graceEndsAt)).toBe(false);
+  });
+
+  it('does not let legacy or undated overrides bypass failed-payment restriction', () => {
+    const graceEndsAt = new Date('2026-09-16T10:00:00Z');
+    expect(adminOverrideSupersedesRestriction({ planSlug: 'business' }, graceEndsAt)).toBe(false);
+    expect(adminOverrideSupersedesRestriction(null, graceEndsAt)).toBe(false);
   });
 });

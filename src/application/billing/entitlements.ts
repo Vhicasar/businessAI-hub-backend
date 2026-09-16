@@ -85,6 +85,21 @@ export function isAdminOverrideActive(value: AdminEntitlementOverride | null, no
   return Number.isFinite(expires.getTime()) && expires > now;
 }
 
+/**
+ * A delinquent workspace ignores grants made before its grace deadline, but a
+ * new admin decision made after restriction is an explicit recovery action.
+ * This distinction prevents an old complimentary plan from defeating failed-
+ * payment enforcement while still letting support restore access deliberately.
+ */
+export function adminOverrideSupersedesRestriction(
+  value: AdminEntitlementOverride | null,
+  graceEndsAt: Date | null,
+): boolean {
+  if (!value || !graceEndsAt || !value.setAt) return false;
+  const setAt = new Date(value.setAt);
+  return Number.isFinite(setAt.getTime()) && setAt >= graceEndsAt;
+}
+
 /** Calendar-month window [firstOfMonth, firstOfNextMonth) in UTC. */
 function calendarMonthWindow(now = new Date()): { start: Date; end: Date } {
   const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
@@ -133,11 +148,13 @@ export async function resolveEntitlements(orgId?: string): Promise<Entitlements>
     ? new Date(subscription.pastDueAt.getTime() + graceDays * 86_400_000)
     : null;
   const paymentRestricted = Boolean(graceEndsAt && graceEndsAt <= new Date());
-  const usableOverride = paymentRestricted ? null : activeOverride;
+  const restrictionWasManuallyRecovered = paymentRestricted
+    && adminOverrideSupersedesRestriction(activeOverride, graceEndsAt);
+  const usableOverride = paymentRestricted && !restrictionWasManuallyRecovered ? null : activeOverride;
   const overriddenPlan = usableOverride?.planSlug
     ? await prismaUnscoped.plan.findUnique({ where: { slug: usableOverride.planSlug } })
     : null;
-  const plan = overriddenPlan ?? (paymentRestricted ? null : subscription?.plan) ??
+  const plan = overriddenPlan ?? (paymentRestricted && !restrictionWasManuallyRecovered ? null : subscription?.plan) ??
     (await prismaUnscoped.plan.findUnique({ where: { slug: 'starter' } }));
 
   if (!plan) {
@@ -170,7 +187,7 @@ export async function resolveEntitlements(orgId?: string): Promise<Entitlements>
     ? { start: subscription.currentPeriodStart, end: subscription.currentPeriodEnd }
     : calendarMonthWindow();
 
-  const purchases = paymentRestricted ? [] : await prismaUnscoped.addOnPurchase.findMany({
+  const purchases = paymentRestricted && !restrictionWasManuallyRecovered ? [] : await prismaUnscoped.addOnPurchase.findMany({
     where: { organizationId, OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
     select: { entitlements: true },
   });
@@ -214,7 +231,7 @@ export async function resolveEntitlements(orgId?: string): Promise<Entitlements>
     periodStart: window.start,
     periodEnd: window.end,
     subscription: subscription ?? null,
-    accessRestriction: paymentRestricted && graceEndsAt ? {
+    accessRestriction: paymentRestricted && !restrictionWasManuallyRecovered && graceEndsAt ? {
       code: 'SUBSCRIPTION_PAYMENT_FAILED',
       graceEndsAt,
       message: 'This workspace is restricted because its subscription payment was not completed. Ask the workspace owner to update billing.',

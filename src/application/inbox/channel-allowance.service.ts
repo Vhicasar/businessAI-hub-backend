@@ -107,9 +107,10 @@ export async function allowanceFor(
   channelType: string
 ): Promise<ChannelAllowance> {
   const policy = channelPolicy(channelType);
-  const [purchased, used, entitlements] = await Promise.all([
+  const [purchased, used, totalUsed, entitlements] = await Promise.all([
     purchasedFor(organizationId, channelType),
     prisma.channelAccount.count({ where: { channelType: channelType as never, deletedAt: null } }),
+    prisma.channelAccount.count({ where: { deletedAt: null } }),
     resolveEntitlements(organizationId).catch(() => null),
   ]);
 
@@ -122,6 +123,10 @@ export async function allowanceFor(
     blockedReason = 'This channel is not available on this platform.';
   } else if (policy.requiresFeature && entitlements && !entitlements.features.has(policy.requiresFeature as never)) {
     blockedReason = 'Your plan does not include this channel. Upgrade to connect it.';
+  } else if (entitlements?.limits.maxChannels !== null
+    && entitlements?.limits.maxChannels !== undefined
+    && totalUsed >= entitlements.limits.maxChannels) {
+    blockedReason = `Your ${entitlements.planName} plan allows up to ${entitlements.limits.maxChannels} connected channels. Upgrade your plan to add more.`;
   } else if (used >= allowed) {
     blockedReason =
       policy.maxQuantity > 0 && uncapped >= policy.maxQuantity

@@ -406,16 +406,12 @@ export const authService = {
     });
     if (memberships.length === 0) return; // first business is always allowed
 
-    const subs = await prismaUnscoped.subscription.findMany({
-      where: {
-        organizationId: { in: memberships.map((m) => m.organizationId) },
-        status: { in: ['TRIALING', 'ACTIVE', 'PAST_DUE'] },
-      },
-      include: { plan: { select: { slug: true } } },
-    });
     const starterMax = PLAN_CATALOG.find((p) => p.slug === 'starter')?.maxBusinesses ?? 1;
-    // No paid subscription anywhere → treat as the free (starter) allowance.
-    const slugs = subs.length ? subs.map((s) => s.plan.slug) : ['starter'];
+    // Resolve effective access rather than reading paid subscriptions directly:
+    // an active admin recovery override must govern every limit consistently.
+    const slugs = await Promise.all(memberships.map(async (membership) =>
+      (await resolveEntitlements(membership.organizationId)).planSlug,
+    ));
     let allowance = 0;
     for (const slug of slugs) {
       const max = PLAN_CATALOG.find((p) => p.slug === slug)?.maxBusinesses ?? starterMax;

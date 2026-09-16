@@ -619,7 +619,17 @@ serviceRoutes.put(
       },
     });
     logger.info({ organizationId, planSlug: nextOverride.planSlug, limitKeys: Object.keys(nextOverride.limits as Partial<PlanLimits>), usageMetrics: Object.keys(req.body.usage ?? {}) }, 'service API: organization entitlements overridden');
-    res.json({ success: true, data: { updated: true } });
+    res.json({ success: true, data: {
+      updated: true,
+      effective: {
+        planSlug: entitlements.planSlug,
+        planName: entitlements.planName,
+        limits: entitlements.limits,
+        features: [...entitlements.features],
+        accessRestriction: entitlements.accessRestriction,
+      },
+      override: nextOverride,
+    } });
   }),
 );
 

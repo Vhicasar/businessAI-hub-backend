@@ -231,13 +231,13 @@ export const campaignService = {
         `Connect an active ${campaign.type} channel in Settings → Channels before sending this campaign.`,
       );
     }
-    const plan = await prisma.plan.findUnique({ where: { id: ent.planId }, select: { maxMarketingReach: true } });
-    if (plan?.maxMarketingReach !== null && plan?.maxMarketingReach !== undefined && customers.length > plan.maxMarketingReach) {
+    const marketingLimit = ent.limits.maxMarketingReach;
+    if (marketingLimit !== null && marketingLimit !== undefined && customers.length > marketingLimit) {
       throw new AppError(
         'MARKETING_REACH_LIMIT',
         402,
-        `This campaign reaches ${customers.length.toLocaleString()} contacts, above your plan limit of ${plan.maxMarketingReach.toLocaleString()}. Upgrade your plan or narrow the audience.`,
-        { audience: customers.length, limit: plan.maxMarketingReach },
+        `This campaign reaches ${customers.length.toLocaleString()} contacts, above your plan limit of ${marketingLimit.toLocaleString()}. Upgrade your plan or narrow the audience.`,
+        { audience: customers.length, limit: marketingLimit },
       );
     }
     const paidChannel = channel as 'SMS' | 'EMAIL' | 'WHATSAPP';

@@ -162,7 +162,7 @@ export const billingService = {
         contacts: { used: contacts, limit: ent.limits.maxContacts },
         products: { used: products, limit: ent.limits.maxProducts },
         smsCredits,
-        marketingReach: { used: marketingReach, limit: plan?.maxMarketingReach ?? null },
+        marketingReach: { used: marketingReach, limit: ent.limits.maxMarketingReach },
       },
       // Active payment gateway (admin-selected, falling back to local env).
       paymentProvider: getActivePaymentProvider().name,
