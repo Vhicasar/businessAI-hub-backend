@@ -26,7 +26,7 @@ export async function sendEmailViaChannel(
   email: ChannelEmail,
 ): Promise<{ ok: boolean; error?: string }> {
   const account = await prisma.channelAccount.findFirst({
-    where: { id: channelAccountId, deletedAt: null, isActive: true },
+    where: { id: channelAccountId, deletedAt: null, isActive: true, status: 'CONNECTED' },
     select: { id: true, channelType: true, name: true, credentialsEnc: true },
   });
   if (!account) return { ok: false, error: 'That email channel is no longer connected' };

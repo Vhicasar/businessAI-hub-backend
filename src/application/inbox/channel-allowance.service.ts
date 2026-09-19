@@ -80,6 +80,57 @@ export interface ChannelAllowance {
   canPurchaseMore: boolean;
 }
 
+/** The single definition of a channel that occupies paid active capacity. */
+export const ACTIVE_CHANNEL_WHERE = {
+  deletedAt: null,
+  isActive: true,
+  status: 'CONNECTED',
+} as const;
+
+export function countsTowardChannelLimit(account: {
+  deletedAt: Date | null;
+  isActive: boolean;
+  status: string;
+}): boolean {
+  return account.deletedAt === null && account.isActive && account.status === 'CONNECTED';
+}
+
+/** Retry/reconnect needs a free slot unless this exact row already owns one. */
+export function connectionWouldAddActiveCapacity(
+  account: { deletedAt: Date | null; isActive: boolean; status: string } | null,
+): boolean {
+  return !account || !countsTowardChannelLimit(account);
+}
+
+/** Repair abandoned/newer failed attempts and the legacy false-CONNECTED state. */
+export async function repairStaleChannelLifecycle(organizationId: string): Promise<void> {
+  const now = new Date();
+  await Promise.all([
+    prismaUnscoped.channelAccount.updateMany({
+      where: {
+        organizationId,
+        status: 'CONNECTING',
+        updatedAt: { lt: new Date(now.getTime() - 30 * 60_000) },
+      },
+      data: {
+        status: 'ERROR', isActive: false,
+        lastError: 'Connection setup expired before it completed. Retry the connection.',
+        lastErrorAt: now,
+      },
+    }),
+    prismaUnscoped.channelAccount.updateMany({
+      where: {
+        organizationId,
+        status: 'CONNECTED',
+        lastWebhookAt: null,
+        lastErrorAt: { not: null },
+        metadata: { path: ['webhookSubscriptionStatus'], equals: 'FAILED' },
+      },
+      data: { status: 'ERROR', isActive: false },
+    }),
+  ]);
+}
+
 /**
  * Extra instances bought for a type.
  *
@@ -106,11 +157,12 @@ export async function allowanceFor(
   organizationId: string,
   channelType: string
 ): Promise<ChannelAllowance> {
+  await repairStaleChannelLifecycle(organizationId);
   const policy = channelPolicy(channelType);
   const [purchased, used, totalUsed, entitlements] = await Promise.all([
     purchasedFor(organizationId, channelType),
-    prisma.channelAccount.count({ where: { channelType: channelType as never, deletedAt: null } }),
-    prisma.channelAccount.count({ where: { deletedAt: null } }),
+    prisma.channelAccount.count({ where: { channelType: channelType as never, ...ACTIVE_CHANNEL_WHERE } }),
+    prisma.channelAccount.count({ where: ACTIVE_CHANNEL_WHERE }),
     resolveEntitlements(organizationId).catch(() => null),
   ]);
 
@@ -183,6 +235,7 @@ export async function pickChannelFor(input: {
     where: {
       deletedAt: null,
       isActive: true,
+      status: 'CONNECTED',
       ...(input.channelTypes?.length ? { channelType: { in: input.channelTypes as never[] } } : {}),
     },
     select: { id: true, channelType: true, name: true, purpose: true },

@@ -146,6 +146,24 @@ export async function markChannelConnected(accountId: string): Promise<void> {
     .catch((err) => logger.warn({ err, accountId }, 'Could not mark channel connected'));
 }
 
+/** Mandatory connection setup failed: never leave the row active or billable. */
+export async function markChannelSetupFailed(
+  accountId: string,
+  channelType: string,
+  rawMessage: string,
+): Promise<void> {
+  await prismaUnscoped.channelAccount.update({
+    where: { id: accountId },
+    data: {
+      isActive: false,
+      status: 'ERROR',
+      lastError: friendlyMessage(channelType, 'ERROR'),
+      lastErrorAt: new Date(),
+    },
+  }).catch((err) => logger.warn({ err, accountId }, 'Could not record channel setup failure'));
+  logger.warn({ accountId, channelType, phase: 'setup_failed', rawMessage }, 'Channel setup failed');
+}
+
 /** Store subscription readiness without storing provider responses or secrets. */
 export async function markWebhookSubscription(
   accountId: string,

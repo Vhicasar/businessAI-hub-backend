@@ -4,7 +4,6 @@ import { z } from 'zod';
 import { validate } from '../middleware/validate';
 import { authenticate, requireTenant } from '../middleware/authenticate';
 import { requirePermission } from '../middleware/require-permission';
-import { enforceLimit } from '../middleware/plan-guard';
 import {
   inboxService,
   listConversationsSchema,
@@ -152,7 +151,6 @@ inboxRoutes.get(
 inboxRoutes.post(
   '/channels',
   requirePermission('inbox.manage_channels', 'settings.manage_integrations'),
-  enforceLimit('channels'),
   validate({ body: connectChannelSchema }),
   wrap(async (req, res) => {
     const data = await channelsService.connect(req.auth!.organizationId!, req.body);

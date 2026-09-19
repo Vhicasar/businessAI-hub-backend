@@ -35,7 +35,7 @@ const DEFAULT_THEME = {
 async function websiteRuntime(organizationId: string) {
   const [webChat, entitlements] = await Promise.all([
     prismaUnscoped.channelAccount.findFirst({
-      where: { organizationId, channelType: 'WEB_CHAT', isActive: true, deletedAt: null },
+      where: { organizationId, channelType: 'WEB_CHAT', isActive: true, status: 'CONNECTED', deletedAt: null },
       orderBy: { createdAt: 'desc' },
       select: { id: true },
     }),

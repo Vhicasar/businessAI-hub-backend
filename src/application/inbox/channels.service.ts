@@ -17,10 +17,12 @@ import { getAdapter, supportedChannels } from '../../infrastructure/channels/reg
 import { activityService } from '../crm/activity.service';
 import { requestContext } from '../../shared/context';
 import { logger } from '../../shared/logger';
-import { friendlyMessage, markChannelConnected, markChannelError, markWebhookSubscription } from './channel-health.service';
+import { friendlyMessage, markChannelConnected, markChannelError, markChannelSetupFailed, markWebhookSubscription } from './channel-health.service';
 import {
   allowanceFor,
   allowanceSummary,
+  connectionWouldAddActiveCapacity,
+  repairStaleChannelLifecycle,
   CHANNEL_PURPOSES,
   CHANNEL_PURPOSE_IDS,
 } from './channel-allowance.service';
@@ -188,6 +190,7 @@ async function recordChannelEvent(
 
 export const channelsService = {
   async list(organizationId: string) {
+    await repairStaleChannelLifecycle(organizationId);
     const accounts = await prisma.channelAccount.findMany({
       where: { deletedAt: null },
       select: accountSelect,
@@ -251,35 +254,34 @@ export const channelsService = {
     const existing = await prisma.channelAccount.findFirst({
       where: { channelType: dto.channelType, externalId },
     });
-    if (existing && !existing.deletedAt) throw new ConflictError('This account is already connected');
+    if (existing && !existing.deletedAt && existing.isActive && existing.status === 'CONNECTED') {
+      throw new ConflictError('This account is already connected');
+    }
 
     // Enforced here, not only in the UI: how many instances a business may run
     // is a billing decision, and the endpoint is reachable without the screen.
-    if (!existing) {
+    if (connectionWouldAddActiveCapacity(existing)) {
       const allowance = await allowanceFor(organizationId, dto.channelType);
       if (!allowance.canAddMore) throw new ConflictError(allowance.blockedReason ?? 'Channel limit reached');
     }
 
-    const account = existing
-      ? await prisma.channelAccount.update({
-          where: { id: existing.id },
-          data: {
+    const account = await prisma.channelAccount.upsert({
+          where: { organizationId_channelType_externalId: { organizationId, channelType: dto.channelType, externalId } },
+          update: {
             name: dto.name,
             purpose: dto.purpose,
             autoReply: dto.autoReply,
             credentialsEnc: encrypt(JSON.stringify(credentials)),
             metadata: safeManualMetadata(dto.channelType, credentials) as never,
-            webhookSecret: existing.webhookSecret || webhookSecret,
-            isActive: true,
-            status: 'CONNECTED',
+            webhookSecret: existing?.webhookSecret || webhookSecret,
+            isActive: false,
+            status: 'CONNECTING',
             lastError: null,
             lastErrorAt: null,
             deletedAt: null,
             ...metaRoutingFields(dto.channelType, credentials),
           },
-        })
-      : await prisma.channelAccount.create({
-          data: {
+          create: {
             organizationId,
             channelType: dto.channelType,
             name: dto.name,
@@ -289,11 +291,13 @@ export const channelsService = {
             credentialsEnc: encrypt(JSON.stringify(credentials)),
             metadata: safeManualMetadata(dto.channelType, credentials) as never,
             webhookSecret,
+            isActive: false,
+            status: 'CONNECTING',
             ...metaRoutingFields(dto.channelType, credentials),
           },
         });
 
-    await recordChannelEvent(account.id, existing ? 'Channel reconnected' : 'Channel connected', {
+    await recordChannelEvent(account.id, existing ? 'Channel retry started' : 'Channel connection started', {
       body: [
         `Type: ${dto.channelType}`,
         `Name: ${dto.name}`,
@@ -301,7 +305,7 @@ export const channelsService = {
         `Auto-reply: ${dto.autoReply ? 'on' : 'off'}`,
       ].join('\n'),
       metadata: {
-        next: { name: dto.name, purpose: dto.purpose, autoReply: dto.autoReply, isActive: true },
+        next: { name: dto.name, purpose: dto.purpose, autoReply: dto.autoReply, isActive: false, status: 'CONNECTING' },
         channelType: dto.channelType,
       },
     });
@@ -331,7 +335,7 @@ export const channelsService = {
           webhookUrl
         );
       } catch (error) {
-        await markChannelError(account.id, dto.channelType, (error as Error).message);
+        await markChannelSetupFailed(account.id, dto.channelType, (error as Error).message);
         throw error;
       }
     }
@@ -345,7 +349,7 @@ export const channelsService = {
         await markChannelConnected(account.id);
       } catch (error) {
         await markWebhookSubscription(account.id, 'FAILED');
-        await markChannelError(account.id, dto.channelType, `Webhook subscription failed: ${(error as Error).message}`);
+        await markChannelSetupFailed(account.id, dto.channelType, `Webhook subscription failed: ${(error as Error).message}`);
         throw error;
       }
     }
@@ -355,6 +359,14 @@ export const channelsService = {
       await prisma.channelAccount.update({
         where: { id: account.id },
         data: { status: 'CONNECTING', lastError: setupNote, lastErrorAt: new Date() },
+      });
+    } else {
+      await markChannelConnected(account.id);
+    }
+
+    if (!['SMS', 'TIKTOK'].includes(dto.channelType)) {
+      await recordChannelEvent(account.id, existing ? 'Channel reconnected' : 'Channel connected', {
+        metadata: { channelType: dto.channelType, next: { isActive: true, status: 'CONNECTED' } },
       });
     }
 
@@ -436,7 +448,7 @@ export const channelsService = {
       // attempting to create a new row would fail with P2002. Reconnecting
       // restores the original row and keeps its conversation history.
       where: { channelType, externalId },
-      select: { id: true, organizationId: true, name: true },
+      select: { id: true, organizationId: true, name: true, status: true, isActive: true, deletedAt: true },
     });
     if (existing && existing.organizationId !== organizationId) {
       throw new ConflictError(
@@ -444,7 +456,7 @@ export const channelsService = {
       );
     }
 
-    if (!existing) {
+    if (connectionWouldAddActiveCapacity(existing)) {
       const allowance = await allowanceFor(organizationId, channelType);
       if (!allowance.canAddMore) {
         throw new ConflictError(allowance.blockedReason ?? 'Channel limit reached');
@@ -452,25 +464,22 @@ export const channelsService = {
     }
 
     const webhookSecret = existing ? undefined : newWebhookSecret();
-    const account = existing
-      ? await prisma.channelAccount.update({
-          where: { id: existing.id },
-          data: {
+    const account = await prisma.channelAccount.upsert({
+          where: { organizationId_channelType_externalId: { organizationId, channelType, externalId } },
+          update: {
             credentialsEnc: encrypt(JSON.stringify(connection.credentials)),
             metadata: connection.metadata as never,
             // A reconnect is also how a disabled account comes back — and how
             // an expired one is repaired, which is the whole point of showing
             // EXPIRED in the first place.
-            isActive: true,
-            status: 'CONNECTED',
+            isActive: false,
+            status: 'CONNECTING',
             deletedAt: null,
             lastError: null,
             lastErrorAt: null,
             ...metaRoutingFields(channelType, connection.credentials),
           },
-        })
-      : await prisma.channelAccount.create({
-          data: {
+          create: {
             organizationId,
             channelType,
             name: connection.displayName,
@@ -482,11 +491,13 @@ export const channelsService = {
             credentialsEnc: encrypt(JSON.stringify(connection.credentials)),
             metadata: connection.metadata as never,
             webhookSecret,
+            isActive: false,
+            status: 'CONNECTING',
             ...metaRoutingFields(channelType, connection.credentials),
           },
         });
 
-    await recordChannelEvent(account.id, existing ? 'Channel reconnected' : 'Channel connected', {
+    await recordChannelEvent(account.id, existing ? 'Channel OAuth retry started' : 'Channel OAuth connection started', {
       body: [
         `Type: ${channelType}`,
         `Account: ${connection.displayName}`,

@@ -35,7 +35,7 @@ export const messagingService = {
     }
 
     const account = await prisma.channelAccount.findFirst({
-      where: { channelType, isActive: true, deletedAt: null },
+      where: { channelType, isActive: true, status: 'CONNECTED', deletedAt: null },
     });
     if (!account) return { ok: false, error: `No active ${channelType} channel is configured` };
 

@@ -131,7 +131,7 @@ export const billingService = {
     const [aiUsed, users, channels, contacts, products, smsCredits, marketingReach, plan, latestSubscription] = await Promise.all([
       usageService.get(USAGE_METRICS.AI_RESPONSE, period),
       prismaUnscoped.membership.count({ where: { organizationId: orgId, isActive: true, deletedAt: null } }),
-      prismaUnscoped.channelAccount.count({ where: { organizationId: orgId, deletedAt: null } }),
+      prismaUnscoped.channelAccount.count({ where: { organizationId: orgId, deletedAt: null, isActive: true, status: 'CONNECTED' } }),
       prismaUnscoped.customer.count({ where: { organizationId: orgId, deletedAt: null, isProvisional: false } }),
       prismaUnscoped.product.count({ where: { organizationId: orgId } }),
       smsWalletService.usage(orgId, ent.periodStart, ent.periodEnd),

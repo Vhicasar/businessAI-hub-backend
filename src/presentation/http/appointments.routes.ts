@@ -24,7 +24,7 @@ const wrap =
 
 async function accountOrg(accountId: string): Promise<string | null> {
   const account = await prismaUnscoped.channelAccount.findFirst({
-    where: { id: accountId, channelType: 'WEB_CHAT', isActive: true, deletedAt: null },
+    where: { id: accountId, channelType: 'WEB_CHAT', isActive: true, status: 'CONNECTED', deletedAt: null },
     select: { organizationId: true },
   });
   return account?.organizationId ?? null;

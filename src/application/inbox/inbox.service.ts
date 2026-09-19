@@ -498,7 +498,7 @@ export const inboxService = {
     // Read from the channel's own setting: auto-reply is per instance, so the
     // support inbox answering by itself must not make the invoices one do the
     // same.
-    if (!account || !account.autoReply) return;
+    if (!account || !account.autoReply || !account.isActive || account.status !== 'CONNECTED' || account.deletedAt) return;
 
     const conversation = await prisma.conversation.findFirst({ where: { id: conversationId } });
     if (!conversation || conversation.status !== 'OPEN' || conversation.assignedToId) return;
@@ -522,7 +522,7 @@ export const inboxService = {
     // second time at the actual send boundary. This applies identically to
     // email and every webhook-backed channel.
     const stillEnabled = await prisma.channelAccount.findFirst({
-      where: { id: accountId, autoReply: true, isActive: true, deletedAt: null },
+      where: { id: accountId, autoReply: true, isActive: true, status: 'CONNECTED', deletedAt: null },
       select: { id: true },
     });
     if (!stillEnabled) return;
@@ -761,7 +761,10 @@ export const inboxService = {
           channelAccount: { select: { channelType: true, name: true } },
         },
       }),
-      prisma.channelAccount.findMany({ select: { channelType: true } }),
+      prisma.channelAccount.findMany({
+        where: { isActive: true, status: 'CONNECTED', deletedAt: null },
+        select: { channelType: true },
+      }),
     ]);
     const connected = [...new Set(accounts.map((a) => a.channelType))];
     return {
@@ -793,8 +796,8 @@ export const inboxService = {
     const identity = await prisma.customerIdentity.findFirst({ where: { customerId, channelType } });
     if (!identity) throw new ConflictError(`This customer has no ${channelType} contact on file`);
     const account = identity.channelAccountId
-      ? await prisma.channelAccount.findFirst({ where: { id: identity.channelAccountId } })
-      : await prisma.channelAccount.findFirst({ where: { channelType } });
+      ? await prisma.channelAccount.findFirst({ where: { id: identity.channelAccountId, isActive: true, status: 'CONNECTED', deletedAt: null } })
+      : await prisma.channelAccount.findFirst({ where: { channelType, isActive: true, status: 'CONNECTED', deletedAt: null } });
     if (!account) throw new ConflictError(`No connected ${channelType} channel to send from`);
 
     let convo = await prisma.conversation.findFirst({
