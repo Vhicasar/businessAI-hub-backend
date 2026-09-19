@@ -282,12 +282,13 @@ export class MetaMessagingAdapter implements ChannelAdapter {
     const directInstagram = instagram && Boolean(account.credentials.accessToken);
     const token = directInstagram ? account.credentials.accessToken : account.credentials.pageAccessToken;
     if (directInstagram && !account.credentials.appSecret) {
-      throw new AppError('CHANNEL_MISCONFIGURED', 400, 'Instagram app credentials are not configured on this deployment.');
+      throw new AppError('CHANNEL_MISCONFIGURED', 400, 'Instagram App ID and App Secret are required for a manual connection.');
     }
     if (directInstagram) {
-      const configured = oauthCredentials('instagram');
-      const appId = configured?.clientId || env.instagram.appId;
-      const appSecret = configured?.clientSecret || env.instagram.appSecret;
+      // BYO/manual rows carry their own appId. OAuth rows created by the
+      // Vhicasar app predate that field and resolve its centrally managed id.
+      const appId = account.credentials.appId || oauthCredentials('instagram')?.clientId || env.instagram.appId;
+      const appSecret = account.credentials.appSecret;
       const debugResponse = await fetch(
         `${graph()}/debug_token?input_token=${encodeURIComponent(token ?? '')}&access_token=${encodeURIComponent(`${appId}|${appSecret}`)}`
       );

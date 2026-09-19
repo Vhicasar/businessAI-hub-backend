@@ -22,6 +22,17 @@ describe('Meta inbound readiness', () => {
     if (!parsed.success) expect(parsed.error.issues.some((issue) => issue.path.at(-1) === 'wabaId')).toBe(true);
   });
 
+  it('requires the owning Meta app credentials for manual Instagram', () => {
+    const parsed = connectChannelSchema.safeParse({
+      channelType: 'INSTAGRAM', name: 'Instagram', purpose: 'SUPPORT', autoReply: false,
+      credentials: { accessToken: 'token', instagramAccountId: 'ig-1' },
+    });
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      expect(parsed.error.issues.map((issue) => issue.path.at(-1))).toEqual(expect.arrayContaining(['appId', 'appSecret']));
+    }
+  });
+
   it('subscribes WhatsApp at the WABA subscribed_apps endpoint', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: true })
@@ -58,7 +69,7 @@ describe('Meta inbound readiness', () => {
     const adapter = new MetaMessagingAdapter('INSTAGRAM', 'instagram');
     await expect(adapter.onAccountConnected!({
       id: 'account', organizationId: 'org', externalId: 'expected-id', webhookSecret: null,
-      credentials: { accessToken: 'token', appSecret: 'secret', instagramAccountId: 'expected-id' },
+      credentials: { accessToken: 'token', appId: process.env.INSTAGRAM_APP_ID || process.env.META_APP_ID || '', appSecret: 'secret', instagramAccountId: 'expected-id' },
     }, 'https://example.test/api/webhooks/instagram')).rejects.toMatchObject({ code: 'CHANNEL_MISCONFIGURED' });
   });
 
@@ -71,7 +82,7 @@ describe('Meta inbound readiness', () => {
     const adapter = new MetaMessagingAdapter('INSTAGRAM', 'instagram');
     await expect(adapter.onAccountConnected!({
       id: 'account', organizationId: 'org', externalId: 'ig-1', webhookSecret: null,
-      credentials: { accessToken: 'token', appSecret: 'secret', instagramAccountId: 'ig-1' },
+      credentials: { accessToken: 'token', appId: process.env.INSTAGRAM_APP_ID || process.env.META_APP_ID || '', appSecret: 'secret', instagramAccountId: 'ig-1' },
     }, 'https://example.test/api/webhooks/instagram')).rejects.toMatchObject({ code: 'INSTAGRAM_MESSAGING_PERMISSION_MISSING' });
   });
 });

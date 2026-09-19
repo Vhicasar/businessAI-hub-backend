@@ -41,7 +41,7 @@ export const connectChannelSchema = z.object({
     SMS: ['accountSid', 'authToken'],
     TIKTOK: ['clientKey', 'clientSecret', 'accessToken', 'openId'],
     WHATSAPP: ['accessToken', 'wabaId', 'phoneNumberId', 'appSecret'],
-    INSTAGRAM: ['accessToken', 'instagramAccountId'],
+    INSTAGRAM: ['appId', 'appSecret', 'accessToken', 'instagramAccountId'],
     EMAIL: ['imapHost', 'imapUser', 'imapPass', 'smtpHost'],
   };
   for (const key of required[dto.channelType] ?? []) {
@@ -106,12 +106,11 @@ function safeManualMetadata(channelType: string, credentials: Record<string, str
   }
 }
 
-/** Add platform-owned secrets without ever accepting or returning them in the browser. */
+/** Copy request credentials before encryption; never return secrets to the browser. */
 function normalizedManualCredentials(
-  channelType: ConnectChannelDto['channelType'],
+  _channelType: ConnectChannelDto['channelType'],
   credentials: Record<string, string>,
 ): Record<string, string> {
-  if (channelType === 'INSTAGRAM') return { ...credentials, appSecret: env.instagram.appSecret };
   return { ...credentials };
 }
 
