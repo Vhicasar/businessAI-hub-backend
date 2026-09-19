@@ -42,7 +42,8 @@ export const connectChannelSchema = z.object({
   const required: Partial<Record<typeof dto.channelType, string[]>> = {
     SMS: ['accountSid', 'authToken'],
     TIKTOK: ['clientKey', 'clientSecret', 'accessToken', 'openId'],
-    WHATSAPP: ['accessToken', 'wabaId', 'phoneNumberId', 'appSecret'],
+    WHATSAPP: ['appId', 'appSecret', 'accessToken', 'wabaId', 'phoneNumberId'],
+    FACEBOOK_MESSENGER: ['appId', 'appSecret', 'pageAccessToken', 'pageId'],
     INSTAGRAM: ['appId', 'appSecret', 'accessToken', 'instagramAccountId'],
     EMAIL: ['imapHost', 'imapUser', 'imapPass', 'smtpHost'],
   };

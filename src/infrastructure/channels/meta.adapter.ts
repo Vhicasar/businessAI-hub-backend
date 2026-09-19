@@ -14,8 +14,7 @@ import type {
 } from '../../application/inbox/channel-adapter';
 import { mediaKindFor } from '../../application/inbox/channel-adapter';
 import { AppError } from '../../shared/errors';
-import { extensionFor, verifyMetaSignature } from './whatsapp.adapter';
-import { oauthCredentials } from '../../application/integrations/oauth-config-sync';
+import { extensionFor, validateMetaTokenOwnership, verifyMetaSignature } from './whatsapp.adapter';
 
 // Was pinned to v21.0 and ignored META_GRAPH_VERSION; read at call time so
 // a stub or a version bump reaches every adapter alike.
@@ -285,19 +284,16 @@ export class MetaMessagingAdapter implements ChannelAdapter {
       throw new AppError('CHANNEL_MISCONFIGURED', 400, 'Instagram App ID and App Secret are required for a manual connection.');
     }
     if (directInstagram) {
-      // BYO/manual rows carry their own appId. OAuth rows created by the
-      // Vhicasar app predate that field and resolve its centrally managed id.
-      const appId = account.credentials.appId || oauthCredentials('instagram')?.clientId || env.instagram.appId;
-      const appSecret = account.credentials.appSecret;
-      const debugResponse = await fetch(
-        `${graph()}/debug_token?input_token=${encodeURIComponent(token ?? '')}&access_token=${encodeURIComponent(`${appId}|${appSecret}`)}`
-      );
-      const debugJson = await debugResponse.json().catch(() => ({})) as {
-        data?: { is_valid?: boolean; app_id?: string };
-      };
-      if (!debugResponse.ok || !debugJson.data?.is_valid || debugJson.data.app_id !== appId) {
-        throw new AppError('INSTAGRAM_TOKEN_APP_MISMATCH', 400, 'This Instagram access token was not issued for the Vhicasar Instagram integration.');
-      }
+      await validateMetaTokenOwnership({
+        appId: account.credentials.appId, appSecret: account.credentials.appSecret,
+        accessToken: token, label: 'Instagram',
+      });
+    } else {
+      await validateMetaTokenOwnership({
+        appId: account.credentials.appId, appSecret: account.credentials.appSecret,
+        accessToken: token, label: 'Facebook Page',
+        requiredScopes: ['pages_messaging', 'pages_manage_metadata'],
+      });
     }
     const res = await fetch(
       `${directInstagram ? env.instagram.graphUrl : graph()}/me?fields=id,user_id,name,username&access_token=${encodeURIComponent(token ?? '')}`

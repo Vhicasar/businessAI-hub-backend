@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { subscribeWebhooks, type ResolvedConnection } from '../../src/application/inbox/channel-oauth.service';
 import { connectChannelSchema } from '../../src/application/inbox/channels.service';
 import { MetaMessagingAdapter } from '../../src/infrastructure/channels/meta.adapter';
+import { validateMetaTokenOwnership } from '../../src/infrastructure/channels/whatsapp.adapter';
 
 function connection(channelType: ResolvedConnection['channelType'], credentials: Record<string, string>): ResolvedConnection {
   return {
@@ -31,6 +32,35 @@ describe('Meta inbound readiness', () => {
     if (!parsed.success) {
       expect(parsed.error.issues.map((issue) => issue.path.at(-1))).toEqual(expect.arrayContaining(['appId', 'appSecret']));
     }
+  });
+
+  it.each([
+    ['WHATSAPP', { accessToken: 'token', wabaId: 'waba', phoneNumberId: 'phone', appSecret: 'secret' }],
+    ['FACEBOOK_MESSENGER', { pageAccessToken: 'token', pageId: 'page', appSecret: 'secret' }],
+  ])('requires a Meta App ID for manual %s', (channelType, credentials) => {
+    const parsed = connectChannelSchema.safeParse({ channelType, name: 'Test', purpose: 'SUPPORT', autoReply: false, credentials });
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) expect(parsed.error.issues.some((issue) => issue.path.at(-1) === 'appId')).toBe(true);
+  });
+
+  it('validates a BYO token against the customer supplied app rather than Vhicasar app', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: { is_valid: true, app_id: 'customer-app', scopes: ['pages_messaging', 'pages_manage_metadata'] } }),
+    }));
+    await expect(validateMetaTokenOwnership({
+      appId: 'customer-app', appSecret: 'customer-secret', accessToken: 'customer-token',
+      label: 'Facebook Page', requiredScopes: ['pages_messaging', 'pages_manage_metadata'],
+    })).resolves.toBeUndefined();
+  });
+
+  it('rejects a token issued by a different app with an actionable message', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true, json: async () => ({ data: { is_valid: true, app_id: 'different-app' } }),
+    }));
+    await expect(validateMetaTokenOwnership({
+      appId: 'customer-app', appSecret: 'customer-secret', accessToken: 'token', label: 'Instagram',
+    })).rejects.toMatchObject({ code: 'META_TOKEN_APP_MISMATCH' });
   });
 
   it('subscribes WhatsApp at the WABA subscribed_apps endpoint', async () => {

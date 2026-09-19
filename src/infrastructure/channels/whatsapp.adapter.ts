@@ -70,6 +70,27 @@ export function verifyMetaSignature(req: WebhookRequestLike, appSecret: string):
   }
 }
 
+/** Validate that a BYO token belongs to the supplied Meta app, without logging it. */
+export async function validateMetaTokenOwnership(input: {
+  appId?: string; appSecret?: string; accessToken?: string; label: string; requiredScopes?: string[];
+}): Promise<void> {
+  if (!input.appId || !input.appSecret || !input.accessToken) {
+    throw new AppError('CHANNEL_MISCONFIGURED', 400, `${input.label} App ID, App Secret and access token are required.`);
+  }
+  const params = new URLSearchParams({ input_token: input.accessToken, access_token: `${input.appId}|${input.appSecret}` });
+  const response = await fetch(`${graph()}/debug_token?${params.toString()}`);
+  const json = await response.json().catch(() => ({})) as {
+    data?: { is_valid?: boolean; app_id?: string; scopes?: string[]; granular_scopes?: Array<{ scope?: string }> };
+  };
+  if (!response.ok || !json.data?.is_valid || json.data.app_id !== input.appId) {
+    throw new AppError('META_TOKEN_APP_MISMATCH', 400, `This ${input.label} access token does not belong to the Meta App ID entered above. Generate the token from that same Meta app.`);
+  }
+  const granted = new Set([...(json.data.scopes ?? []), ...(json.data.granular_scopes ?? []).flatMap((item) => item.scope ? [item.scope] : [])]);
+  if ((input.requiredScopes ?? []).some((scope) => !granted.has(scope))) {
+    throw new AppError('META_MESSAGING_PERMISSION_MISSING', 400, `The ${input.label} token belongs to this app but does not grant the required messaging permissions.`);
+  }
+}
+
 /**
  * WhatsApp Business Cloud API.
  * Credentials: { accessToken, phoneNumberId, appSecret }.
@@ -330,6 +351,11 @@ export class WhatsAppAdapter implements ChannelAdapter {
   }
 
   async onAccountConnected(account: ChannelAccountRef, _webhookUrl: string): Promise<string | null> {
+    await validateMetaTokenOwnership({
+      appId: account.credentials.appId, appSecret: account.credentials.appSecret,
+      accessToken: account.credentials.accessToken, label: 'WhatsApp',
+      requiredScopes: ['whatsapp_business_management', 'whatsapp_business_messaging'],
+    });
     // Validate the token/number by fetching the phone number resource.
     const res = await fetch(`${graph()}/${account.credentials.phoneNumberId}`, {
       headers: { Authorization: `Bearer ${account.credentials.accessToken}` },

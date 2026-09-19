@@ -334,6 +334,7 @@ async function resolveInstagramViaFacebook(
       pageAccessToken: page.access_token,
       pageId: page.id,
       instagramAccountId: instagram.id,
+      appId: instagramApp().appId,
       appSecret: instagramApp().appSecret,
     },
     metadata: {
@@ -370,7 +371,7 @@ async function resolveInstagram(
   return {
     externalId: accountId,
     displayName: profile.username ? `@${profile.username}` : 'Instagram',
-    credentials: { accessToken, instagramAccountId: accountId, appSecret: instagramApp().appSecret },
+    credentials: { accessToken, instagramAccountId: accountId, appId: instagramApp().appId, appSecret: instagramApp().appSecret },
     metadata: {
       instagramAccountId: accountId,
       username: profile.username ?? null,
@@ -462,6 +463,7 @@ async function resolveWhatsApp(
       accessToken: userToken,
       phoneNumberId: number.id,
       wabaId: waba.id,
+      appId: app.appId,
       // Signature verification uses the app secret, which is ours, not theirs.
       appSecret: metaApp().appSecret,
     },
@@ -510,6 +512,7 @@ async function resolvePage(
     credentials: {
       pageAccessToken: page.access_token ?? '',
       pageId: page.id,
+      appId: metaApp().appId,
       appSecret: metaApp().appSecret,
     },
     metadata: {
