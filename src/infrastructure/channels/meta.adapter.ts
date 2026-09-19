@@ -322,20 +322,38 @@ export class MetaMessagingAdapter implements ChannelAdapter {
       );
       const permissionJson = await permissionResponse.json().catch(() => ({})) as {
         data?: Array<{ permission?: string; status?: string }>;
+        error?: { message?: string };
       };
-      const granted = new Set(
-        (permissionJson.data ?? [])
-          .filter((item) => item.status === 'granted')
-          .map((item) => item.permission),
-      );
-      if (!permissionResponse.ok || !granted.has('instagram_business_basic') || !granted.has('instagram_business_manage_messages')) {
+      if (!permissionResponse.ok) {
         if (permissionResponse.status === 401 || permissionResponse.status === 403) {
           throw new AppError('TOKEN_INVALID', 400, 'The Instagram access token is invalid or expired.');
         }
         throw new AppError(
+          'PROVIDER_VALIDATION_UNAVAILABLE',
+          502,
+          'Instagram could not verify the permissions granted to this token. Try again shortly or generate a new token.',
+        );
+      }
+      if (!Array.isArray(permissionJson.data)) {
+        throw new AppError(
+          'PROVIDER_VALIDATION_UNAVAILABLE',
+          502,
+          'Instagram returned no permission information for this token. Generate a new token through Instagram Login and try again.',
+        );
+      }
+      const granted = new Set(
+        permissionJson.data
+          .filter((item) => item.status?.trim().toLowerCase() === 'granted')
+          .flatMap((item) => item.permission ? [item.permission.trim().toLowerCase()] : []),
+      );
+      const required = ['instagram_business_basic', 'instagram_business_manage_messages'];
+      const missing = required.filter((permission) => !granted.has(permission));
+      if (missing.length) {
+        throw new AppError(
           'MESSAGING_PERMISSION_MISSING',
           400,
-          'The Instagram credentials are valid, but this access token does not grant messaging access.',
+          `This access token is missing: ${missing.join(', ')}. Enabling permissions in Meta does not update an existing token; authorize the Instagram account again and generate a new token.`,
+          { missingPermissions: missing, grantedPermissions: [...granted].sort() },
         );
       }
     }

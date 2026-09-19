@@ -132,7 +132,22 @@ describe('Meta inbound readiness', () => {
     await expect(adapter.onAccountConnected!({
       id: 'account', organizationId: 'org', externalId: 'ig-1', webhookSecret: null,
       credentials: { instagramApiModel: 'INSTAGRAM_LOGIN', accessToken: 'token', appId: 'customer-app', appSecret: 'secret', instagramAccountId: 'ig-1' },
-    }, 'https://example.test/api/webhooks/instagram')).rejects.toMatchObject({ code: 'MESSAGING_PERMISSION_MISSING' });
+    }, 'https://example.test/api/webhooks/instagram')).rejects.toMatchObject({
+      code: 'MESSAGING_PERMISSION_MISSING',
+      details: { missingPermissions: ['instagram_business_manage_messages'] },
+    });
+  });
+
+  it('does not misreport an unavailable permission response as a missing grant', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ user_id: 'ig-1', username: 'shop', account_type: 'BUSINESS' }) })
+      .mockResolvedValueOnce({ ok: false, status: 500, json: async () => ({ error: { message: 'temporary' } }) });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = new MetaMessagingAdapter('INSTAGRAM', 'instagram');
+    await expect(adapter.onAccountConnected!({
+      id: 'account', organizationId: 'org', externalId: 'ig-1', webhookSecret: null,
+      credentials: { instagramApiModel: 'INSTAGRAM_LOGIN', accessToken: 'token', appId: 'customer-app', appSecret: 'secret', instagramAccountId: 'ig-1' },
+    }, 'https://example.test/api/webhooks/instagram')).rejects.toMatchObject({ code: 'PROVIDER_VALIDATION_UNAVAILABLE' });
   });
 
   it('validates direct Instagram Login without running Facebook debug_token app matching', async () => {
