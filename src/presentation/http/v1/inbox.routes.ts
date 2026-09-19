@@ -160,6 +160,14 @@ inboxRoutes.post(
   })
 );
 
+inboxRoutes.post(
+  '/channels/:id/diagnostic',
+  requirePermission('inbox.manage_channels', 'settings.manage_integrations'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await channelsService.diagnose(req.params.id as string) });
+  })
+);
+
 /**
  * Start a one-click connection.
  *

@@ -10,7 +10,7 @@ import {
   subscribeWebhooks,
 } from '../../application/inbox/channel-oauth.service';
 import { channelsService } from '../../application/inbox/channels.service';
-import { markChannelError } from '../../application/inbox/channel-health.service';
+import { markChannelError, markWebhookSubscription } from '../../application/inbox/channel-health.service';
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<void>): RequestHandler =>
@@ -94,7 +94,9 @@ channelOAuthRoutes.get(
        */
       try {
         await subscribeWebhooks(connection);
+        await markWebhookSubscription(account.id, 'READY');
       } catch (subscribeError) {
+        await markWebhookSubscription(account.id, 'FAILED');
         await markChannelError(
           account.id,
           channelType,

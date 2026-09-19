@@ -141,8 +141,11 @@ export class TelegramAdapter implements ChannelAdapter {
     const json = (await res.json()) as { ok: boolean; description?: string };
     if (!json.ok) {
       logger.warn({ description: json.description }, 'Telegram setWebhook failed');
-      return `Connected as @${me.result?.username}, but webhook registration failed: ${json.description}. ` +
-        `Confirm the configured application URL is the permanent public HTTPS production domain, then reconnect.`;
+      throw new AppError(
+        'CHANNEL_WEBHOOK_SUBSCRIBE_FAILED',
+        502,
+        'Telegram credentials are valid, but webhook registration failed. Confirm the public HTTPS application URL and reconnect.',
+      );
     }
     return `Connected as @${me.result?.username}. Webhook registered.`;
   }

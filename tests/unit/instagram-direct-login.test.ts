@@ -61,6 +61,7 @@ describe('direct Instagram Login', () => {
   it('subscribes and sends using the direct Instagram account and token', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
       .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: 'app-1' }] }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ message_id: 'mid-1' }), { status: 200 }));
     const connection = {
       organizationId: 'org', userId: 'user', returnTo: '/', channelType: 'INSTAGRAM' as const,

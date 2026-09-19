@@ -15,6 +15,7 @@ import type {
 import { mediaKindFor } from '../../application/inbox/channel-adapter';
 import { AppError } from '../../shared/errors';
 import { extensionFor, verifyMetaSignature } from './whatsapp.adapter';
+import { oauthCredentials } from '../../application/integrations/oauth-config-sync';
 
 // Was pinned to v21.0 and ignored META_GRAPH_VERSION; read at call time so
 // a stub or a version bump reaches every adapter alike.
@@ -280,13 +281,55 @@ export class MetaMessagingAdapter implements ChannelAdapter {
     const instagram = this.channelType === 'INSTAGRAM';
     const directInstagram = instagram && Boolean(account.credentials.accessToken);
     const token = directInstagram ? account.credentials.accessToken : account.credentials.pageAccessToken;
+    if (directInstagram && !account.credentials.appSecret) {
+      throw new AppError('CHANNEL_MISCONFIGURED', 400, 'Instagram app credentials are not configured on this deployment.');
+    }
+    if (directInstagram) {
+      const configured = oauthCredentials('instagram');
+      const appId = configured?.clientId || env.instagram.appId;
+      const appSecret = configured?.clientSecret || env.instagram.appSecret;
+      const debugResponse = await fetch(
+        `${graph()}/debug_token?input_token=${encodeURIComponent(token ?? '')}&access_token=${encodeURIComponent(`${appId}|${appSecret}`)}`
+      );
+      const debugJson = await debugResponse.json().catch(() => ({})) as {
+        data?: { is_valid?: boolean; app_id?: string };
+      };
+      if (!debugResponse.ok || !debugJson.data?.is_valid || debugJson.data.app_id !== appId) {
+        throw new AppError('INSTAGRAM_TOKEN_APP_MISMATCH', 400, 'This Instagram access token was not issued for the Vhicasar Instagram integration.');
+      }
+    }
     const res = await fetch(
-      `${directInstagram ? env.instagram.graphUrl : graph()}/me?access_token=${encodeURIComponent(token ?? '')}`
+      `${directInstagram ? env.instagram.graphUrl : graph()}/me?fields=id,user_id,name,username&access_token=${encodeURIComponent(token ?? '')}`
     );
     if (!res.ok) {
       throw new AppError('CHANNEL_MISCONFIGURED', 400, `${instagram ? 'Instagram' : 'Page'} access token invalid`);
     }
-    const me = (await res.json()) as { name?: string; username?: string };
+    const me = (await res.json()) as { id?: string; user_id?: string; name?: string; username?: string };
+    const returnedId = me.user_id ?? me.id;
+    const expectedId = directInstagram ? account.credentials.instagramAccountId : account.credentials.pageId;
+    if (expectedId && returnedId && expectedId !== returnedId) {
+      throw new AppError('CHANNEL_MISCONFIGURED', 400, `${instagram ? 'Instagram account' : 'Facebook Page'} ID does not belong to this access token.`);
+    }
+    if (directInstagram) {
+      const permissionResponse = await fetch(
+        `${env.instagram.graphUrl}/me/permissions?access_token=${encodeURIComponent(token ?? '')}`
+      );
+      const permissionJson = await permissionResponse.json().catch(() => ({})) as {
+        data?: Array<{ permission?: string; status?: string }>;
+      };
+      const granted = new Set(
+        (permissionJson.data ?? [])
+          .filter((item) => item.status === 'granted')
+          .map((item) => item.permission),
+      );
+      if (!permissionResponse.ok || !granted.has('instagram_business_basic') || !granted.has('instagram_business_manage_messages')) {
+        throw new AppError(
+          'INSTAGRAM_MESSAGING_PERMISSION_MISSING',
+          400,
+          'The Instagram credentials are valid, but this access token does not grant messaging access.',
+        );
+      }
+    }
     return `Connected to "${me.username ? `@${me.username}` : me.name ?? (instagram ? 'Instagram account' : 'page')}". Vhicasar uses the platform-level ${this.webhookObject} webhook; no business-specific callback setup is required.`;
   }
 }

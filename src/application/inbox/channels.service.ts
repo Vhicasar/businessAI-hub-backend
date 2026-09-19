@@ -2,11 +2,12 @@ import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { ConflictError, NotFoundError } from '../../shared/errors';
 import { prisma } from '../../infrastructure/database/prisma';
-import { encrypt } from '../../shared/crypto';
+import { decrypt, encrypt } from '../../shared/crypto';
 import { env } from '../../shared/config/env';
 import {
   newWebhookSecret,
   oauthUnavailableReason,
+  subscribeWebhooks,
   supportsOAuth,
   type ResolvedConnection,
 } from './channel-oauth.service';
@@ -16,6 +17,7 @@ import { getAdapter, supportedChannels } from '../../infrastructure/channels/reg
 import { activityService } from '../crm/activity.service';
 import { requestContext } from '../../shared/context';
 import { logger } from '../../shared/logger';
+import { friendlyMessage, markChannelConnected, markChannelError, markWebhookSubscription } from './channel-health.service';
 import {
   allowanceFor,
   allowanceSummary,
@@ -38,7 +40,7 @@ export const connectChannelSchema = z.object({
   const required: Partial<Record<typeof dto.channelType, string[]>> = {
     SMS: ['accountSid', 'authToken'],
     TIKTOK: ['clientKey', 'clientSecret', 'accessToken', 'openId'],
-    WHATSAPP: ['accessToken', 'phoneNumberId', 'appSecret'],
+    WHATSAPP: ['accessToken', 'wabaId', 'phoneNumberId', 'appSecret'],
     INSTAGRAM: ['accessToken', 'instagramAccountId'],
     EMAIL: ['imapHost', 'imapUser', 'imapPass', 'smtpHost'],
   };
@@ -92,7 +94,7 @@ function metaRoutingFields(channelType: string, credentials: Record<string, stri
 function safeManualMetadata(channelType: string, credentials: Record<string, string>): Record<string, unknown> {
   const common = { connectedVia: 'manual_credentials', connectedAt: new Date().toISOString() };
   switch (channelType) {
-    case 'WHATSAPP': return { ...common, phoneNumberId: credentials.phoneNumberId ?? null };
+    case 'WHATSAPP': return { ...common, wabaId: credentials.wabaId ?? null, phoneNumberId: credentials.phoneNumberId ?? null };
     case 'FACEBOOK_MESSENGER': return { ...common, facebookPageId: credentials.pageId ?? null };
     case 'INSTAGRAM': return { ...common, instagramAccountId: credentials.instagramAccountId ?? null };
     case 'TELEGRAM': return { ...common, botId: credentials.botToken?.split(':')[0] ?? null };
@@ -102,6 +104,32 @@ function safeManualMetadata(channelType: string, credentials: Record<string, str
     case 'WEB_CHAT': return { ...common };
     default: return common;
   }
+}
+
+/** Add platform-owned secrets without ever accepting or returning them in the browser. */
+function normalizedManualCredentials(
+  channelType: ConnectChannelDto['channelType'],
+  credentials: Record<string, string>,
+): Record<string, string> {
+  if (channelType === 'INSTAGRAM') return { ...credentials, appSecret: env.instagram.appSecret };
+  return { ...credentials };
+}
+
+function manualConnection(
+  organizationId: string,
+  dto: ConnectChannelDto,
+  credentials: Record<string, string>,
+): ResolvedConnection {
+  return {
+    organizationId,
+    userId: requestContext.get()?.userId ?? 'manual',
+    returnTo: '',
+    channelType: dto.channelType,
+    externalId: deriveExternalId({ ...dto, credentials }),
+    displayName: dto.name,
+    credentials,
+    metadata: safeManualMetadata(dto.channelType, credentials),
+  };
 }
 
 export type ConnectChannelDto = z.infer<typeof connectChannelSchema>;
@@ -213,8 +241,9 @@ export const channelsService = {
 
   async connect(organizationId: string, dto: ConnectChannelDto) {
     const adapter = getAdapter(dto.channelType);
+    const credentials = normalizedManualCredentials(dto.channelType, dto.credentials);
     const webhookSecret = randomUUID().replace(/-/g, '');
-    const externalId = deriveExternalId(dto);
+    const externalId = deriveExternalId({ ...dto, credentials });
 
     // Include soft-deleted rows. The database unique key still reserves their
     // organization/channel/external-id tuple, so creating a replacement would
@@ -239,15 +268,15 @@ export const channelsService = {
             name: dto.name,
             purpose: dto.purpose,
             autoReply: dto.autoReply,
-            credentialsEnc: encrypt(JSON.stringify(dto.credentials)),
-            metadata: safeManualMetadata(dto.channelType, dto.credentials) as never,
+            credentialsEnc: encrypt(JSON.stringify(credentials)),
+            metadata: safeManualMetadata(dto.channelType, credentials) as never,
             webhookSecret: existing.webhookSecret || webhookSecret,
             isActive: true,
             status: 'CONNECTED',
             lastError: null,
             lastErrorAt: null,
             deletedAt: null,
-            ...metaRoutingFields(dto.channelType, dto.credentials),
+            ...metaRoutingFields(dto.channelType, credentials),
           },
         })
       : await prisma.channelAccount.create({
@@ -258,10 +287,10 @@ export const channelsService = {
             purpose: dto.purpose,
             autoReply: dto.autoReply,
             externalId,
-            credentialsEnc: encrypt(JSON.stringify(dto.credentials)),
-            metadata: safeManualMetadata(dto.channelType, dto.credentials) as never,
+            credentialsEnc: encrypt(JSON.stringify(credentials)),
+            metadata: safeManualMetadata(dto.channelType, credentials) as never,
             webhookSecret,
-            ...metaRoutingFields(dto.channelType, dto.credentials),
+            ...metaRoutingFields(dto.channelType, credentials),
           },
         });
 
@@ -291,16 +320,43 @@ export const channelsService = {
         `<script src="${env.API_BASE_URL}/widget.js" data-account="${account.id}" ` +
         `data-color="#F97316" data-title="Chat with us"></script>`;
     } else if (adapter.onAccountConnected) {
-      setupNote = await adapter.onAccountConnected(
-        {
-          id: account.id,
-          organizationId,
-          externalId,
-          credentials: dto.credentials,
-          webhookSecret: account.webhookSecret,
-        },
-        webhookUrl
-      );
+      try {
+        setupNote = await adapter.onAccountConnected(
+          {
+            id: account.id,
+            organizationId,
+            externalId,
+            credentials,
+            webhookSecret: account.webhookSecret,
+          },
+          webhookUrl
+        );
+      } catch (error) {
+        await markChannelError(account.id, dto.channelType, (error as Error).message);
+        throw error;
+      }
+    }
+
+    // A valid token is not proof that Meta enabled inbound delivery. Manual
+    // connections must perform the same app subscription as OAuth.
+    if (['WHATSAPP', 'FACEBOOK_MESSENGER', 'INSTAGRAM'].includes(dto.channelType)) {
+      try {
+        await subscribeWebhooks(manualConnection(organizationId, dto, credentials));
+        await markWebhookSubscription(account.id, 'READY');
+        await markChannelConnected(account.id);
+      } catch (error) {
+        await markWebhookSubscription(account.id, 'FAILED');
+        await markChannelError(account.id, dto.channelType, `Webhook subscription failed: ${(error as Error).message}`);
+        throw error;
+      }
+    }
+    // These providers require a dashboard callback the API cannot configure.
+    // Keep them in setup state until the first signed webhook proves delivery.
+    if (['SMS', 'TIKTOK'].includes(dto.channelType) && setupNote) {
+      await prisma.channelAccount.update({
+        where: { id: account.id },
+        data: { status: 'CONNECTING', lastError: setupNote, lastErrorAt: new Date() },
+      });
     }
 
     return {
@@ -317,6 +373,46 @@ export const channelsService = {
       webhookUrl,
       setupNote,
     };
+  },
+
+  /** Re-check credentials and repair provider-side webhook registration. */
+  async diagnose(accountId: string) {
+    const account = await prisma.channelAccount.findFirst({ where: { id: accountId, deletedAt: null } });
+    if (!account) throw new NotFoundError('Channel account');
+    const credentials = account.credentialsEnc
+      ? JSON.parse(decrypt(account.credentialsEnc)) as Record<string, string>
+      : {};
+    const adapter = getAdapter(account.channelType);
+    const correlationId = randomUUID();
+    logger.info({ correlationId, accountId, channelType: account.channelType, phase: 'started' }, 'Channel diagnostic');
+    try {
+      if (adapter.onAccountConnected) {
+        await adapter.onAccountConnected(
+          { id: account.id, organizationId: account.organizationId, externalId: account.externalId, credentials, webhookSecret: account.webhookSecret },
+          `${env.API_BASE_URL}/api/webhooks/${account.channelType === 'FACEBOOK_MESSENGER' ? 'messenger' : account.channelType.toLowerCase()}`,
+        );
+      }
+      if (['WHATSAPP', 'FACEBOOK_MESSENGER', 'INSTAGRAM'].includes(account.channelType)) {
+        await subscribeWebhooks({
+          organizationId: account.organizationId,
+          userId: requestContext.get()?.userId ?? 'diagnostic',
+          returnTo: '', channelType: account.channelType, externalId: account.externalId,
+          displayName: account.name, credentials,
+          metadata: (account.metadata as Record<string, unknown> | null) ?? {},
+        });
+        await markWebhookSubscription(account.id, 'READY');
+      }
+      await markChannelConnected(account.id);
+      logger.info({ correlationId, accountId, channelType: account.channelType, phase: 'passed' }, 'Channel diagnostic');
+      return { healthy: true, status: 'CONNECTED', message: 'Credentials and inbound webhook registration are ready.' };
+    } catch (error) {
+      if (['WHATSAPP', 'FACEBOOK_MESSENGER', 'INSTAGRAM'].includes(account.channelType)) {
+        await markWebhookSubscription(account.id, 'FAILED');
+      }
+      const status = await markChannelError(account.id, account.channelType, (error as Error).message);
+      logger.warn({ correlationId, accountId, channelType: account.channelType, phase: 'failed', status, errorCode: error instanceof Error ? error.name : 'UNKNOWN' }, 'Channel diagnostic');
+      return { healthy: false, status, message: friendlyMessage(account.channelType, status) };
+    }
   },
 
   /**

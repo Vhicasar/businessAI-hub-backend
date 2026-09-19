@@ -50,7 +50,7 @@ export function verifyMetaChallenge(query: Record<string, unknown>, expectedToke
 
 type WebhookAccount = Awaited<ReturnType<typeof prismaUnscoped.channelAccount.findFirst>>;
 
-async function processForAccount(account: NonNullable<WebhookAccount>, body: unknown, headers: Record<string, string | string[] | undefined>, query: Record<string, unknown>, rawBody?: Buffer) {
+async function processForAccount(account: NonNullable<WebhookAccount>, body: unknown, headers: Record<string, string | string[] | undefined>, query: Record<string, unknown>, rawBody?: Buffer, correlationId = randomUUID()) {
   const channelType = account.channelType;
   const adapter = getAdapter(channelType);
   const accountRef = {
@@ -63,20 +63,26 @@ async function processForAccount(account: NonNullable<WebhookAccount>, body: unk
     accountRef,
   );
   if (!verified) {
-    logger.warn({ channelType }, 'Webhook signature verification failed');
+    logger.warn({ correlationId, accountId: account.id, channelType, phase: 'signature_rejected' }, 'Webhook signature verification failed');
     return;
   }
+  logger.info({ correlationId, accountId: account.id, channelType, phase: 'signature_verified' }, 'Webhook lifecycle');
   await markWebhookReceived(account.id);
   const parsedMessages = adapter.parseInbound(body);
   const messages = adapter.enrichInbound
     ? await Promise.all(parsedMessages.map((message) => adapter.enrichInbound!(message, accountRef)))
     : parsedMessages;
   const statuses = adapter.parseStatuses?.(body) ?? [];
+  logger.info({ correlationId, accountId: account.id, channelType, phase: 'normalized', messageCount: messages.length, statusCount: statuses.length }, 'Webhook lifecycle');
   await requestContext.run(
     { requestId: randomUUID(), organizationId: account.organizationId },
     async () => {
       for (const inbound of messages) {
         await inboxService.processInbound({ id: account.id, organizationId: account.organizationId, channelType }, inbound);
+        logger.info({ correlationId, accountId: account.id, channelType, phase: 'persisted', providerEventId: inbound.providerMessageId }, 'Webhook lifecycle');
+        // processInbound commits and emits the existing Socket.IO events before
+        // its promise resolves; no second realtime path is introduced here.
+        logger.info({ correlationId, accountId: account.id, channelType, phase: 'realtime_emitted', providerEventId: inbound.providerMessageId }, 'Webhook lifecycle');
       }
       for (const update of statuses) {
         await inboxService.applyStatus({ id: account.id, organizationId: account.organizationId }, update)
@@ -101,11 +107,13 @@ webhookRoutes.post('/:meta(whatsapp|messenger|instagram)', (req, res) => {
   const channelType = META_ROUTES[meta];
   const body = req.body as { entry?: Array<Record<string, unknown>> };
   const rawBody = (req as unknown as { rawBody?: Buffer }).rawBody;
+  const correlationId = randomUUID();
   if (!body || !Array.isArray(body.entry)) {
     res.sendStatus(400);
     return;
   }
   res.status(200).json({ ok: true });
+  logger.info({ correlationId, channelType, phase: 'received', entryCount: body.entry.length }, 'Webhook lifecycle');
 
   void (async () => {
     for (const entry of body.entry ?? []) {
@@ -125,15 +133,17 @@ webhookRoutes.post('/:meta(whatsapp|messenger|instagram)', (req, res) => {
         },
       });
       if (!account) {
-        logger.warn({ channelType, providerIdentifierPresent: Boolean(entryId || phoneNumberId) }, 'Meta webhook for unknown or disconnected account');
+        logger.warn({ correlationId, channelType, phase: 'routing_failed', providerIdentifierPresent: Boolean(entryId || phoneNumberId) }, 'Meta webhook for unknown or disconnected account');
         continue;
       }
+      logger.info({ correlationId, accountId: account.id, channelType, phase: 'routed' }, 'Webhook lifecycle');
+      logger.info({ correlationId, accountId: account.id, organizationId: account.organizationId, channelType, phase: 'business_resolved' }, 'Webhook lifecycle');
       const singleBody = { ...(body as Record<string, unknown>), entry: [entry] };
       // Signature verification occurs inside processForAccount using this
       // connection's encrypted app secret. A platform-wide check here used to
       // reject customer-owned WhatsApp apps before their account could even be
       // identified; Page/Instagram platform apps happened to pass it.
-      await processForAccount(account, singleBody, req.headers, req.query as Record<string, unknown>, rawBody);
+      await processForAccount(account, singleBody, req.headers, req.query as Record<string, unknown>, rawBody, correlationId);
     }
   })().catch((err) => logger.error({ err, channelType }, 'Meta webhook processing failed'));
 });

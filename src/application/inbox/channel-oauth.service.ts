@@ -530,9 +530,18 @@ async function resolvePage(
  */
 export async function subscribeWebhooks(connection: ResolvedConnection): Promise<void> {
   const { channelType, credentials } = connection;
+  const verifySubscription = async (url: string, token: string, errorCode: string) => {
+    const separator = url.includes('?') ? '&' : '?';
+    const response = await fetch(`${url}${separator}access_token=${encodeURIComponent(token)}`);
+    const json = await response.json().catch(() => ({})) as { data?: unknown[] };
+    if (!response.ok || !Array.isArray(json.data) || json.data.length === 0) {
+      throw new AppError(errorCode, 502, 'Meta accepted the connection but the webhook subscription could not be verified.');
+    }
+  };
   if (channelType === 'WHATSAPP') {
+    const subscriptionUrl = `${graph()}/${credentials.wabaId}/subscribed_apps`;
     const res = await fetch(
-      `${graph()}/${credentials.wabaId}/subscribed_apps?access_token=${encodeURIComponent(credentials.accessToken ?? '')}`,
+      `${subscriptionUrl}?access_token=${encodeURIComponent(credentials.accessToken ?? '')}`,
       { method: 'POST' },
     );
     if (!res.ok) {
@@ -542,17 +551,21 @@ export async function subscribeWebhooks(connection: ResolvedConnection): Promise
         'Connected, but Meta would not turn on message delivery. Try reconnecting.',
       );
     }
+    await verifySubscription(subscriptionUrl, credentials.accessToken ?? '', 'CHANNEL_WEBHOOK_SUBSCRIBE_FAILED');
     return;
   }
 
   if (channelType === 'INSTAGRAM') {
-    if (instagramLoginMode() === 'FACEBOOK_PAGE') {
+    // Infer the connection kind from its credentials. A later admin setting
+    // change must not break subscriptions for existing Page-linked accounts.
+    if (credentials.pageId && credentials.pageAccessToken) {
       const fields = ['messages', 'messaging_seen', 'messaging_postbacks'];
       const res = await fetch(
         `${graph()}/${credentials.pageId}/subscribed_apps?access_token=${encodeURIComponent(credentials.pageAccessToken ?? '')}`,
         { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ subscribed_fields: fields.join(',') }) },
       );
       if (!res.ok) throw new AppError('INSTAGRAM_WEBHOOK_SUBSCRIPTION_FAILED', 502, 'Instagram connected through Facebook, but message webhook delivery could not be enabled.');
+      await verifySubscription(`${graph()}/${credentials.pageId}/subscribed_apps`, credentials.pageAccessToken ?? '', 'INSTAGRAM_WEBHOOK_SUBSCRIPTION_FAILED');
       return;
     }
     const params = new URLSearchParams({
@@ -566,6 +579,7 @@ export async function subscribeWebhooks(connection: ResolvedConnection): Promise
     if (!res.ok) {
       throw new AppError('INSTAGRAM_WEBHOOK_SUBSCRIPTION_FAILED', 502, 'Instagram connected, but message webhook delivery could not be enabled. Reconnect and confirm the messaging permission.');
     }
+    await verifySubscription(`${env.instagram.graphUrl}/${credentials.instagramAccountId}/subscribed_apps`, credentials.accessToken ?? '', 'INSTAGRAM_WEBHOOK_SUBSCRIPTION_FAILED');
     return;
   }
 
@@ -585,6 +599,7 @@ export async function subscribeWebhooks(connection: ResolvedConnection): Promise
       'Connected, but Meta would not turn on message delivery. Try reconnecting.',
     );
   }
+  await verifySubscription(`${graph()}/${credentials.pageId}/subscribed_apps`, credentials.pageAccessToken ?? '', 'CHANNEL_WEBHOOK_SUBSCRIBE_FAILED');
 }
 
 /** A per-account webhook secret, used as Meta's verify token. */
