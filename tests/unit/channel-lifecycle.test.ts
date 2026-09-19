@@ -9,7 +9,7 @@ const row = (status: string, isActive = status === 'CONNECTED', deletedAt: Date 
 });
 
 describe('channel lifecycle capacity policy', () => {
-  it.each(['ERROR', 'CONNECTING', 'DISCONNECTED', 'EXPIRED'])(
+  it.each(['ERROR', 'CONNECTING', 'SETUP_REQUIRED', 'DISCONNECTED', 'EXPIRED'])(
     '%s does not consume channel quota',
     (status) => expect(countsTowardChannelLimit(row(status, false))).toBe(false),
   );

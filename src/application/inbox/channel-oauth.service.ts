@@ -334,6 +334,7 @@ async function resolveInstagramViaFacebook(
       pageAccessToken: page.access_token,
       pageId: page.id,
       instagramAccountId: instagram.id,
+      instagramApiModel: 'FACEBOOK_LOGIN',
       appId: instagramApp().appId,
       appSecret: instagramApp().appSecret,
     },
@@ -371,7 +372,7 @@ async function resolveInstagram(
   return {
     externalId: accountId,
     displayName: profile.username ? `@${profile.username}` : 'Instagram',
-    credentials: { accessToken, instagramAccountId: accountId, appId: instagramApp().appId, appSecret: instagramApp().appSecret },
+    credentials: { accessToken, instagramAccountId: accountId, instagramApiModel: 'INSTAGRAM_LOGIN', appId: instagramApp().appId, appSecret: instagramApp().appSecret },
     metadata: {
       instagramAccountId: accountId,
       username: profile.username ?? null,

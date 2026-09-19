@@ -94,12 +94,24 @@ async function processForAccount(account: NonNullable<WebhookAccount>, body: unk
 
 /** Application-level Meta verification: one callback per product, never per tenant. */
 webhookRoutes.get('/:meta(whatsapp|messenger|instagram)', (req, res) => {
-  const challenge = verifyMetaChallenge(req.query as Record<string, unknown>, env.meta.webhookVerifyToken);
-  if (!challenge) {
-    logger.warn({ metaChannel: req.params.meta }, 'Meta webhook verification token mismatch');
-    return void res.sendStatus(403);
-  }
-  res.status(200).send(challenge);
+  void (async () => {
+    const query = req.query as Record<string, unknown>;
+    let challenge = verifyMetaChallenge(query, env.meta.webhookVerifyToken);
+    if (!challenge && typeof query['hub.verify_token'] === 'string') {
+      const channelType = META_ROUTES[req.params.meta as keyof typeof META_ROUTES];
+      const account = await prismaUnscoped.channelAccount.findFirst({
+        where: { channelType, webhookSecret: query['hub.verify_token'], deletedAt: null, status: { in: ['CONNECTING', 'SETUP_REQUIRED', 'CONNECTED'] } },
+        select: { webhookSecret: true },
+      });
+      if (account?.webhookSecret) challenge = verifyMetaChallenge(query, account.webhookSecret);
+    }
+    if (!challenge) {
+      logger.warn({ metaChannel: req.params.meta }, 'Meta webhook verification token mismatch');
+      res.sendStatus(403);
+      return;
+    }
+    res.status(200).send(challenge);
+  })().catch(() => res.sendStatus(500));
 });
 
 webhookRoutes.post('/:meta(whatsapp|messenger|instagram)', (req, res) => {
@@ -124,7 +136,7 @@ webhookRoutes.post('/:meta(whatsapp|messenger|instagram)', (req, res) => {
       }
       const account = await prismaUnscoped.channelAccount.findFirst({
         where: {
-          channelType, isActive: true, status: 'CONNECTED', deletedAt: null,
+          channelType, status: { in: ['CONNECTING', 'SETUP_REQUIRED', 'CONNECTED'] }, deletedAt: null,
           ...(channelType === 'WHATSAPP'
             ? { OR: [{ metaPhoneNumberId: phoneNumberId ?? undefined }, { metaWabaId: entryId ?? undefined }] }
             : channelType === 'FACEBOOK_MESSENGER'

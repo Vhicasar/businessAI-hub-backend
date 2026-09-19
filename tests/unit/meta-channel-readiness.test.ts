@@ -51,7 +51,7 @@ describe('Meta inbound readiness', () => {
     await expect(validateMetaTokenOwnership({
       appId: 'customer-app', appSecret: 'customer-secret', accessToken: 'customer-token',
       label: 'Facebook Page', requiredScopes: ['pages_messaging', 'pages_manage_metadata'],
-    })).resolves.toBeUndefined();
+    })).resolves.toBe('VERIFIED');
   });
 
   it('rejects a token issued by a different app with an actionable message', async () => {
@@ -60,7 +60,25 @@ describe('Meta inbound readiness', () => {
     }));
     await expect(validateMetaTokenOwnership({
       appId: 'customer-app', appSecret: 'customer-secret', accessToken: 'token', label: 'Instagram',
-    })).rejects.toMatchObject({ code: 'META_TOKEN_APP_MISMATCH' });
+    })).rejects.toMatchObject({ code: 'TOKEN_APP_MISMATCH' });
+  });
+
+  it('distinguishes invalid app credentials from a proven token/app mismatch', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false, json: async () => ({ error: { message: 'Invalid appsecret_proof' } }),
+    }));
+    await expect(validateMetaTokenOwnership({
+      appId: 'customer-app', appSecret: 'wrong-secret', accessToken: 'token', label: 'Instagram',
+    })).rejects.toMatchObject({ code: 'APP_CREDENTIALS_INVALID' });
+  });
+
+  it('returns UNKNOWN rather than inventing a mismatch when Meta omits issuing app identity', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true, json: async () => ({ data: { is_valid: true } }),
+    }));
+    await expect(validateMetaTokenOwnership({
+      appId: 'customer-app', appSecret: 'secret', accessToken: 'token', label: 'Instagram',
+    })).resolves.toBe('UNKNOWN');
   });
 
   it('subscribes WhatsApp at the WABA subscribed_apps endpoint', async () => {
@@ -93,26 +111,43 @@ describe('Meta inbound readiness', () => {
   });
 
   it('rejects a manual Instagram account id that does not belong to its token', async () => {
-    vi.stubGlobal('fetch', vi.fn()
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: { is_valid: true, app_id: process.env.INSTAGRAM_APP_ID || process.env.META_APP_ID || '' } }) })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ user_id: 'actual-id', username: 'shop' }) }));
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ user_id: 'actual-id', username: 'shop', account_type: 'BUSINESS' }) });
+    vi.stubGlobal('fetch', fetchMock);
     const adapter = new MetaMessagingAdapter('INSTAGRAM', 'instagram');
     await expect(adapter.onAccountConnected!({
       id: 'account', organizationId: 'org', externalId: 'expected-id', webhookSecret: null,
-      credentials: { accessToken: 'token', appId: process.env.INSTAGRAM_APP_ID || process.env.META_APP_ID || '', appSecret: 'secret', instagramAccountId: 'expected-id' },
-    }, 'https://example.test/api/webhooks/instagram')).rejects.toMatchObject({ code: 'CHANNEL_MISCONFIGURED' });
+      credentials: { instagramApiModel: 'INSTAGRAM_LOGIN', accessToken: 'token', appId: 'customer-app', appSecret: 'secret', instagramAccountId: 'expected-id' },
+    }, 'https://example.test/api/webhooks/instagram')).rejects.toMatchObject({ code: 'INSTAGRAM_ACCOUNT_MISMATCH' });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('graph.instagram.com');
+    expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain('debug_token');
   });
 
   it('does not accept a valid Instagram profile token without messaging permission', async () => {
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: { is_valid: true, app_id: process.env.INSTAGRAM_APP_ID || process.env.META_APP_ID || '' } }) })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ user_id: 'ig-1', username: 'shop' }) })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: [{ permission: 'instagram_business_basic', status: 'granted' }] }) });
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ user_id: 'ig-1', username: 'shop', account_type: 'BUSINESS' }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ data: [{ permission: 'instagram_business_basic', status: 'granted' }] }) });
     vi.stubGlobal('fetch', fetchMock);
     const adapter = new MetaMessagingAdapter('INSTAGRAM', 'instagram');
     await expect(adapter.onAccountConnected!({
       id: 'account', organizationId: 'org', externalId: 'ig-1', webhookSecret: null,
-      credentials: { accessToken: 'token', appId: process.env.INSTAGRAM_APP_ID || process.env.META_APP_ID || '', appSecret: 'secret', instagramAccountId: 'ig-1' },
-    }, 'https://example.test/api/webhooks/instagram')).rejects.toMatchObject({ code: 'INSTAGRAM_MESSAGING_PERMISSION_MISSING' });
+      credentials: { instagramApiModel: 'INSTAGRAM_LOGIN', accessToken: 'token', appId: 'customer-app', appSecret: 'secret', instagramAccountId: 'ig-1' },
+    }, 'https://example.test/api/webhooks/instagram')).rejects.toMatchObject({ code: 'MESSAGING_PERMISSION_MISSING' });
+  });
+
+  it('validates direct Instagram Login without running Facebook debug_token app matching', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ user_id: 'ig-1', username: 'shop', account_type: 'BUSINESS' }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ data: [
+        { permission: 'instagram_business_basic', status: 'granted' },
+        { permission: 'instagram_business_manage_messages', status: 'granted' },
+      ] }) });
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = new MetaMessagingAdapter('INSTAGRAM', 'instagram');
+    await expect(adapter.onAccountConnected!({
+      id: 'account', organizationId: 'org', externalId: 'ig-1', webhookSecret: null,
+      credentials: { instagramApiModel: 'INSTAGRAM_LOGIN', accessToken: 'token', appId: 'any-customer-app', appSecret: 'secret', instagramAccountId: 'ig-1' },
+    }, 'https://example.test/api/webhooks/instagram')).resolves.toContain('Credentials validated');
+    expect(fetchMock.mock.calls.map(([url]) => String(url)).some((url) => url.includes('debug_token'))).toBe(false);
   });
 });

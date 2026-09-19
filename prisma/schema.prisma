@@ -88,6 +88,9 @@ enum ChannelConnectionStatus {
   CONNECTED
   /// The OAuth handshake has begun but no account has been resolved yet.
   CONNECTING
+  /// Provider credentials passed, but an external dashboard callback has not
+  /// yet delivered a correctly signed event.
+  SETUP_REQUIRED
   /// Switched off deliberately, by a person.
   DISCONNECTED
   /// The provider rejected our credentials. Only reconnecting fixes it.

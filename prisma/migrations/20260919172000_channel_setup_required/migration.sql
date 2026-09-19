@@ -1,0 +1,1 @@
+ALTER TYPE "ChannelConnectionStatus" ADD VALUE IF NOT EXISTS 'SETUP_REQUIRED';

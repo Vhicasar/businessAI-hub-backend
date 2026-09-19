@@ -59,6 +59,8 @@ export function friendlyMessage(
       return `${name} connection expired. Reconnect ${name} to continue receiving messages.`;
     case 'ERROR':
       return `${name} is not working right now. Try reconnecting, or contact support if it continues.`;
+    case 'SETUP_REQUIRED':
+      return `${name} credentials are valid, but the provider webhook still needs to be configured and verified.`;
     case 'DISCONNECTED':
       return `${name} is disconnected.`;
     case 'CONNECTING':
@@ -96,6 +98,7 @@ export async function markWebhookReceived(accountId: string): Promise<void> {
       data: {
         lastWebhookAt: new Date(),
         status: 'CONNECTED',
+        isActive: true,
         lastError: null,
         lastErrorAt: null,
       },

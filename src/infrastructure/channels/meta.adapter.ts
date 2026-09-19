@@ -278,16 +278,17 @@ export class MetaMessagingAdapter implements ChannelAdapter {
 
   async onAccountConnected(account: ChannelAccountRef, _webhookUrl: string): Promise<string | null> {
     const instagram = this.channelType === 'INSTAGRAM';
-    const directInstagram = instagram && Boolean(account.credentials.accessToken);
+    const instagramModel = account.credentials.instagramApiModel;
+    const directInstagram = instagram && instagramModel === 'INSTAGRAM_LOGIN';
     const token = directInstagram ? account.credentials.accessToken : account.credentials.pageAccessToken;
     if (directInstagram && !account.credentials.appSecret) {
       throw new AppError('CHANNEL_MISCONFIGURED', 400, 'Instagram App ID and App Secret are required for a manual connection.');
     }
     if (directInstagram) {
-      await validateMetaTokenOwnership({
-        appId: account.credentials.appId, appSecret: account.credentials.appSecret,
-        accessToken: token, label: 'Instagram',
-      });
+      // Instagram Login tokens are validated through graph.instagram.com.
+      // Meta does not reliably expose their issuing app through the Facebook
+      // debug_token contract, so app identity remains UNKNOWN rather than
+      // fabricating a mismatch.
     } else {
       await validateMetaTokenOwnership({
         appId: account.credentials.appId, appSecret: account.credentials.appSecret,
@@ -295,17 +296,25 @@ export class MetaMessagingAdapter implements ChannelAdapter {
         requiredScopes: ['pages_messaging', 'pages_manage_metadata'],
       });
     }
-    const res = await fetch(
-      `${directInstagram ? env.instagram.graphUrl : graph()}/me?fields=id,user_id,name,username&access_token=${encodeURIComponent(token ?? '')}`
-    );
+    const res = await fetch(directInstagram
+      ? `${env.instagram.graphUrl}/me?fields=id,user_id,name,username,account_type&access_token=${encodeURIComponent(token ?? '')}`
+      : `${graph()}/${account.credentials.pageId}?fields=id,name,instagram_business_account{id,username}&access_token=${encodeURIComponent(token ?? '')}`);
     if (!res.ok) {
-      throw new AppError('CHANNEL_MISCONFIGURED', 400, `${instagram ? 'Instagram' : 'Page'} access token invalid`);
+      throw new AppError('TOKEN_INVALID', 400, `${instagram ? 'Instagram' : 'Page'} access token is invalid or cannot access the required account.`);
     }
-    const me = (await res.json()) as { id?: string; user_id?: string; name?: string; username?: string };
-    const returnedId = me.user_id ?? me.id;
-    const expectedId = directInstagram ? account.credentials.instagramAccountId : account.credentials.pageId;
-    if (expectedId && returnedId && expectedId !== returnedId) {
-      throw new AppError('CHANNEL_MISCONFIGURED', 400, `${instagram ? 'Instagram account' : 'Facebook Page'} ID does not belong to this access token.`);
+    const me = (await res.json()) as {
+      id?: string; user_id?: string; name?: string; username?: string; account_type?: string;
+      instagram_business_account?: { id?: string; username?: string };
+    };
+    const returnedInstagramId = directInstagram ? (me.user_id ?? me.id) : me.instagram_business_account?.id;
+    if (directInstagram && me.account_type && !['BUSINESS', 'MEDIA_CREATOR'].includes(me.account_type)) {
+      throw new AppError('INSTAGRAM_ACCOUNT_NOT_ELIGIBLE', 400, 'The supplied account is not an Instagram Business or Creator account.');
+    }
+    if (account.credentials.instagramAccountId && returnedInstagramId !== account.credentials.instagramAccountId) {
+      throw new AppError('INSTAGRAM_ACCOUNT_MISMATCH', 400, 'The Instagram Account ID does not belong to this access token.');
+    }
+    if (!directInstagram && me.id !== account.credentials.pageId) {
+      throw new AppError('INSTAGRAM_ACCOUNT_MISMATCH', 400, 'The Facebook Page ID does not belong to this access token.');
     }
     if (directInstagram) {
       const permissionResponse = await fetch(
@@ -320,13 +329,17 @@ export class MetaMessagingAdapter implements ChannelAdapter {
           .map((item) => item.permission),
       );
       if (!permissionResponse.ok || !granted.has('instagram_business_basic') || !granted.has('instagram_business_manage_messages')) {
+        if (permissionResponse.status === 401 || permissionResponse.status === 403) {
+          throw new AppError('TOKEN_INVALID', 400, 'The Instagram access token is invalid or expired.');
+        }
         throw new AppError(
-          'INSTAGRAM_MESSAGING_PERMISSION_MISSING',
+          'MESSAGING_PERMISSION_MISSING',
           400,
           'The Instagram credentials are valid, but this access token does not grant messaging access.',
         );
       }
     }
-    return `Connected to "${me.username ? `@${me.username}` : me.name ?? (instagram ? 'Instagram account' : 'page')}". Vhicasar uses the platform-level ${this.webhookObject} webhook; no business-specific callback setup is required.`;
+    const username = directInstagram ? me.username : me.instagram_business_account?.username;
+    return `Credentials validated for "${username ? `@${username}` : me.name ?? (instagram ? 'Instagram account' : 'page')}". Configure your Meta app webhook to complete inbound messaging setup.`;
   }
 }

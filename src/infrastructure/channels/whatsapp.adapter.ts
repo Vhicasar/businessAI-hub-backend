@@ -73,7 +73,7 @@ export function verifyMetaSignature(req: WebhookRequestLike, appSecret: string):
 /** Validate that a BYO token belongs to the supplied Meta app, without logging it. */
 export async function validateMetaTokenOwnership(input: {
   appId?: string; appSecret?: string; accessToken?: string; label: string; requiredScopes?: string[];
-}): Promise<void> {
+}): Promise<'VERIFIED' | 'UNKNOWN'> {
   if (!input.appId || !input.appSecret || !input.accessToken) {
     throw new AppError('CHANNEL_MISCONFIGURED', 400, `${input.label} App ID, App Secret and access token are required.`);
   }
@@ -81,14 +81,25 @@ export async function validateMetaTokenOwnership(input: {
   const response = await fetch(`${graph()}/debug_token?${params.toString()}`);
   const json = await response.json().catch(() => ({})) as {
     data?: { is_valid?: boolean; app_id?: string; scopes?: string[]; granular_scopes?: Array<{ scope?: string }> };
+    error?: { message?: string };
   };
-  if (!response.ok || !json.data?.is_valid || json.data.app_id !== input.appId) {
-    throw new AppError('META_TOKEN_APP_MISMATCH', 400, `This ${input.label} access token does not belong to the Meta App ID entered above. Generate the token from that same Meta app.`);
+  if (!response.ok || json.error) {
+    throw new AppError('APP_CREDENTIALS_INVALID', 400, `Meta could not validate the supplied ${input.label} App ID and App Secret.`);
+  }
+  if (!json.data) {
+    return 'UNKNOWN';
+  }
+  if (!json.data.is_valid) {
+    throw new AppError('TOKEN_INVALID', 400, `The supplied ${input.label} access token is invalid or expired.`);
+  }
+  if (json.data.app_id && json.data.app_id !== input.appId) {
+    throw new AppError('TOKEN_APP_MISMATCH', 400, `This ${input.label} access token was issued for a different Meta app than the App ID entered above.`);
   }
   const granted = new Set([...(json.data.scopes ?? []), ...(json.data.granular_scopes ?? []).flatMap((item) => item.scope ? [item.scope] : [])]);
   if ((input.requiredScopes ?? []).some((scope) => !granted.has(scope))) {
-    throw new AppError('META_MESSAGING_PERMISSION_MISSING', 400, `The ${input.label} token belongs to this app but does not grant the required messaging permissions.`);
+    throw new AppError('MESSAGING_PERMISSION_MISSING', 400, `The ${input.label} token belongs to this app but does not grant the required messaging permissions.`);
   }
+  return json.data.app_id ? 'VERIFIED' : 'UNKNOWN';
 }
 
 /**

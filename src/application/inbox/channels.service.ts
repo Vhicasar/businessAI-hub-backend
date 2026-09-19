@@ -44,11 +44,22 @@ export const connectChannelSchema = z.object({
     TIKTOK: ['clientKey', 'clientSecret', 'accessToken', 'openId'],
     WHATSAPP: ['appId', 'appSecret', 'accessToken', 'wabaId', 'phoneNumberId'],
     FACEBOOK_MESSENGER: ['appId', 'appSecret', 'pageAccessToken', 'pageId'],
-    INSTAGRAM: ['appId', 'appSecret', 'accessToken', 'instagramAccountId'],
     EMAIL: ['imapHost', 'imapUser', 'imapPass', 'smtpHost'],
   };
   for (const key of required[dto.channelType] ?? []) {
     if (!dto.credentials[key]?.trim()) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['credentials', key], message: `${key} is required` });
+    }
+  }
+  if (dto.channelType === 'INSTAGRAM') {
+    const model = dto.credentials.instagramApiModel;
+    if (!['INSTAGRAM_LOGIN', 'FACEBOOK_LOGIN'].includes(model ?? '')) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['credentials', 'instagramApiModel'], message: 'Instagram API model is required' });
+    }
+    const keys = model === 'FACEBOOK_LOGIN'
+      ? ['appId', 'appSecret', 'pageAccessToken', 'pageId', 'instagramAccountId']
+      : ['appId', 'appSecret', 'accessToken', 'instagramAccountId'];
+    for (const key of keys) if (!dto.credentials[key]?.trim()) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['credentials', key], message: `${key} is required` });
     }
   }
@@ -99,7 +110,12 @@ function safeManualMetadata(channelType: string, credentials: Record<string, str
   switch (channelType) {
     case 'WHATSAPP': return { ...common, wabaId: credentials.wabaId ?? null, phoneNumberId: credentials.phoneNumberId ?? null };
     case 'FACEBOOK_MESSENGER': return { ...common, facebookPageId: credentials.pageId ?? null };
-    case 'INSTAGRAM': return { ...common, instagramAccountId: credentials.instagramAccountId ?? null };
+    case 'INSTAGRAM': return {
+      ...common,
+      instagramAccountId: credentials.instagramAccountId ?? null,
+      instagramApiModel: credentials.instagramApiModel ?? null,
+      appIdentityValidation: credentials.instagramApiModel === 'INSTAGRAM_LOGIN' ? 'UNKNOWN' : 'VERIFIED',
+    };
     case 'TELEGRAM': return { ...common, botId: credentials.botToken?.split(':')[0] ?? null };
     case 'EMAIL': return { ...common, emailAddress: credentials.imapUser ?? null, imapHost: credentials.imapHost ?? null };
     case 'SMS': return { ...common, fromNumber: credentials.fromNumber ?? null, messagingServiceSid: credentials.messagingServiceSid ?? null };
@@ -343,11 +359,11 @@ export const channelsService = {
 
     // A valid token is not proof that Meta enabled inbound delivery. Manual
     // connections must perform the same app subscription as OAuth.
-    if (['WHATSAPP', 'FACEBOOK_MESSENGER', 'INSTAGRAM'].includes(dto.channelType)) {
+    const customerManagedMeta = ['WHATSAPP', 'FACEBOOK_MESSENGER', 'INSTAGRAM'].includes(dto.channelType);
+    if (customerManagedMeta) {
       try {
         await subscribeWebhooks(manualConnection(organizationId, dto, credentials));
         await markWebhookSubscription(account.id, 'READY');
-        await markChannelConnected(account.id);
       } catch (error) {
         await markWebhookSubscription(account.id, 'FAILED');
         await markChannelSetupFailed(account.id, dto.channelType, `Webhook subscription failed: ${(error as Error).message}`);
@@ -356,7 +372,19 @@ export const channelsService = {
     }
     // These providers require a dashboard callback the API cannot configure.
     // Keep them in setup state until the first signed webhook proves delivery.
-    if (['SMS', 'TIKTOK'].includes(dto.channelType) && setupNote) {
+    if (customerManagedMeta) {
+      setupNote = [
+        setupNote,
+        `Callback URL: ${webhookUrl}`,
+        `Verify token: ${account.webhookSecret}`,
+        `Required fields: ${dto.channelType === 'WHATSAPP' ? 'messages' : dto.channelType === 'FACEBOOK_MESSENGER' ? 'messages, message_deliveries, message_reads, messaging_postbacks' : 'messages, messaging_seen, messaging_postbacks'}`,
+        'Status remains Setup required until Vhicasar receives a correctly signed webhook from your Meta app.',
+      ].filter(Boolean).join('\n');
+      await prisma.channelAccount.update({
+        where: { id: account.id },
+        data: { status: 'SETUP_REQUIRED', isActive: false, lastError: setupNote, lastErrorAt: new Date() },
+      });
+    } else if (['SMS', 'TIKTOK'].includes(dto.channelType) && setupNote) {
       await prisma.channelAccount.update({
         where: { id: account.id },
         data: { status: 'CONNECTING', lastError: setupNote, lastErrorAt: new Date() },
@@ -365,7 +393,7 @@ export const channelsService = {
       await markChannelConnected(account.id);
     }
 
-    if (!['SMS', 'TIKTOK'].includes(dto.channelType)) {
+    if (!customerManagedMeta && !['SMS', 'TIKTOK'].includes(dto.channelType)) {
       await recordChannelEvent(account.id, existing ? 'Channel reconnected' : 'Channel connected', {
         metadata: { channelType: dto.channelType, next: { isActive: true, status: 'CONNECTED' } },
       });
@@ -413,6 +441,21 @@ export const channelsService = {
           metadata: (account.metadata as Record<string, unknown> | null) ?? {},
         });
         await markWebhookSubscription(account.id, 'READY');
+      }
+      const metadata = (account.metadata as Record<string, unknown> | null) ?? {};
+      const customerManagedMeta = metadata.connectedVia === 'manual_credentials'
+        && ['WHATSAPP', 'FACEBOOK_MESSENGER', 'INSTAGRAM'].includes(account.channelType);
+      if (customerManagedMeta && !account.lastWebhookAt) {
+        await prisma.channelAccount.update({
+          where: { id: account.id },
+          data: {
+            status: 'SETUP_REQUIRED', isActive: false,
+            lastError: 'Credentials and provider subscription are valid. Configure the webhook in your Meta app and send a test event.',
+            lastErrorAt: new Date(),
+          },
+        });
+        logger.info({ correlationId, accountId, channelType: account.channelType, phase: 'setup_required' }, 'Channel diagnostic');
+        return { healthy: false, status: 'SETUP_REQUIRED', message: 'Credentials are valid, but no correctly signed webhook has been received from your Meta app yet.' };
       }
       await markChannelConnected(account.id);
       logger.info({ correlationId, accountId, channelType: account.channelType, phase: 'passed' }, 'Channel diagnostic');
