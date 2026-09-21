@@ -15,6 +15,8 @@ export interface NormalizedInbound {
     phone?: string;
     profileUrl?: string;
   };
+  /** Privacy-safe outcome of an optional provider profile lookup. */
+  profileEnrichment?: ProviderProfileEnrichment;
   contentType: MessageContentType;
   text?: string;
   /** Original thread subject for subject-based channels such as email. */
@@ -33,6 +35,23 @@ export interface NormalizedInbound {
   media?: InboundMedia;
   sentAt?: Date;
   raw?: unknown;
+}
+
+export type ProfileEnrichmentReason =
+  | 'PROFILE_NOT_REQUESTED'
+  | 'PROFILE_PERMISSION_MISSING'
+  | 'ADVANCED_ACCESS_REQUIRED'
+  | 'PROFILE_FIELD_NOT_AVAILABLE'
+  | 'PROFILE_LOOKUP_FAILED'
+  | 'TOKEN_SCOPE_INSUFFICIENT'
+  | 'PROFILE_CACHED';
+
+export interface ProviderProfileEnrichment {
+  status: 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'SKIPPED';
+  reason?: ProfileEnrichmentReason;
+  permissionSufficient: 'YES' | 'NO' | 'UNKNOWN';
+  advancedAccessRequired: 'YES' | 'NO' | 'UNKNOWN';
+  attemptedAt: string;
 }
 
 /** A provider's reference to a file attached to an inbound message. */

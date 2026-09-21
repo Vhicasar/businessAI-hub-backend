@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { ConflictError, NotFoundError } from '../../shared/errors';
-import { prisma } from '../../infrastructure/database/prisma';
+import { prisma, prismaUnscoped } from '../../infrastructure/database/prisma';
 import { decrypt, encrypt } from '../../shared/crypto';
 import { env } from '../../shared/config/env';
 import {
@@ -102,6 +102,49 @@ function metaRoutingFields(channelType: string, credentials: Record<string, stri
     metaFacebookPageId: channelType === 'FACEBOOK_MESSENGER' ? credentials.pageId || null : null,
     metaInstagramAccountId: channelType === 'INSTAGRAM' ? credentials.instagramAccountId || null : null,
   };
+}
+
+type ExistingChannel = {
+  id: string; organizationId: string; name: string; status: string;
+  isActive: boolean; deletedAt: Date | null; webhookSecret: string | null;
+};
+
+export function canReleaseMetaRoutingOwner(owner: Pick<ExistingChannel, 'isActive' | 'status' | 'deletedAt'>): boolean {
+  return !owner.isActive && owner.status === 'DISCONNECTED' && Boolean(owner.deletedAt);
+}
+
+/** Resolve globally unique Meta webhook routing ids outside tenant scoping. */
+async function resolveMetaRoutingOwner(
+  organizationId: string,
+  channelType: string,
+  credentials: Record<string, string>,
+): Promise<ExistingChannel | null> {
+  const candidates = Object.entries(metaRoutingFields(channelType, credentials))
+    .filter(([, value]) => Boolean(value))
+    .map(([field, value]) => ({ [field]: value }));
+  if (candidates.length === 0) return null;
+
+  const owners = await prismaUnscoped.channelAccount.findMany({
+    where: { channelType: channelType as never, OR: candidates },
+    select: { id: true, organizationId: true, name: true, status: true, isActive: true, deletedAt: true, webhookSecret: true },
+  });
+  if (owners.length > 1) {
+    throw new ConflictError('This Meta asset is attached to conflicting channel records. Contact Vhicasar support to reconcile the connection safely.');
+  }
+  const owner = owners[0] ?? null;
+  if (!owner || owner.organizationId === organizationId) return owner;
+  if (!canReleaseMetaRoutingOwner(owner)) {
+    throw new ConflictError('That Meta account or phone number is already connected to another business on Vhicasar. Disconnect it there before connecting it here.');
+  }
+
+  const released = await prismaUnscoped.channelAccount.updateMany({
+    where: { id: owner.id, isActive: false, status: 'DISCONNECTED', deletedAt: { not: null } },
+    data: { metaWabaId: null, metaPhoneNumberId: null, metaFacebookPageId: null, metaInstagramAccountId: null },
+  });
+  if (released.count !== 1) {
+    throw new ConflictError('That Meta account changed while it was being connected. Please retry the connection.');
+  }
+  return null;
 }
 
 /** Provider details safe to return to the settings UI. Never copy secrets. */
@@ -268,9 +311,15 @@ export const channelsService = {
     // organization/channel/external-id tuple, so creating a replacement would
     // fail with P2002. A disconnected channel is restored in place instead,
     // preserving its inbox history and webhook identity.
-    const existing = await prisma.channelAccount.findFirst({
+    const tupleExisting = await prisma.channelAccount.findFirst({
       where: { channelType: dto.channelType, externalId },
+      select: { id: true, organizationId: true, name: true, status: true, isActive: true, deletedAt: true, webhookSecret: true },
     });
+    const routingExisting = await resolveMetaRoutingOwner(organizationId, dto.channelType, credentials);
+    if (tupleExisting && routingExisting && tupleExisting.id !== routingExisting.id) {
+      throw new ConflictError('This Meta asset is already attached to another channel record in this business. Disconnect the old channel before reconnecting.');
+    }
+    const existing = routingExisting ?? tupleExisting;
     if (existing && !existing.deletedAt && existing.isActive && existing.status === 'CONNECTED') {
       throw new ConflictError('This account is already connected');
     }
@@ -282,15 +331,17 @@ export const channelsService = {
       if (!allowance.canAddMore) throw new ConflictError(allowance.blockedReason ?? 'Channel limit reached');
     }
 
-    const account = await prisma.channelAccount.upsert({
-          where: { organizationId_channelType_externalId: { organizationId, channelType: dto.channelType, externalId } },
-          update: {
+    const account = existing
+      ? await prisma.channelAccount.update({
+          where: { id: existing.id },
+          data: {
             name: dto.name,
+            externalId,
             purpose: dto.purpose,
             autoReply: dto.autoReply,
             credentialsEnc: encrypt(JSON.stringify(credentials)),
             metadata: safeManualMetadata(dto.channelType, credentials) as never,
-            webhookSecret: existing?.webhookSecret || webhookSecret,
+            webhookSecret: existing.webhookSecret || webhookSecret,
             isActive: false,
             status: 'CONNECTING',
             lastError: null,
@@ -298,7 +349,9 @@ export const channelsService = {
             deletedAt: null,
             ...metaRoutingFields(dto.channelType, credentials),
           },
-          create: {
+        })
+      : await prisma.channelAccount.create({
+          data: {
             organizationId,
             channelType: dto.channelType,
             name: dto.name,
@@ -486,19 +539,19 @@ export const channelsService = {
   async connectFromOAuth(connection: ResolvedConnection) {
     const { organizationId, channelType, externalId } = connection;
 
-    const existing = await prisma.channelAccount.findFirst({
+    const tupleExisting = await prisma.channelAccount.findFirst({
       // Disconnection is a soft delete. Include that row here: the database
       // unique key still reserves (organization, channel, externalId), so
       // attempting to create a new row would fail with P2002. Reconnecting
       // restores the original row and keeps its conversation history.
       where: { channelType, externalId },
-      select: { id: true, organizationId: true, name: true, status: true, isActive: true, deletedAt: true },
+      select: { id: true, organizationId: true, name: true, status: true, isActive: true, deletedAt: true, webhookSecret: true },
     });
-    if (existing && existing.organizationId !== organizationId) {
-      throw new ConflictError(
-        'That account is already connected to another business on Vhicasar.',
-      );
+    const routingExisting = await resolveMetaRoutingOwner(organizationId, channelType, connection.credentials);
+    if (tupleExisting && routingExisting && tupleExisting.id !== routingExisting.id) {
+      throw new ConflictError('This Meta asset is already attached to another channel record in this business. Disconnect the old channel before reconnecting.');
     }
+    const existing = routingExisting ?? tupleExisting;
 
     if (connectionWouldAddActiveCapacity(existing)) {
       const allowance = await allowanceFor(organizationId, channelType);
@@ -508,11 +561,15 @@ export const channelsService = {
     }
 
     const webhookSecret = existing ? undefined : newWebhookSecret();
-    const account = await prisma.channelAccount.upsert({
-          where: { organizationId_channelType_externalId: { organizationId, channelType, externalId } },
-          update: {
+    const account = existing
+      ? await prisma.channelAccount.update({
+          where: { id: existing.id },
+          data: {
+            name: connection.displayName,
+            externalId,
             credentialsEnc: encrypt(JSON.stringify(connection.credentials)),
             metadata: connection.metadata as never,
+            webhookSecret: existing.webhookSecret || newWebhookSecret(),
             // A reconnect is also how a disabled account comes back — and how
             // an expired one is repaired, which is the whole point of showing
             // EXPIRED in the first place.
@@ -523,7 +580,9 @@ export const channelsService = {
             lastErrorAt: null,
             ...metaRoutingFields(channelType, connection.credentials),
           },
-          create: {
+        })
+      : await prisma.channelAccount.create({
+          data: {
             organizationId,
             channelType,
             name: connection.displayName,
@@ -627,6 +686,12 @@ export const channelsService = {
         lastError: null,
         lastErrorAt: null,
         deletedAt: new Date(),
+        // The historical row remains for conversations, but provider routing
+        // ids must be available for a later connection in another business.
+        metaWabaId: null,
+        metaPhoneNumberId: null,
+        metaFacebookPageId: null,
+        metaInstagramAccountId: null,
       },
     });
     await recordChannelEvent(accountId, `Channel disconnected — ${account.name}`, {

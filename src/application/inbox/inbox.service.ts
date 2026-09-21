@@ -46,7 +46,12 @@ const conversationListSelect = {
   unreadCount: true,
   assignedToId: true,
   aiSentiment: true,
-  customer: { select: { id: true, firstName: true, lastName: true } },
+  customer: {
+    select: {
+      id: true, firstName: true, lastName: true, displayName: true,
+      identities: { select: { channelType: true, displayName: true, profileUrl: true } },
+    },
+  },
   channelAccount: { select: { id: true, name: true, channelType: true } },
 } as const;
 
@@ -91,7 +96,10 @@ function usefulName(value: string | null | undefined): string | null {
 
 function placeholderCustomer(customer: Pick<Customer, 'firstName' | 'displayName' | 'isProvisional'>): boolean {
   const name = customer.displayName || customer.firstName;
-  return customer.isProvisional || !usefulName(name) || /^(unknown|website visitor|visitor|guest|anonymous)$/i.test(name.trim());
+  return customer.isProvisional
+    || !usefulName(name)
+    || /^(unknown|website visitor|visitor|guest|anonymous)$/i.test(name.trim())
+    || /^(?:[a-z_ ]+\s+)?(?:contact|customer|user)(?:\s*\([^)]*\))?$/i.test(name.trim());
 }
 
 function contactPhone(value: string | undefined): string | null {
@@ -107,6 +115,7 @@ async function syncInboundCustomerProfile(
   inbound: NormalizedInbound,
 ): Promise<void> {
   const profile = inbound.senderProfile;
+  const enrichment = inbound.profileEnrichment;
   const structured = usefulName([profile?.firstName, profile?.lastName].filter(Boolean).join(' '));
   const displayName = structured || usefulName(inbound.senderDisplayName) || usefulName(profile?.username ? `@${profile.username}` : null);
   const split = displayName?.replace(/^@/, '').split(/\s+/) ?? [];
@@ -119,19 +128,44 @@ async function syncInboundCustomerProfile(
   const oldProfiles = oldCustom.channelProfiles && typeof oldCustom.channelProfiles === 'object' && !Array.isArray(oldCustom.channelProfiles)
     ? oldCustom.channelProfiles as Record<string, unknown> : {};
   const channelProfile = Object.fromEntries(Object.entries({
+    firstName: profile?.firstName?.trim() || undefined,
+    lastName: profile?.lastName?.trim() || undefined,
     username: profile?.username || undefined,
     displayName: displayName || undefined,
     profileUrl: profile?.profileUrl || undefined,
-    updatedAt: new Date().toISOString(),
+    sources: Object.fromEntries(Object.entries({
+      name: displayName ? channelType : undefined,
+      username: profile?.username ? channelType : undefined,
+      profileUrl: profile?.profileUrl ? channelType : undefined,
+      email: validEmail ? channelType : undefined,
+      phone: phone ? channelType : undefined,
+    }).filter(([, value]) => value !== undefined)),
+    ...(enrichment?.status === 'SKIPPED' ? {} : { updatedAt: new Date().toISOString() }),
+    enrichment: enrichment && enrichment.status !== 'SKIPPED' ? {
+      status: enrichment.status,
+      reason: enrichment.reason,
+      permissionSufficient: enrichment.permissionSufficient,
+      advancedAccessRequired: enrichment.advancedAccessRequired,
+      attemptedAt: enrichment.attemptedAt,
+      fields: {
+        name: Boolean(structured || usefulName(inbound.senderDisplayName)),
+        username: Boolean(profile?.username),
+        profilePicture: Boolean(profile?.profileUrl),
+        email: Boolean(validEmail),
+        phone: Boolean(phone),
+      },
+    } : undefined,
   }).filter(([, value]) => value !== undefined));
 
-  await prisma.customerIdentity.update({
-    where: { id: identity.id },
-    data: {
-      ...(displayName ? { displayName } : {}),
-      ...(profile?.profileUrl ? { profileUrl: profile.profileUrl } : {}),
-    },
-  });
+  if (displayName || profile?.profileUrl) {
+    await prisma.customerIdentity.update({
+      where: { id: identity.id },
+      data: {
+        ...(displayName ? { displayName } : {}),
+        ...(profile?.profileUrl ? { profileUrl: profile.profileUrl } : {}),
+      },
+    });
+  }
   const updated = await prisma.customer.update({
       where: { id: identity.customerId },
       data: {
@@ -141,13 +175,36 @@ async function syncInboundCustomerProfile(
           displayName,
           isProvisional: false,
         } : {}),
-        customFields: { ...oldCustom, channelProfiles: { ...oldProfiles, [channelType]: channelProfile } } as Prisma.InputJsonValue,
+        ...((Object.keys(channelProfile).length > 0) ? {
+          customFields: {
+            ...oldCustom,
+            channelProfiles: {
+              ...oldProfiles,
+              [channelType]: { ...((oldProfiles[channelType] as object | undefined) ?? {}), ...channelProfile },
+            },
+          } as Prisma.InputJsonValue,
+        } : {}),
         lastContactAt: new Date(),
       },
     });
   identity.customer = updated;
   identity.displayName = displayName || identity.displayName;
   identity.profileUrl = profile?.profileUrl || identity.profileUrl;
+  if (enrichment) {
+    logger.info({
+      customerId: identity.customerId,
+      channelType,
+      profileEnrichment: enrichment.status,
+      reason: enrichment.reason,
+      nameAvailable: Boolean(structured || usefulName(inbound.senderDisplayName)),
+      usernameAvailable: Boolean(profile?.username),
+      profilePictureAvailable: Boolean(profile?.profileUrl),
+      emailAvailable: Boolean(validEmail),
+      phoneAvailable: Boolean(phone),
+      permissionSufficient: enrichment.permissionSufficient,
+      advancedAccessRequired: enrichment.advancedAccessRequired,
+    }, 'Inbound customer profile enrichment');
+  }
   for (const data of [
     !updated.email && validEmail ? { email: validEmail } : null,
     !updated.phone && phone ? { phone } : null,
@@ -245,7 +302,8 @@ export const inboxService = {
 
     if (!identity) {
       const profileName = [inbound.senderProfile?.firstName, inbound.senderProfile?.lastName].filter(Boolean).join(' ');
-      const displayName = usefulName(profileName) || usefulName(inbound.senderDisplayName) || usefulName(inbound.senderProfile?.username ? `@${inbound.senderProfile.username}` : null) || `${account.channelType.replace(/_/g, ' ')} contact`;
+      const resolvedName = usefulName(profileName) || usefulName(inbound.senderDisplayName) || usefulName(inbound.senderProfile?.username ? `@${inbound.senderProfile.username}` : null);
+      const displayName = resolvedName || `${account.channelType.replace(/_/g, ' ')} contact`;
       const [firstName, ...rest] = displayName.split(' ');
       const senderEmail = account.channelType === 'EMAIL' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(inbound.senderExternalId)
         ? inbound.senderExternalId.trim().toLowerCase()
@@ -266,7 +324,7 @@ export const inboxService = {
             displayName,
             email: senderEmail,
             phone: senderPhone,
-            isProvisional: account.channelType === 'WEB_CHAT' && /^(website visitor|visitor|guest|anonymous)$/i.test(displayName.trim()),
+            isProvisional: !resolvedName,
             lastContactAt: new Date(),
           },
         });
@@ -685,12 +743,13 @@ export const inboxService = {
             id: true,
             firstName: true,
             lastName: true,
+            displayName: true,
             email: true,
             phone: true,
             lifetimeValue: true,
             totalOrders: true,
             aiSummary: true,
-            identities: { select: { channelType: true, externalId: true, displayName: true } },
+            identities: { select: { channelType: true, externalId: true, displayName: true, profileUrl: true } },
           },
         },
         messages: {

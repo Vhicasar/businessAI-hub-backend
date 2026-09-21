@@ -166,4 +166,35 @@ describe('MetaMessagingAdapter', () => {
       senderProfile: { firstName: 'Ada', lastName: 'Okafor', profileUrl: 'https://example.test/ada.jpg' },
     });
   });
+
+  it('uses the messaging-scoped Instagram profile fields and keeps email/phone absent', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ name: 'Ngozi A', username: 'ngozi', profile_pic: 'https://example.test/ngozi.jpg' }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const instagram = new MetaMessagingAdapter('INSTAGRAM', 'instagram');
+    const inbound = instagram.parseInbound({ object: 'instagram', entry: [{ messaging: [{ sender: { id: 'igsid-1' }, message: { mid: 'm2', text: 'Hello' } }] }] })[0]!;
+    const enriched = await instagram.enrichInbound(inbound, account({ credentials: { accessToken: 'ig-token' } }));
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('fields=name%2Cusername%2Cprofile_pic');
+    expect(enriched.senderProfile).toMatchObject({ firstName: 'Ngozi', lastName: 'A', username: 'ngozi', profileUrl: 'https://example.test/ngozi.jpg' });
+    expect(enriched.senderProfile).not.toHaveProperty('email');
+    expect(enriched.senderProfile).not.toHaveProperty('phone');
+    expect(enriched.profileEnrichment?.status).toBe('SUCCESS');
+  });
+
+  it('classifies unavailable Instagram fields without discarding the message', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: async () => ({ error: { code: 100, message: 'Tried accessing nonexisting field' } }),
+    }));
+    const instagram = new MetaMessagingAdapter('INSTAGRAM', 'instagram');
+    const inbound = instagram.parseInbound({ object: 'instagram', entry: [{ messaging: [{ sender: { id: 'igsid-1' }, message: { mid: 'm3', text: 'Still save me' } }] }] })[0]!;
+    const enriched = await instagram.enrichInbound(inbound, account({ credentials: { accessToken: 'ig-token' } }));
+
+    expect(enriched.text).toBe('Still save me');
+    expect(enriched.profileEnrichment).toMatchObject({ status: 'FAILED', reason: 'PROFILE_FIELD_NOT_AVAILABLE' });
+  });
 });

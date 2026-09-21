@@ -3,9 +3,19 @@ import {
   countsTowardChannelLimit,
   connectionWouldAddActiveCapacity,
 } from '../../src/application/inbox/channel-allowance.service';
+import { canReleaseMetaRoutingOwner } from '../../src/application/inbox/channels.service';
 
 const row = (status: string, isActive = status === 'CONNECTED', deletedAt: Date | null = null) => ({
   status, isActive, deletedAt,
+});
+
+describe('Meta routing ownership lifecycle', () => {
+  it('releases provider routing ids only after an explicit completed disconnect', () => {
+    expect(canReleaseMetaRoutingOwner(row('DISCONNECTED', false, new Date()))).toBe(true);
+    expect(canReleaseMetaRoutingOwner(row('CONNECTED', true))).toBe(false);
+    expect(canReleaseMetaRoutingOwner(row('ERROR', false))).toBe(false);
+    expect(canReleaseMetaRoutingOwner(row('DISCONNECTED', false))).toBe(false);
+  });
 });
 
 describe('channel lifecycle capacity policy', () => {

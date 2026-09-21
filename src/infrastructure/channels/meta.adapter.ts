@@ -113,9 +113,16 @@ export class MetaMessagingAdapter implements ChannelAdapter {
     const instagram = this.channelType === 'INSTAGRAM';
     const directInstagram = instagram && Boolean(account.credentials.accessToken);
     const token = directInstagram ? account.credentials.accessToken : account.credentials.pageAccessToken;
-    if (!token) return inbound;
+    const attemptedAt = new Date().toISOString();
+    if (!token) return {
+      ...inbound,
+      profileEnrichment: {
+        status: 'FAILED', reason: 'TOKEN_SCOPE_INSUFFICIENT', permissionSufficient: 'NO',
+        advancedAccessRequired: 'UNKNOWN', attemptedAt,
+      },
+    };
     const fields = instagram
-      ? (directInstagram ? 'name,username,profile_picture_url' : 'name,username,profile_pic')
+      ? 'name,username,profile_pic'
       : 'first_name,last_name,name,profile_pic';
     const base = directInstagram ? env.instagram.graphUrl : graph();
     const query = new URLSearchParams({ fields, access_token: token });
@@ -125,22 +132,53 @@ export class MetaMessagingAdapter implements ChannelAdapter {
         first_name?: string; last_name?: string; name?: string; username?: string;
         profile_pic?: string; profile_picture_url?: string;
       };
-      if (!response.ok) return inbound;
+      if (!response.ok) {
+        const providerError = profile as { error?: { code?: number; error_subcode?: number; message?: string; type?: string } };
+        const message = providerError.error?.message?.toLowerCase() ?? '';
+        const reason = message.includes('advanced access') || message.includes('app role') || message.includes('tester')
+          ? 'ADVANCED_ACCESS_REQUIRED'
+          : message.includes('permission') || message.includes('scope') || response.status === 403
+            ? 'PROFILE_PERMISSION_MISSING'
+            : providerError.error?.code === 100 && message.includes('field')
+              ? 'PROFILE_FIELD_NOT_AVAILABLE'
+              : 'PROFILE_LOOKUP_FAILED';
+        return {
+          ...inbound,
+          profileEnrichment: {
+            status: 'FAILED', reason,
+            permissionSufficient: reason === 'PROFILE_PERMISSION_MISSING' ? 'NO' : 'UNKNOWN',
+            advancedAccessRequired: reason === 'ADVANCED_ACCESS_REQUIRED' ? 'YES' : 'UNKNOWN',
+            attemptedAt,
+          },
+        };
+      }
       const structuredName = [profile.first_name, profile.last_name].filter(Boolean).join(' ');
       const displayName = profile.name || structuredName || profile.username;
+      const senderProfile = {
+        firstName: profile.first_name ?? profile.name?.split(/\s+/)[0],
+        lastName: profile.last_name ?? (profile.name?.split(/\s+/).slice(1).join(' ') || undefined),
+        username: profile.username,
+        profileUrl: profile.profile_pic ?? profile.profile_picture_url,
+      };
+      const populated = Object.values(senderProfile).filter(Boolean).length;
       return {
         ...inbound,
         senderDisplayName: displayName || inbound.senderDisplayName,
-        senderProfile: {
-          firstName: profile.first_name ?? profile.name?.split(/\s+/)[0],
-          lastName: profile.last_name ?? (profile.name?.split(/\s+/).slice(1).join(' ') || undefined),
-          username: profile.username,
-          profileUrl: profile.profile_pic ?? profile.profile_picture_url,
+        senderProfile,
+        profileEnrichment: {
+          status: populated >= (instagram ? 2 : 3) ? 'SUCCESS' : 'PARTIAL',
+          permissionSufficient: 'YES', advancedAccessRequired: 'NO', attemptedAt,
         },
       };
     } catch {
       // Profile enrichment is best-effort: never discard the actual message.
-      return inbound;
+      return {
+        ...inbound,
+        profileEnrichment: {
+          status: 'FAILED', reason: 'PROFILE_LOOKUP_FAILED', permissionSufficient: 'UNKNOWN',
+          advancedAccessRequired: 'UNKNOWN', attemptedAt,
+        },
+      };
     }
   }
 

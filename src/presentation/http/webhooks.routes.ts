@@ -9,6 +9,7 @@ import { inboxService } from '../../application/inbox/inbox.service';
 import { decrypt } from '../../shared/crypto';
 import { markWebhookReceived } from '../../application/inbox/channel-health.service';
 import { env } from '../../shared/config/env';
+import { enrichInboundProfiles } from '../../application/inbox/profile-enrichment.service';
 
 /**
  * Stable Meta receivers live at /whatsapp, /messenger and /instagram.
@@ -69,9 +70,7 @@ async function processForAccount(account: NonNullable<WebhookAccount>, body: unk
   logger.info({ correlationId, accountId: account.id, channelType, phase: 'signature_verified' }, 'Webhook lifecycle');
   await markWebhookReceived(account.id);
   const parsedMessages = adapter.parseInbound(body);
-  const messages = adapter.enrichInbound
-    ? await Promise.all(parsedMessages.map((message) => adapter.enrichInbound!(message, accountRef)))
-    : parsedMessages;
+  const messages = await enrichInboundProfiles(adapter, accountRef, parsedMessages);
   const statuses = adapter.parseStatuses?.(body) ?? [];
   logger.info({ correlationId, accountId: account.id, channelType, phase: 'normalized', messageCount: messages.length, statusCount: statuses.length }, 'Webhook lifecycle');
   await requestContext.run(
@@ -235,9 +234,7 @@ webhookRoutes.post('/:channel/:accountId', (req, res) => {
       await markWebhookReceived(account.id);
 
       const parsedMessages = adapter.parseInbound(req.body);
-      const messages = adapter.enrichInbound
-        ? await Promise.all(parsedMessages.map((message) => adapter.enrichInbound!(message, accountRef)))
-        : parsedMessages;
+      const messages = await enrichInboundProfiles(adapter, accountRef, parsedMessages);
       // One delivery can carry both new messages and receipts for old ones.
       const statuses = adapter.parseStatuses?.(req.body) ?? [];
       if (messages.length === 0 && statuses.length === 0) return;
