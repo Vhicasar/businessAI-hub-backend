@@ -6,6 +6,7 @@ import { decrypt, encrypt } from '../../shared/crypto';
 import { env } from '../../shared/config/env';
 import {
   newWebhookSecret,
+  inspectWhatsAppReadiness,
   oauthUnavailableReason,
   subscribeWebhooks,
   supportsOAuth,
@@ -17,7 +18,7 @@ import { getAdapter, supportedChannels } from '../../infrastructure/channels/reg
 import { activityService } from '../crm/activity.service';
 import { requestContext } from '../../shared/context';
 import { logger } from '../../shared/logger';
-import { friendlyMessage, markChannelConnected, markChannelError, markChannelSetupFailed, markWebhookSubscription } from './channel-health.service';
+import { friendlyMessage, markChannelAwaitingWebhook, markChannelConnected, markChannelError, markChannelSetupFailed, markWebhookSubscription } from './channel-health.service';
 import {
   allowanceFor,
   allowanceSummary,
@@ -479,6 +480,24 @@ export const channelsService = {
     const correlationId = randomUUID();
     logger.info({ correlationId, accountId, channelType: account.channelType, phase: 'started' }, 'Channel diagnostic');
     try {
+      let whatsappReadiness = account.channelType === 'WHATSAPP'
+        ? await inspectWhatsAppReadiness(credentials)
+        : null;
+      const whatsappOperationalChecks = () => {
+        const metadata = account.metadata && typeof account.metadata === 'object' && !Array.isArray(account.metadata)
+          ? account.metadata as Record<string, unknown> : {};
+        return whatsappReadiness ? {
+          ...whatsappReadiness,
+          callbackUrlExpected: `${env.API_BASE_URL}/api/webhooks/whatsapp`,
+          webhookVerifyTokenConfigured: Boolean(env.meta.webhookVerifyToken),
+          metaDashboardCallback: 'UNKNOWN',
+          messagesWebhookField: 'UNKNOWN',
+          actualInboundPostObserved: Boolean(account.lastWebhookAt),
+          actualInboundMessageObserved: Boolean(metadata.lastInboundMessageAt),
+          lastInboundMessageAt: metadata.lastInboundMessageAt ?? null,
+          lastOutboundMessageAt: metadata.lastOutboundMessageAt ?? null,
+        } : null;
+      };
       if (adapter.onAccountConnected) {
         await adapter.onAccountConnected(
           { id: account.id, organizationId: account.organizationId, externalId: account.externalId, credentials, webhookSecret: account.webhookSecret },
@@ -494,25 +513,40 @@ export const channelsService = {
           metadata: (account.metadata as Record<string, unknown> | null) ?? {},
         });
         await markWebhookSubscription(account.id, 'READY');
+        if (account.channelType === 'WHATSAPP') {
+          whatsappReadiness = await inspectWhatsAppReadiness(credentials);
+          const oldMetadata = account.metadata && typeof account.metadata === 'object' && !Array.isArray(account.metadata)
+            ? account.metadata as Record<string, unknown> : {};
+          await prisma.channelAccount.update({
+            where: { id: account.id },
+            data: { metadata: { ...oldMetadata, whatsappReadiness, whatsappReadinessCheckedAt: new Date().toISOString() } as never },
+          });
+          if (whatsappReadiness.wabaSubscription !== 'ACTIVE') {
+            await markChannelSetupFailed(account.id, account.channelType, 'The Vhicasar Meta App is not subscribed to this WABA.');
+            return {
+              healthy: false, status: 'ERROR',
+              message: 'WhatsApp authorization exists, but the Vhicasar Meta App subscription is not active for this WhatsApp Business Account.',
+              checks: whatsappOperationalChecks(),
+            };
+          }
+        }
       }
       const metadata = (account.metadata as Record<string, unknown> | null) ?? {};
       const customerManagedMeta = metadata.connectedVia === 'manual_credentials'
         && ['WHATSAPP', 'FACEBOOK_MESSENGER', 'INSTAGRAM'].includes(account.channelType);
-      if (customerManagedMeta && !account.lastWebhookAt) {
-        await prisma.channelAccount.update({
-          where: { id: account.id },
-          data: {
-            status: 'SETUP_REQUIRED', isActive: false,
-            lastError: 'Credentials and provider subscription are valid. Configure the webhook in your Meta app and send a test event.',
-            lastErrorAt: new Date(),
-          },
-        });
+      if ((customerManagedMeta || account.channelType === 'WHATSAPP') && !account.lastWebhookAt) {
+        await markChannelAwaitingWebhook(account.id, account.channelType);
         logger.info({ correlationId, accountId, channelType: account.channelType, phase: 'setup_required' }, 'Channel diagnostic');
-        return { healthy: false, status: 'SETUP_REQUIRED', message: 'Credentials are valid, but no correctly signed webhook has been received from your Meta app yet.' };
+        return {
+          healthy: false,
+          status: 'SETUP_REQUIRED',
+          message: 'Credentials and WABA subscription are valid, but no correctly signed WhatsApp webhook has reached Vhicasar yet.',
+          ...(whatsappReadiness ? { checks: whatsappOperationalChecks() } : {}),
+        };
       }
       await markChannelConnected(account.id);
       logger.info({ correlationId, accountId, channelType: account.channelType, phase: 'passed' }, 'Channel diagnostic');
-      return { healthy: true, status: 'CONNECTED', message: 'Credentials and inbound webhook registration are ready.' };
+      return { healthy: true, status: 'CONNECTED', message: 'Credentials and inbound webhook registration are ready.', ...(whatsappReadiness ? { checks: whatsappOperationalChecks() } : {}) };
     } catch (error) {
       if (['WHATSAPP', 'FACEBOOK_MESSENGER', 'INSTAGRAM'].includes(account.channelType)) {
         await markWebhookSubscription(account.id, 'FAILED');

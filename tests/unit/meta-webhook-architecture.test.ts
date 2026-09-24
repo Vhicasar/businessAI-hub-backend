@@ -23,6 +23,12 @@ describe('stable Meta webhook architecture', () => {
     })).toEqual({ entryId: 'waba-1', phoneNumberId: 'phone-1' });
   });
 
+  it('finds the phone number id even when it is not in the first change', () => {
+    expect(extractMetaRoutingIds('WHATSAPP', {
+      id: 'waba-1', changes: [{ value: {} }, { value: { metadata: { phone_number_id: 'phone-2' } } }],
+    })).toEqual({ entryId: 'waba-1', phoneNumberId: 'phone-2' });
+  });
+
   it('rejects malformed entries by yielding no routing identifier', () => {
     expect(extractMetaRoutingIds('INSTAGRAM', { changes: [] })).toEqual({ entryId: null, phoneNumberId: null });
   });

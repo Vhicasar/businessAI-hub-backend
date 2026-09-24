@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { subscribeWebhooks, type ResolvedConnection } from '../../src/application/inbox/channel-oauth.service';
+import { inspectWhatsAppReadiness, resolveWhatsApp, subscribeWebhooks, type ResolvedConnection } from '../../src/application/inbox/channel-oauth.service';
 import { connectChannelSchema } from '../../src/application/inbox/channels.service';
 import { MetaMessagingAdapter } from '../../src/infrastructure/channels/meta.adapter';
 import { validateMetaTokenOwnership } from '../../src/infrastructure/channels/whatsapp.adapter';
@@ -84,11 +84,64 @@ describe('Meta inbound readiness', () => {
   it('subscribes WhatsApp at the WABA subscribed_apps endpoint', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: true })
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: [{ id: 'app' }] }) });
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: [{ whatsapp_business_api_data: { id: 'app-7' } }] }) });
     vi.stubGlobal('fetch', fetchMock);
-    await subscribeWebhooks(connection('WHATSAPP', { accessToken: 'token', wabaId: 'waba-7' }));
+    await subscribeWebhooks(connection('WHATSAPP', { accessToken: 'token', wabaId: 'waba-7', phoneNumberId: 'phone-7', appId: 'app-7' }));
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/waba-7/subscribed_apps');
+  });
+
+  it('discovers the phone number server-side when Coexistence returns only a WABA id', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: { granular_scopes: [] } }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: [{ id: 'phone-22', display_phone_number: '+2348000000022', verified_name: 'Demo Business' }] }) });
+    vi.stubGlobal('fetch', fetchMock);
+    const resolved = await resolveWhatsApp('token', null, {
+      wabaId: 'waba-22', connectionMode: 'WHATSAPP_BUSINESS_APP_COEXISTENCE', connectionAttemptId: 'attempt-22',
+    });
+    expect(resolved).toMatchObject({
+      externalId: 'phone-22', displayName: 'Demo Business',
+      credentials: { wabaId: 'waba-22', phoneNumberId: 'phone-22' },
+      metadata: { connectionMode: 'WHATSAPP_BUSINESS_APP_COEXISTENCE', connectionAttemptId: 'attempt-22' },
+    });
+    expect(String(fetchMock.mock.calls[1]?.[0])).toContain('/waba-22/phone_numbers');
+  });
+
+  it('does not guess which phone was selected when a WABA-only completion has multiple numbers', async () => {
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: { granular_scopes: [] } }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: [{ id: 'one' }, { id: 'two' }] }) }));
+    await expect(resolveWhatsApp('token', null, {
+      wabaId: 'waba-22', connectionMode: 'WHATSAPP_BUSINESS_APP_COEXISTENCE',
+    })).rejects.toMatchObject({ code: 'CHANNEL_OAUTH_INCOMPLETE' });
+  });
+
+  it('rejects a non-empty WABA subscription list when the Vhicasar app is absent', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: [{ whatsapp_business_api_data: { id: 'other-app' } }] }) });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(subscribeWebhooks(connection('WHATSAPP', {
+      accessToken: 'token', wabaId: 'waba-7', phoneNumberId: 'phone-7', appId: 'vhicasar-app',
+    }))).rejects.toMatchObject({ code: 'CHANNEL_WEBHOOK_SUBSCRIBE_FAILED' });
+  });
+
+  it('reports WhatsApp token, asset and exact app-subscription readiness without returning secrets', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: { is_valid: true, scopes: ['whatsapp_business_management', 'whatsapp_business_messaging'] } }) })
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: [{ whatsapp_business_api_data: { id: 'app-7' } }] }) });
+    vi.stubGlobal('fetch', fetchMock);
+    const readiness = await inspectWhatsAppReadiness({
+      accessToken: 'secret-token', appId: 'app-7', appSecret: 'secret', wabaId: 'waba-7', phoneNumberId: 'phone-7',
+    });
+    expect(readiness).toMatchObject({
+      wabaIdFound: true, phoneNumberIdFound: true, accessTokenPresent: true,
+      tokenValid: 'YES', wabaAccessible: 'YES', phoneNumberAccessible: 'YES',
+      requiredPermissions: 'PASS', wabaSubscription: 'ACTIVE',
+    });
+    expect(JSON.stringify(readiness)).not.toContain('secret-token');
   });
 
   it('uses direct Instagram subscribed_apps when credentials have no Page', async () => {

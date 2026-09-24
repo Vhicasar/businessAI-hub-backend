@@ -54,6 +54,9 @@ interface StatePayload {
   /** Where to send the browser once the exchange is done. */
   returnTo: string;
   issuedAt: number;
+  /** Correlates browser SDK events with the server-side OAuth exchange. */
+  connectionAttemptId?: string;
+  signupFlow?: 'STANDARD_CLOUD_API' | 'WHATSAPP_BUSINESS_APP_COEXISTENCE';
 }
 
 const STATE_TTL_MS = 10 * 60 * 1000;

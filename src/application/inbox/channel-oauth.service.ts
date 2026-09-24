@@ -169,6 +169,37 @@ export function authorizationUrl(input: {
   };
 }
 
+export type WhatsAppConnectionMode = 'STANDARD_CLOUD_API' | 'WHATSAPP_BUSINESS_APP_COEXISTENCE';
+
+/** Public browser configuration only. App secrets and tokens never leave the server. */
+export function whatsappEmbeddedSignupConfig(input: {
+  organizationId: string;
+  userId: string;
+  returnTo: string;
+}): { appId: string; configId: string; graphVersion: string; state: string; connectionAttemptId: string } {
+  const reason = oauthUnavailableReason('WHATSAPP');
+  if (reason) throw new AppError('CHANNEL_OAUTH_UNAVAILABLE', 400, reason);
+  if (!env.meta.whatsappConfigId) {
+    throw new AppError('CHANNEL_OAUTH_UNAVAILABLE', 400, 'WhatsApp Embedded Signup is not configured on this deployment.');
+  }
+  const connectionAttemptId = randomUUID();
+  return {
+    appId: metaApp().appId,
+    configId: env.meta.whatsappConfigId,
+    graphVersion: env.meta.graphVersion,
+    connectionAttemptId,
+    state: signState({
+      organizationId: input.organizationId,
+      userId: input.userId,
+      provider: 'channel:WHATSAPP',
+      returnTo: input.returnTo,
+      issuedAt: Date.now(),
+      connectionAttemptId,
+      signupFlow: 'WHATSAPP_BUSINESS_APP_COEXISTENCE',
+    }),
+  };
+}
+
 /** What the callback resolved to, ready to become a ChannelAccount. */
 export interface ResolvedConnection {
   organizationId: string;
@@ -201,15 +232,15 @@ async function graphGet<T>(path: string, token: string): Promise<T> {
 }
 
 /** Swap the one-time code for a token that belongs to this business. */
-async function exchangeCode(code: string, channelType: ChannelType): Promise<{ accessToken: string; expiresAt: string | null; scopes?: string[] }> {
+async function exchangeCode(code: string, channelType: ChannelType, embeddedSignup = false): Promise<{ accessToken: string; expiresAt: string | null; scopes?: string[] }> {
   if (channelType === 'INSTAGRAM' && instagramLoginMode() === 'DIRECT_INSTAGRAM') return exchangeInstagramCode(code);
   const app = channelType === 'INSTAGRAM' ? instagramApp() : metaApp();
   const params = new URLSearchParams({
     client_id: app.appId,
     client_secret: app.appSecret,
-    redirect_uri: callbackUrl(channelType),
     code,
   });
+  if (!embeddedSignup) params.set('redirect_uri', callbackUrl(channelType));
   const res = await fetch(`${graph()}/oauth/access_token?${params.toString()}`);
   const json = (await res.json()) as { access_token?: string; expires_in?: number; error?: { message?: string } };
   if (!res.ok || !json.access_token) {
@@ -274,6 +305,12 @@ export async function completeCallback(input: {
   channelType: ChannelType;
   code: string;
   state: string;
+  whatsappSession?: {
+    wabaId?: string;
+    phoneNumberId?: string;
+    connectionMode?: WhatsAppConnectionMode;
+    connectionAttemptId?: string;
+  };
 }): Promise<ResolvedConnection> {
   let payload: ReturnType<typeof verifyState>;
   try {
@@ -289,8 +326,11 @@ export async function completeCallback(input: {
   if (payload.provider !== `channel:${input.channelType}`) {
     throw new AppError(input.channelType === 'INSTAGRAM' ? 'INSTAGRAM_STATE_MISMATCH' : 'OAUTH_STATE_INVALID', 400, 'This connection link is for a different channel.');
   }
+  if (input.whatsappSession?.connectionAttemptId && payload.connectionAttemptId !== input.whatsappSession.connectionAttemptId) {
+    throw new AppError('OAUTH_STATE_INVALID', 400, 'This WhatsApp signup session does not match the connection attempt.');
+  }
 
-  const token = await exchangeCode(input.code, input.channelType);
+  const token = await exchangeCode(input.code, input.channelType, input.channelType === 'WHATSAPP' && Boolean(payload.connectionAttemptId));
   const base = {
     organizationId: payload.organizationId,
     userId: payload.userId,
@@ -299,7 +339,7 @@ export async function completeCallback(input: {
   };
 
   if (input.channelType === 'WHATSAPP') {
-    return { ...base, ...(await resolveWhatsApp(token.accessToken, token.expiresAt)) };
+    return { ...base, ...(await resolveWhatsApp(token.accessToken, token.expiresAt, input.whatsappSession)) };
   }
   if (input.channelType === 'INSTAGRAM') {
     return {
@@ -389,9 +429,10 @@ async function resolveInstagram(
 }
 
 /** The WABA and phone number the business picked during Embedded Signup. */
-async function resolveWhatsApp(
+export async function resolveWhatsApp(
   userToken: string,
   tokenExpiresAt: string | null,
+  session?: { wabaId?: string; phoneNumberId?: string; connectionMode?: WhatsAppConnectionMode; connectionAttemptId?: string },
 ): Promise<Pick<ResolvedConnection, 'externalId' | 'displayName' | 'credentials' | 'metadata'>> {
   // Facebook Login for Business records the assets selected in Embedded
   // Signup as granular-scope target ids. This is both more precise and less
@@ -413,7 +454,7 @@ async function resolveWhatsApp(
       )]
     : [];
 
-  const businesses = grantedWabaIds.length
+  const businesses = (session?.wabaId || grantedWabaIds.length)
     ? { data: [] as { id: string; name?: string }[] }
     : await graphGet<{ data?: { id: string; name?: string }[] }>(
         '/me/businesses?fields=id,name',
@@ -427,6 +468,7 @@ async function resolveWhatsApp(
         );
       });
   const wabas: { id: string; name?: string; businessId: string }[] = [];
+  if (session?.wabaId) wabas.push({ id: session.wabaId, businessId: '' });
   wabas.push(...grantedWabaIds.map((id) => ({ id, businessId: '' })));
   for (const business of businesses.data ?? []) {
     const owned = await graphGet<{ data?: { id: string; name?: string }[] }>(
@@ -447,7 +489,16 @@ async function resolveWhatsApp(
   const numbers = await graphGet<{
     data?: { id: string; display_phone_number?: string; verified_name?: string }[];
   }>(`/${waba.id}/phone_numbers?fields=id,display_phone_number,verified_name`, userToken);
-  const number = numbers.data?.[0];
+  if (!session?.phoneNumberId && (numbers.data?.length ?? 0) > 1) {
+    throw new AppError(
+      'CHANNEL_OAUTH_INCOMPLETE',
+      400,
+      'Meta returned more than one WhatsApp phone number without identifying the one selected during signup. Reopen Connect WhatsApp and complete the selection again.',
+    );
+  }
+  const number = session?.phoneNumberId
+    ? numbers.data?.find((candidate) => candidate.id === session.phoneNumberId)
+    : numbers.data?.[0];
   if (!number) {
     throw new AppError(
       'CHANNEL_OAUTH_INCOMPLETE',
@@ -477,6 +528,8 @@ async function resolveWhatsApp(
       tokenExpiresAt,
       connectedAt: new Date().toISOString(),
       connectedVia: 'meta_embedded_signup',
+      connectionMode: session?.connectionMode ?? 'STANDARD_CLOUD_API',
+      connectionAttemptId: session?.connectionAttemptId ?? null,
     },
   };
 }
@@ -543,6 +596,13 @@ export async function subscribeWebhooks(connection: ResolvedConnection): Promise
     }
   };
   if (channelType === 'WHATSAPP') {
+    if (!credentials.wabaId || !credentials.phoneNumberId || !credentials.accessToken || !credentials.appId) {
+      throw new AppError(
+        'CHANNEL_WEBHOOK_SUBSCRIBE_FAILED',
+        400,
+        'WhatsApp setup is incomplete because the WABA ID, Phone Number ID, access token, or Meta App ID is missing.',
+      );
+    }
     const subscriptionUrl = `${graph()}/${credentials.wabaId}/subscribed_apps`;
     const res = await fetch(
       `${subscriptionUrl}?access_token=${encodeURIComponent(credentials.accessToken ?? '')}`,
@@ -555,7 +615,20 @@ export async function subscribeWebhooks(connection: ResolvedConnection): Promise
         'Connected, but Meta would not turn on message delivery. Try reconnecting.',
       );
     }
-    await verifySubscription(subscriptionUrl, credentials.accessToken ?? '', 'CHANNEL_WEBHOOK_SUBSCRIBE_FAILED');
+    const verification = await fetch(`${subscriptionUrl}?access_token=${encodeURIComponent(credentials.accessToken)}`);
+    const verificationJson = await verification.json().catch(() => ({})) as {
+      data?: Array<{ whatsapp_business_api_data?: { id?: string } }>;
+    };
+    const appSubscribed = verificationJson.data?.some(
+      (item) => item.whatsapp_business_api_data?.id === credentials.appId,
+    ) ?? false;
+    if (!verification.ok || !appSubscribed) {
+      throw new AppError(
+        'CHANNEL_WEBHOOK_SUBSCRIBE_FAILED',
+        502,
+        'Meta accepted WhatsApp signup, but the Vhicasar Meta App is not subscribed to this WhatsApp Business Account.',
+      );
+    }
     return;
   }
 
@@ -604,6 +677,90 @@ export async function subscribeWebhooks(connection: ResolvedConnection): Promise
     );
   }
   await verifySubscription(`${graph()}/${credentials.pageId}/subscribed_apps`, credentials.pageAccessToken ?? '', 'CHANNEL_WEBHOOK_SUBSCRIBE_FAILED');
+}
+
+export type WhatsAppReadiness = {
+  integrationRecordFound: boolean;
+  wabaIdFound: boolean;
+  phoneNumberIdFound: boolean;
+  accessTokenPresent: boolean;
+  tokenValid: 'YES' | 'NO' | 'UNKNOWN';
+  wabaAccessible: 'YES' | 'NO' | 'UNKNOWN';
+  phoneNumberAccessible: 'YES' | 'NO' | 'UNKNOWN';
+  requiredPermissions: 'PASS' | 'FAIL' | 'UNKNOWN';
+  wabaSubscription: 'ACTIVE' | 'MISSING' | 'FAILED' | 'UNKNOWN';
+};
+
+/** Read-only WhatsApp checks. Tokens and provider payloads are never returned. */
+export async function inspectWhatsAppReadiness(
+  credentials: Record<string, string>,
+): Promise<WhatsAppReadiness> {
+  const result: WhatsAppReadiness = {
+    integrationRecordFound: true,
+    wabaIdFound: Boolean(credentials.wabaId),
+    phoneNumberIdFound: Boolean(credentials.phoneNumberId),
+    accessTokenPresent: Boolean(credentials.accessToken),
+    tokenValid: 'UNKNOWN',
+    wabaAccessible: 'UNKNOWN',
+    phoneNumberAccessible: 'UNKNOWN',
+    requiredPermissions: 'UNKNOWN',
+    wabaSubscription: 'UNKNOWN',
+  };
+  if (!credentials.accessToken) return result;
+  const accessToken = credentials.accessToken;
+
+  if (credentials.appId && credentials.appSecret) {
+    const params = new URLSearchParams({
+      input_token: accessToken,
+      access_token: `${credentials.appId}|${credentials.appSecret}`,
+    });
+    try {
+      const response = await fetch(`${graph()}/debug_token?${params.toString()}`);
+      const json = await response.json().catch(() => ({})) as {
+        data?: { is_valid?: boolean; scopes?: string[]; granular_scopes?: Array<{ scope?: string }> };
+      };
+      if (response.ok && json.data) {
+        result.tokenValid = json.data.is_valid ? 'YES' : 'NO';
+        const scopes = new Set([
+          ...(json.data.scopes ?? []),
+          ...(json.data.granular_scopes ?? []).flatMap((item) => item.scope ? [item.scope] : []),
+        ]);
+        result.requiredPermissions = ['whatsapp_business_management', 'whatsapp_business_messaging']
+          .every((scope) => scopes.has(scope)) ? 'PASS' : 'FAIL';
+      }
+    } catch {
+      // Network/provider failures remain UNKNOWN rather than being called invalid.
+    }
+  }
+
+  const inspect = async (id: string | undefined): Promise<'YES' | 'NO' | 'UNKNOWN'> => {
+    if (!id) return 'NO';
+    try {
+      const response = await fetch(`${graph()}/${encodeURIComponent(id)}?fields=id&access_token=${encodeURIComponent(accessToken)}`);
+      return response.ok ? 'YES' : response.status === 400 || response.status === 401 || response.status === 403 ? 'NO' : 'UNKNOWN';
+    } catch {
+      return 'UNKNOWN';
+    }
+  };
+  result.wabaAccessible = await inspect(credentials.wabaId);
+  result.phoneNumberAccessible = await inspect(credentials.phoneNumberId);
+
+  if (credentials.wabaId && credentials.appId) {
+    try {
+      const response = await fetch(`${graph()}/${encodeURIComponent(credentials.wabaId)}/subscribed_apps?access_token=${encodeURIComponent(accessToken)}`);
+      const json = await response.json().catch(() => ({})) as {
+        data?: Array<{ whatsapp_business_api_data?: { id?: string } }>;
+      };
+      result.wabaSubscription = !response.ok
+        ? 'FAILED'
+        : json.data?.some((item) => item.whatsapp_business_api_data?.id === credentials.appId)
+          ? 'ACTIVE'
+          : 'MISSING';
+    } catch {
+      result.wabaSubscription = 'UNKNOWN';
+    }
+  }
+  return result;
 }
 
 /** A per-account webhook secret, used as Meta's verify token. */

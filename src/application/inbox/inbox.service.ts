@@ -20,7 +20,7 @@ import type {
   NormalizedStatus,
 } from './channel-adapter';
 import { ingestInboundMedia } from './inbox-media.service';
-import { markChannelConnected, markChannelError } from './channel-health.service';
+import { markChannelConnected, markChannelError, markOutboundMessageSent } from './channel-health.service';
 import { workflowService } from '../crm/workflow.service';
 
 export const listConversationsSchema = z.object({
@@ -290,7 +290,7 @@ export const inboxService = {
   async processInbound(
     account: { id: string; organizationId: string; channelType: ChannelType },
     inbound: NormalizedInbound
-  ): Promise<void> {
+  ): Promise<'PERSISTED' | 'DUPLICATE'> {
     // Identity resolution: one Customer per human, per-channel handles linked.
     let identity = await prisma.customerIdentity.findFirst({
       where: {
@@ -380,7 +380,7 @@ export const inboxService = {
     const existing = await prisma.message.findFirst({
       where: { conversationId: conversation.id, providerMessageId: inbound.providerMessageId },
     });
-    if (existing) return;
+    if (existing) return 'DUPLICATE';
 
     let message;
     try {
@@ -400,7 +400,7 @@ export const inboxService = {
     } catch (error) {
       // Two identical webhook/widget retries may race past the read above. The
       // database uniqueness constraint is the final idempotency boundary.
-      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return;
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return 'DUPLICATE';
       throw error;
     }
 
@@ -415,6 +415,10 @@ export const inboxService = {
         accountId: account.id,
         media: inbound.media,
         caption: inbound.text,
+      }).catch((err) => {
+        // The text/message identity is already durable. A temporary media CDN
+        // or download failure must not hide the WhatsApp message from Inbox.
+        logger.warn({ err, messageId: message.id, channelType: account.channelType }, 'Inbound media download failed; message retained');
       });
     }
 
@@ -544,6 +548,7 @@ export const inboxService = {
         logger.warn({ err: e }, 'Auto-reply failed (non-fatal)')
       );
     }
+    return 'PERSISTED';
   },
 
   /**
@@ -668,9 +673,11 @@ export const inboxService = {
         where: { id: message.id },
         data: { status: 'SENT', providerMessageId: result.providerMessageId, sentAt: new Date() },
       });
+      await markOutboundMessageSent(conversation.channelAccount.id);
       // A send that worked is the same proof a webhook is: the credentials are
-      // good. Clears a stale error without waiting for the customer to write in.
-      if (conversation.channelAccount.status !== 'CONNECTED') {
+      // good. WhatsApp remains SETUP_REQUIRED until an inbound signed webhook
+      // proves that Meta can reach us; outbound success alone is not inbound proof.
+      if (conversation.channelAccount.channelType !== 'WHATSAPP' && conversation.channelAccount.status !== 'CONNECTED') {
         await markChannelConnected(conversation.channelAccount.id);
       }
     } catch (e) {

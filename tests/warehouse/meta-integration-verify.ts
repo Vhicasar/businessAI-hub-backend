@@ -102,7 +102,11 @@ function startGraphStub(): Promise<number> {
           });
         }
         // Webhook subscription.
-        if (url.pathname.includes('/subscribed_apps')) return json(200, { success: true });
+        if (url.pathname.includes('/subscribed_apps')) {
+          return req.method === 'POST'
+            ? json(200, { success: true })
+            : json(200, { data: [{ whatsapp_business_api_data: { id: APP_ID } }] });
+        }
         // Token validation on connect.
         if (url.pathname.endsWith('/me')) return json(200, { id: 'page-1', name: 'Eleganz Collections' });
         // Outbound media upload, then send. Checked before the generic phone

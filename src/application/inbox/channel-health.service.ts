@@ -149,6 +149,44 @@ export async function markChannelConnected(accountId: string): Promise<void> {
     .catch((err) => logger.warn({ err, accountId }, 'Could not mark channel connected'));
 }
 
+/** Subscription succeeded, but no signed provider delivery has proved the route yet. */
+export async function markChannelAwaitingWebhook(accountId: string, channelType: string): Promise<void> {
+  await prismaUnscoped.channelAccount.update({
+    where: { id: accountId },
+    data: {
+      status: 'SETUP_REQUIRED',
+      isActive: false,
+      lastError: `${channelLabel(channelType)} authorization and provider subscription succeeded. Waiting for the first signed webhook delivery.`,
+      lastErrorAt: new Date(),
+    },
+  });
+}
+
+/** Record a real inbound customer message separately from status-only webhooks. */
+export async function markInboundMessageReceived(accountId: string): Promise<void> {
+  const account = await prismaUnscoped.channelAccount.findUnique({
+    where: { id: accountId }, select: { metadata: true },
+  });
+  const metadata = account?.metadata && typeof account.metadata === 'object' && !Array.isArray(account.metadata)
+    ? account.metadata as Record<string, unknown> : {};
+  await prismaUnscoped.channelAccount.update({
+    where: { id: accountId },
+    data: { metadata: { ...metadata, lastInboundMessageAt: new Date().toISOString() } },
+  }).catch((err) => logger.warn({ err, accountId }, 'Could not stamp inbound channel message health'));
+}
+
+export async function markOutboundMessageSent(accountId: string): Promise<void> {
+  const account = await prismaUnscoped.channelAccount.findUnique({
+    where: { id: accountId }, select: { metadata: true },
+  });
+  const metadata = account?.metadata && typeof account.metadata === 'object' && !Array.isArray(account.metadata)
+    ? account.metadata as Record<string, unknown> : {};
+  await prismaUnscoped.channelAccount.update({
+    where: { id: accountId },
+    data: { metadata: { ...metadata, lastOutboundMessageAt: new Date().toISOString() } },
+  }).catch((err) => logger.warn({ err, accountId }, 'Could not stamp outbound channel message health'));
+}
+
 /** Mandatory connection setup failed: never leave the row active or billable. */
 export async function markChannelSetupFailed(
   accountId: string,

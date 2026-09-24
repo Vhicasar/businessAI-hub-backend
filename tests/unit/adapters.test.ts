@@ -117,7 +117,30 @@ describe('WhatsAppAdapter.parseInbound', () => {
       senderDisplayName: 'Fatima',
       contentType: 'TEXT',
       text: 'Do you deliver?',
+      senderProfile: { phone: '2348010000000', firstName: 'Fatima' },
     });
+  });
+
+  it('normalizes WhatsApp media separately from delivery statuses', () => {
+    const payload = {
+      object: 'whatsapp_business_account',
+      entry: [{ changes: [{ value: {
+        metadata: { phone_number_id: 'phone-1' },
+        contacts: [{ profile: { name: 'Fatima Bello' }, wa_id: '2348010000000' }],
+        messages: [{ from: '2348010000000', id: 'wamid.media', type: 'image', image: { id: 'media-1', mime_type: 'image/jpeg', caption: 'Receipt' } }],
+        statuses: [{ id: 'wamid.outbound', status: 'delivered', timestamp: '1700000000' }],
+      } }] }],
+    };
+    expect(adapter.parseInbound(payload)).toEqual([
+      expect.objectContaining({
+        providerMessageId: 'wamid.media', contentType: 'IMAGE', text: 'Receipt',
+        media: { externalId: 'media-1', mimeType: 'image/jpeg' },
+        senderDisplayName: 'Fatima Bello', senderProfile: expect.objectContaining({ phone: '2348010000000' }),
+      }),
+    ]);
+    expect(adapter.parseStatuses?.(payload)).toEqual([
+      expect.objectContaining({ providerMessageId: 'wamid.outbound', status: 'DELIVERED' }),
+    ]);
   });
 
   it('ignores non-WhatsApp payloads and status-only deliveries', () => {

@@ -14,11 +14,13 @@ import {
   updateChannelSchema,
   connectChannelSchema,
 } from '../../../application/inbox/channels.service';
-import { authorizationUrl } from '../../../application/inbox/channel-oauth.service';
+import { authorizationUrl, completeCallback, subscribeWebhooks, whatsappEmbeddedSignupConfig } from '../../../application/inbox/channel-oauth.service';
 import { isAutomaticChannelConnectEnabled } from '../../../application/settings/workspace-config';
 import { allowanceFor } from '../../../application/inbox/channel-allowance.service';
 import type { ChannelType } from '@prisma/client';
 import { env } from '../../../shared/config/env';
+import { logger } from '../../../shared/logger';
+import { markChannelAwaitingWebhook, markChannelSetupFailed, markWebhookSubscription } from '../../../application/inbox/channel-health.service';
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<void>): RequestHandler =>
@@ -187,6 +189,15 @@ inboxRoutes.post(
     if (!allowance.canAddMore) {
       throw new ConflictError(allowance.blockedReason ?? 'This channel cannot be connected.');
     }
+    if (channelType === 'WHATSAPP' && env.meta.whatsappConfigId) {
+      const data = whatsappEmbeddedSignupConfig({
+        organizationId: req.auth!.organizationId!, userId: req.auth!.userId,
+        returnTo: `${env.WEB_APP_URL}/settings/integrations?tab=channels`,
+      });
+      logger.info({ event: 'WHATSAPP_SIGNUP_STARTED', connectionAttemptId: data.connectionAttemptId, tenantId: req.auth!.organizationId }, 'WhatsApp Embedded Signup started');
+      res.json({ success: true, data: { embeddedSignup: data } });
+      return;
+    }
     const { url } = authorizationUrl({
       channelType,
       organizationId: req.auth!.organizationId!,
@@ -195,6 +206,48 @@ inboxRoutes.post(
     });
     res.json({ success: true, data: { url } });
   })
+);
+
+const embeddedSignupCompleteSchema = z.object({
+  code: z.string().min(1), state: z.string().min(1), connectionAttemptId: z.string().uuid(),
+  wabaId: z.string().regex(/^\d+$/).optional(), phoneNumberId: z.string().regex(/^\d+$/).optional(),
+  connectionMode: z.enum(['STANDARD_CLOUD_API', 'WHATSAPP_BUSINESS_APP_COEXISTENCE']),
+});
+
+inboxRoutes.post(
+  '/channels/whatsapp/embedded-signup/complete',
+  requirePermission('inbox.manage_channels', 'settings.manage_integrations'),
+  validate({ body: embeddedSignupCompleteSchema }),
+  wrap(async (req, res) => {
+    const body = req.body as z.infer<typeof embeddedSignupCompleteSchema>;
+    logger.info({ event: 'WHATSAPP_OAUTH_CODE_RECEIVED', connectionAttemptId: body.connectionAttemptId, tenantId: req.auth!.organizationId }, 'WhatsApp OAuth code received');
+    if (body.wabaId) logger.info({ event: 'WHATSAPP_SESSION_INFO_RECEIVED', connectionAttemptId: body.connectionAttemptId, tenantId: req.auth!.organizationId, hasWabaId: true, hasPhoneNumberId: Boolean(body.phoneNumberId) }, 'WhatsApp signup session received');
+    if (body.connectionMode === 'WHATSAPP_BUSINESS_APP_COEXISTENCE') logger.info({ event: 'WHATSAPP_COEXISTENCE_FINISHED', connectionAttemptId: body.connectionAttemptId, tenantId: req.auth!.organizationId }, 'WhatsApp Business App onboarding finished');
+
+    const connection = await completeCallback({
+      channelType: 'WHATSAPP', code: body.code, state: body.state,
+      whatsappSession: { wabaId: body.wabaId, phoneNumberId: body.phoneNumberId, connectionMode: body.connectionMode, connectionAttemptId: body.connectionAttemptId },
+    });
+    if (connection.organizationId !== req.auth!.organizationId || connection.userId !== req.auth!.userId) {
+      throw new ConflictError('This WhatsApp connection was started by a different workspace or user.');
+    }
+    logger.info({ event: 'WHATSAPP_WABA_RESOLVED', connectionAttemptId: body.connectionAttemptId, tenantId: connection.organizationId, wabaId: connection.credentials.wabaId }, 'WhatsApp Business Account resolved');
+    logger.info({ event: 'WHATSAPP_PHONE_NUMBER_RESOLVED', connectionAttemptId: body.connectionAttemptId, tenantId: connection.organizationId, phoneNumberId: connection.credentials.phoneNumberId }, 'WhatsApp phone number resolved');
+    const account = await channelsService.connectFromOAuth(connection);
+    try {
+      logger.info({ event: 'WHATSAPP_WABA_SUBSCRIBE_STARTED', connectionAttemptId: body.connectionAttemptId, tenantId: connection.organizationId }, 'WhatsApp WABA subscription started');
+      await subscribeWebhooks(connection);
+      await markWebhookSubscription(account.id, 'READY');
+      await markChannelAwaitingWebhook(account.id, 'WHATSAPP');
+      logger.info({ event: 'WHATSAPP_WABA_SUBSCRIBED', connectionAttemptId: body.connectionAttemptId, tenantId: connection.organizationId, channelAccountId: account.id }, 'WhatsApp WABA subscription verified');
+      logger.info({ event: 'WHATSAPP_CONNECTION_READY', connectionAttemptId: body.connectionAttemptId, tenantId: connection.organizationId, channelAccountId: account.id }, 'WhatsApp connection awaiting first signed webhook');
+    } catch (error) {
+      await markWebhookSubscription(account.id, 'FAILED');
+      await markChannelSetupFailed(account.id, 'WHATSAPP', `Webhook subscription failed: ${(error as Error).message}`);
+      throw error;
+    }
+    res.json({ success: true, data: { accountId: account.id, accountName: account.name, status: 'SETUP_REQUIRED' } });
+  }),
 );
 
 inboxRoutes.patch(

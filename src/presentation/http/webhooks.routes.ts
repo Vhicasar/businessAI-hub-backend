@@ -7,7 +7,7 @@ import { logger } from '../../shared/logger';
 import { getAdapter } from '../../infrastructure/channels/registry';
 import { inboxService } from '../../application/inbox/inbox.service';
 import { decrypt } from '../../shared/crypto';
-import { markWebhookReceived } from '../../application/inbox/channel-health.service';
+import { markInboundMessageReceived, markWebhookReceived } from '../../application/inbox/channel-health.service';
 import { env } from '../../shared/config/env';
 import { enrichInboundProfiles } from '../../application/inbox/profile-enrichment.service';
 
@@ -35,7 +35,9 @@ export function stableMetaWebhookPath(channelType: ChannelType): string | null {
 export function extractMetaRoutingIds(channelType: ChannelType, entry: Record<string, unknown>) {
   const entryId = typeof entry.id === 'string' && entry.id.trim() ? entry.id : null;
   const phoneNumberId = channelType === 'WHATSAPP'
-    ? ((entry.changes as Array<{ value?: { metadata?: { phone_number_id?: string } } }> | undefined)?.[0]?.value?.metadata?.phone_number_id ?? null)
+    ? ((entry.changes as Array<{ value?: { metadata?: { phone_number_id?: string } } }> | undefined)
+        ?.map((change) => change.value?.metadata?.phone_number_id)
+        .find((id): id is string => typeof id === 'string' && id.length > 0) ?? null)
     : null;
   return { entryId, phoneNumberId };
 }
@@ -64,24 +66,30 @@ async function processForAccount(account: NonNullable<WebhookAccount>, body: unk
     accountRef,
   );
   if (!verified) {
-    logger.warn({ correlationId, accountId: account.id, channelType, phase: 'signature_rejected' }, 'Webhook signature verification failed');
+    logger.warn({ correlationId, accountId: account.id, channelType, phase: 'signature_rejected' }, channelType === 'WHATSAPP' ? '[WhatsAppWebhook] SIGNATURE_REJECTED' : 'Webhook signature verification failed');
     return;
   }
-  logger.info({ correlationId, accountId: account.id, channelType, phase: 'signature_verified' }, 'Webhook lifecycle');
+  logger.info({ correlationId, accountId: account.id, tenantId: account.organizationId, channelType, phase: 'signature_verified' }, channelType === 'WHATSAPP' ? '[WhatsAppWebhook] SIGNATURE_VALID' : 'Webhook lifecycle');
   await markWebhookReceived(account.id);
   const parsedMessages = adapter.parseInbound(body);
   const messages = await enrichInboundProfiles(adapter, accountRef, parsedMessages);
   const statuses = adapter.parseStatuses?.(body) ?? [];
-  logger.info({ correlationId, accountId: account.id, channelType, phase: 'normalized', messageCount: messages.length, statusCount: statuses.length }, 'Webhook lifecycle');
+  logger.info({ correlationId, accountId: account.id, channelType, phase: 'normalized', messageCount: messages.length, statusCount: statuses.length }, channelType === 'WHATSAPP' ? '[WhatsAppWebhook] MESSAGE_NORMALIZED' : 'Webhook lifecycle');
   await requestContext.run(
     { requestId: randomUUID(), organizationId: account.organizationId },
     async () => {
       for (const inbound of messages) {
-        await inboxService.processInbound({ id: account.id, organizationId: account.organizationId, channelType }, inbound);
-        logger.info({ correlationId, accountId: account.id, channelType, phase: 'persisted', providerEventId: inbound.providerMessageId }, 'Webhook lifecycle');
+        if (channelType === 'WHATSAPP') logger.info({ event: 'WHATSAPP_INBOUND_MESSAGE_RECEIVED', correlationId, accountId: account.id, tenantId: account.organizationId }, 'WhatsApp inbound message received');
+        const outcome = await inboxService.processInbound({ id: account.id, organizationId: account.organizationId, channelType }, inbound);
+        await markInboundMessageReceived(account.id);
+        if (outcome === 'DUPLICATE') {
+          logger.info({ correlationId, accountId: account.id, channelType, phase: 'duplicate_ignored' }, channelType === 'WHATSAPP' ? '[WhatsAppWebhook] DUPLICATE_IGNORED' : 'Webhook lifecycle');
+          continue;
+        }
+        logger.info({ event: channelType === 'WHATSAPP' ? 'WHATSAPP_MESSAGE_PERSISTED' : undefined, correlationId, accountId: account.id, tenantId: account.organizationId, channelType, phase: 'persisted' }, channelType === 'WHATSAPP' ? '[WhatsAppWebhook] MESSAGE_PERSISTED' : 'Webhook lifecycle');
         // processInbound commits and emits the existing Socket.IO events before
         // its promise resolves; no second realtime path is introduced here.
-        logger.info({ correlationId, accountId: account.id, channelType, phase: 'realtime_emitted', providerEventId: inbound.providerMessageId }, 'Webhook lifecycle');
+        logger.info({ event: channelType === 'WHATSAPP' ? 'WHATSAPP_REALTIME_EMITTED' : undefined, correlationId, accountId: account.id, tenantId: account.organizationId, channelType, phase: 'realtime_emitted' }, channelType === 'WHATSAPP' ? '[WhatsAppWebhook] REALTIME_EMITTED' : 'Webhook lifecycle');
       }
       for (const update of statuses) {
         await inboxService.applyStatus({ id: account.id, organizationId: account.organizationId }, update)
@@ -124,11 +132,14 @@ webhookRoutes.post('/:meta(whatsapp|messenger|instagram)', (req, res) => {
     return;
   }
   res.status(200).json({ ok: true });
-  logger.info({ correlationId, channelType, phase: 'received', entryCount: body.entry.length }, 'Webhook lifecycle');
+  logger.info({ event: channelType === 'WHATSAPP' ? 'WHATSAPP_WEBHOOK_RECEIVED' : undefined, correlationId, channelType, phase: 'received', entryCount: body.entry.length }, channelType === 'WHATSAPP' ? '[WhatsAppWebhook] RECEIVED' : 'Webhook lifecycle');
 
   void (async () => {
     for (const entry of body.entry ?? []) {
       const { entryId, phoneNumberId } = extractMetaRoutingIds(channelType, entry);
+      if (channelType === 'WHATSAPP') {
+        logger.info({ correlationId, channelType, phase: 'phone_number_id_extracted', phoneNumberIdPresent: Boolean(phoneNumberId) }, '[WhatsAppWebhook] PHONE_NUMBER_ID_EXTRACTED');
+      }
       if (!entryId && !phoneNumberId) {
         logger.warn({ channelType }, 'Meta webhook entry has no routing identifier');
         continue;
@@ -137,7 +148,7 @@ webhookRoutes.post('/:meta(whatsapp|messenger|instagram)', (req, res) => {
         where: {
           channelType, status: { in: ['CONNECTING', 'SETUP_REQUIRED', 'CONNECTED'] }, deletedAt: null,
           ...(channelType === 'WHATSAPP'
-            ? { OR: [{ metaPhoneNumberId: phoneNumberId ?? undefined }, { metaWabaId: entryId ?? undefined }] }
+            ? (phoneNumberId ? { metaPhoneNumberId: phoneNumberId } : { metaWabaId: entryId ?? undefined })
             : channelType === 'FACEBOOK_MESSENGER'
               ? { metaFacebookPageId: entryId ?? undefined }
               : { metaInstagramAccountId: entryId ?? undefined }),
@@ -147,8 +158,8 @@ webhookRoutes.post('/:meta(whatsapp|messenger|instagram)', (req, res) => {
         logger.warn({ correlationId, channelType, phase: 'routing_failed', providerIdentifierPresent: Boolean(entryId || phoneNumberId) }, 'Meta webhook for unknown or disconnected account');
         continue;
       }
-      logger.info({ correlationId, accountId: account.id, channelType, phase: 'routed' }, 'Webhook lifecycle');
-      logger.info({ correlationId, accountId: account.id, organizationId: account.organizationId, channelType, phase: 'business_resolved' }, 'Webhook lifecycle');
+      logger.info({ correlationId, accountId: account.id, channelType, phase: 'routed' }, channelType === 'WHATSAPP' ? '[WhatsAppWebhook] INTEGRATION_RESOLVED' : 'Webhook lifecycle');
+      logger.info({ correlationId, accountId: account.id, organizationId: account.organizationId, channelType, phase: 'business_resolved' }, channelType === 'WHATSAPP' ? '[WhatsAppWebhook] BUSINESS_RESOLVED' : 'Webhook lifecycle');
       const singleBody = { ...(body as Record<string, unknown>), entry: [entry] };
       // Signature verification occurs inside processForAccount using this
       // connection's encrypted app secret. A platform-wide check here used to

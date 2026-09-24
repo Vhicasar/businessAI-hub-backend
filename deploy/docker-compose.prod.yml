@@ -52,6 +52,13 @@ x-backend-env: &backend-env
   ADMIN_API_URL: ${ADMIN_API_URL:-https://admin.vhicasar.com}
   ADMIN_TENANT_SLUG: businesshub-ai
   ADMIN_PLAN_SYNC: "true"
+  # Meta channel OAuth + stable webhook verification.
+  META_APP_ID: ${META_APP_ID}
+  META_APP_SECRET: ${META_APP_SECRET}
+  META_WEBHOOK_VERIFY_TOKEN: ${META_WEBHOOK_VERIFY_TOKEN}
+  META_WHATSAPP_CONFIG_ID: ${META_WHATSAPP_CONFIG_ID}
+  META_GRAPH_VERSION: ${META_GRAPH_VERSION:-v26.0}
+  META_GRAPH_BASE_URL: ${META_GRAPH_BASE_URL:-https://graph.facebook.com}
 
 services:
   agentv-postgres:
