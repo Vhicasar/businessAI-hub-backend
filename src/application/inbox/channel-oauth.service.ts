@@ -5,6 +5,7 @@ import { oauthCredentials } from '../integrations/oauth-config-sync';
 import { AppError } from '../../shared/errors';
 import { logger } from '../../shared/logger';
 import { signState, verifyState } from '../integrations/oauth-connection.service';
+import { prismaUnscoped } from '../../infrastructure/database/prisma';
 
 /**
  * Connecting WhatsApp, Messenger and Instagram without a Developer App.
@@ -172,17 +173,26 @@ export function authorizationUrl(input: {
 export type WhatsAppConnectionMode = 'STANDARD_CLOUD_API' | 'WHATSAPP_BUSINESS_APP_COEXISTENCE';
 
 /** Public browser configuration only. App secrets and tokens never leave the server. */
-export function whatsappEmbeddedSignupConfig(input: {
+export async function whatsappEmbeddedSignupConfig(input: {
   organizationId: string;
   userId: string;
   returnTo: string;
-}): { appId: string; configId: string; graphVersion: string; state: string; connectionAttemptId: string } {
+}): Promise<{ appId: string; configId: string; graphVersion: string; state: string; connectionAttemptId: string }> {
   const reason = oauthUnavailableReason('WHATSAPP');
   if (reason) throw new AppError('CHANNEL_OAUTH_UNAVAILABLE', 400, reason);
   if (!env.meta.whatsappConfigId) {
     throw new AppError('CHANNEL_OAUTH_UNAVAILABLE', 400, 'WhatsApp Embedded Signup is not configured on this deployment.');
   }
   const connectionAttemptId = randomUUID();
+  await prismaUnscoped.whatsAppConnectionAttempt.create({
+    data: {
+      id: connectionAttemptId,
+      organizationId: input.organizationId,
+      userId: input.userId,
+      connectionMode: 'WHATSAPP_BUSINESS_APP_COEXISTENCE',
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+    },
+  });
   return {
     appId: metaApp().appId,
     configId: env.meta.whatsappConfigId,
@@ -198,6 +208,81 @@ export function whatsappEmbeddedSignupConfig(input: {
       signupFlow: 'WHATSAPP_BUSINESS_APP_COEXISTENCE',
     }),
   };
+}
+
+export async function claimWhatsAppConnectionAttempt(input: {
+  id: string; organizationId: string; userId: string;
+  state: string;
+  wabaId?: string; phoneNumberId?: string; metaBusinessId?: string;
+  connectionMode: WhatsAppConnectionMode;
+}): Promise<{ alreadyCompletedAccountId?: string; wabaId?: string; phoneNumberId?: string; metaBusinessId?: string }> {
+  const state = verifyState(input.state);
+  if (state.provider !== 'channel:WHATSAPP' || state.connectionAttemptId !== input.id || state.organizationId !== input.organizationId || state.userId !== input.userId) {
+    throw new AppError('WHATSAPP_CONNECTION_ATTEMPT_INVALID', 400, 'This WhatsApp connection state does not match the signed-in workspace.');
+  }
+  const now = new Date();
+  const claimed = await prismaUnscoped.whatsAppConnectionAttempt.updateMany({
+    where: {
+      id: input.id, organizationId: input.organizationId, userId: input.userId,
+      status: 'PENDING', expiresAt: { gt: now },
+    },
+    data: {
+      status: 'AUTHORIZING', oauthCodeReceivedAt: now,
+      sessionInfoReceivedAt: input.wabaId || input.phoneNumberId ? now : undefined,
+      wabaId: input.wabaId, phoneNumberId: input.phoneNumberId,
+      metaBusinessId: input.metaBusinessId, connectionMode: input.connectionMode,
+    },
+  });
+  if (claimed.count === 1) {
+    const stored = await prismaUnscoped.whatsAppConnectionAttempt.findUniqueOrThrow({ where: { id: input.id } });
+    return {
+      wabaId: stored.wabaId ?? undefined,
+      phoneNumberId: stored.phoneNumberId ?? undefined,
+      metaBusinessId: stored.metaBusinessId ?? undefined,
+    };
+  }
+  const attempt = await prismaUnscoped.whatsAppConnectionAttempt.findUnique({ where: { id: input.id } });
+  if (!attempt || attempt.organizationId !== input.organizationId || attempt.userId !== input.userId) {
+    throw new AppError('WHATSAPP_CONNECTION_ATTEMPT_INVALID', 400, 'This WhatsApp connection attempt is invalid. Start again.');
+  }
+  if (attempt.expiresAt <= now) throw new AppError('WHATSAPP_CONNECTION_ATTEMPT_EXPIRED', 400, 'This WhatsApp connection attempt expired. Start again.');
+  if (attempt.status === 'COMPLETED' && attempt.channelAccountId) return { alreadyCompletedAccountId: attempt.channelAccountId };
+  throw new AppError('WHATSAPP_CONNECTION_ATTEMPT_IN_PROGRESS', 409, 'This WhatsApp connection attempt is already being processed.');
+}
+
+export async function recordWhatsAppConnectionSession(input: {
+  id: string; organizationId: string; userId: string; state: string;
+  wabaId?: string; phoneNumberId?: string; metaBusinessId?: string;
+  connectionMode: WhatsAppConnectionMode;
+}): Promise<void> {
+  const state = verifyState(input.state);
+  if (state.provider !== 'channel:WHATSAPP' || state.connectionAttemptId !== input.id || state.organizationId !== input.organizationId || state.userId !== input.userId) {
+    throw new AppError('WHATSAPP_CONNECTION_ATTEMPT_INVALID', 400, 'This WhatsApp session does not match the signed-in workspace.');
+  }
+  const updated = await prismaUnscoped.whatsAppConnectionAttempt.updateMany({
+    where: {
+      id: input.id, organizationId: input.organizationId, userId: input.userId,
+      status: { in: ['PENDING', 'AUTHORIZING'] }, expiresAt: { gt: new Date() },
+    },
+    data: {
+      sessionInfoReceivedAt: new Date(), wabaId: input.wabaId,
+      phoneNumberId: input.phoneNumberId, metaBusinessId: input.metaBusinessId,
+      connectionMode: input.connectionMode,
+    },
+  });
+  if (updated.count !== 1) throw new AppError('WHATSAPP_CONNECTION_ATTEMPT_INVALID', 400, 'This WhatsApp signup session is expired or already completed.');
+}
+
+export async function finishWhatsAppConnectionAttempt(id: string, channelAccountId: string): Promise<void> {
+  await prismaUnscoped.whatsAppConnectionAttempt.update({
+    where: { id }, data: { status: 'COMPLETED', channelAccountId, completedAt: new Date(), errorCode: null },
+  });
+}
+
+export async function failWhatsAppConnectionAttempt(id: string, errorCode: string): Promise<void> {
+  await prismaUnscoped.whatsAppConnectionAttempt.updateMany({
+    where: { id, status: { not: 'COMPLETED' } }, data: { status: 'ERROR', errorCode },
+  });
 }
 
 /** What the callback resolved to, ready to become a ChannelAccount. */
@@ -310,6 +395,7 @@ export async function completeCallback(input: {
     phoneNumberId?: string;
     connectionMode?: WhatsAppConnectionMode;
     connectionAttemptId?: string;
+    metaBusinessId?: string;
   };
 }): Promise<ResolvedConnection> {
   let payload: ReturnType<typeof verifyState>;
@@ -331,6 +417,9 @@ export async function completeCallback(input: {
   }
 
   const token = await exchangeCode(input.code, input.channelType, input.channelType === 'WHATSAPP' && Boolean(payload.connectionAttemptId));
+  if (input.channelType === 'WHATSAPP') {
+    logger.info({ event: 'WHATSAPP_TOKEN_EXCHANGED', connectionAttemptId: payload.connectionAttemptId, tenantId: payload.organizationId, expiresAt: token.expiresAt }, 'WhatsApp authorization code exchanged');
+  }
   const base = {
     organizationId: payload.organizationId,
     userId: payload.userId,
@@ -432,7 +521,7 @@ async function resolveInstagram(
 export async function resolveWhatsApp(
   userToken: string,
   tokenExpiresAt: string | null,
-  session?: { wabaId?: string; phoneNumberId?: string; connectionMode?: WhatsAppConnectionMode; connectionAttemptId?: string },
+  session?: { wabaId?: string; phoneNumberId?: string; connectionMode?: WhatsAppConnectionMode; connectionAttemptId?: string; metaBusinessId?: string },
 ): Promise<Pick<ResolvedConnection, 'externalId' | 'displayName' | 'credentials' | 'metadata'>> {
   // Facebook Login for Business records the assets selected in Embedded
   // Signup as granular-scope target ids. This is both more precise and less
@@ -453,6 +542,9 @@ export async function resolveWhatsApp(
           .flatMap((grant) => grant.target_ids ?? []),
       )]
     : [];
+  if (session?.wabaId && grantedWabaIds.length > 0 && !grantedWabaIds.includes(session.wabaId)) {
+    throw new AppError('WABA_ID_MISMATCH', 400, 'The WhatsApp Business Account supplied by the browser was not part of the authorized Meta grant.');
+  }
 
   const businesses = (session?.wabaId || grantedWabaIds.length)
     ? { data: [] as { id: string; name?: string }[] }
@@ -477,8 +569,8 @@ export async function resolveWhatsApp(
     ).catch(() => ({ data: [] as { id: string; name?: string }[] }));
     wabas.push(...(owned.data ?? []).map((waba) => ({ ...waba, businessId: business.id })));
   }
-  const waba = wabas[0];
-  if (!waba) {
+  const wabaCandidate = wabas[0];
+  if (!wabaCandidate) {
     throw new AppError(
       'CHANNEL_OAUTH_INCOMPLETE',
       400,
@@ -486,26 +578,48 @@ export async function resolveWhatsApp(
     );
   }
 
+  const waba = await graphGet<{
+    id?: string; name?: string; currency?: string;
+    owner_business_info?: { id?: string; name?: string };
+  }>(`/${wabaCandidate.id}?fields=id,name,currency,owner_business_info`, userToken).catch((error) => {
+    throw new AppError('WABA_ACCESS_DENIED', 400, 'Meta did not allow Vhicasar to access the selected WhatsApp Business Account.', { cause: error });
+  });
+  if (!waba.id || waba.id !== wabaCandidate.id) {
+    throw new AppError('WABA_ID_MISMATCH', 400, 'The WhatsApp Business Account returned by Meta did not match the authorized signup.');
+  }
+  logger.info({ event: 'WHATSAPP_WABA_FETCHED', connectionAttemptId: session?.connectionAttemptId, wabaId: waba.id }, 'WhatsApp Business Account fetched');
+
   const numbers = await graphGet<{
-    data?: { id: string; display_phone_number?: string; verified_name?: string }[];
-  }>(`/${waba.id}/phone_numbers?fields=id,display_phone_number,verified_name`, userToken);
-  if (!session?.phoneNumberId && (numbers.data?.length ?? 0) > 1) {
+    data?: Array<{
+      id: string; cc?: string; country_dial_code?: string; display_phone_number?: string;
+      verified_name?: string; status?: string; quality_rating?: string;
+      search_visibility?: string; platform_type?: string; code_verification_status?: string;
+    }>;
+  }>(`/${waba.id}/phone_numbers?fields=id,display_phone_number,verified_name,quality_rating`, userToken);
+  logger.info({ event: 'WHATSAPP_PHONE_NUMBERS_FETCHED', connectionAttemptId: session?.connectionAttemptId, wabaId: waba.id, count: numbers.data?.length ?? 0, multiple: (numbers.data?.length ?? 0) > 1 }, 'WhatsApp phone numbers fetched');
+  const selectedNumber = selectPrimaryWhatsAppPhoneNumber(numbers.data ?? [], session?.phoneNumberId);
+  if (!selectedNumber) {
     throw new AppError(
-      'CHANNEL_OAUTH_INCOMPLETE',
+      session?.phoneNumberId ? 'PHONE_NUMBER_ACCESS_DENIED' : 'PHONE_NUMBER_NOT_FOUND',
       400,
-      'Meta returned more than one WhatsApp phone number without identifying the one selected during signup. Reopen Connect WhatsApp and complete the selection again.',
+      session?.phoneNumberId
+        ? 'The phone number returned by Embedded Signup does not belong to the authorized WhatsApp Business Account.'
+        : 'That WhatsApp Business account has no phone number yet. Add and verify one in Meta, then connect again.',
     );
   }
-  const number = session?.phoneNumberId
-    ? numbers.data?.find((candidate) => candidate.id === session.phoneNumberId)
-    : numbers.data?.[0];
-  if (!number) {
-    throw new AppError(
-      'CHANNEL_OAUTH_INCOMPLETE',
-      400,
-      'That WhatsApp Business account has no phone number yet. Add and verify one in Meta, then connect again.',
-    );
-  }
+  // Some Graph versions expose readiness fields only on the phone resource,
+  // not the WABA edge. Failure here must not erase the authoritative WABA
+  // membership already proved by /phone_numbers.
+  const number = selectedNumber.status || selectedNumber.code_verification_status
+    ? selectedNumber
+    : await graphGet<WhatsAppPhone>(
+        `/${selectedNumber.id}?fields=id,cc,country_dial_code,display_phone_number,verified_name,status,quality_rating,search_visibility,platform_type,code_verification_status`,
+        userToken,
+      ).catch(() => selectedNumber);
+  logger.info({ event: 'WHATSAPP_PRIMARY_PHONE_SELECTED', connectionAttemptId: session?.connectionAttemptId, wabaId: waba.id, phoneNumberId: number.id, selection: session?.phoneNumberId ? 'EMBEDDED_SIGNUP' : 'FIRST_AUTHORIZED' }, 'Primary WhatsApp phone selected');
+
+  const templates = await fetchWhatsAppTemplates(waba.id, userToken, session?.connectionAttemptId);
+  const registration = await ensureWhatsAppPhoneRegistration(number, userToken, session?.connectionAttemptId);
 
   return {
     externalId: number.id,
@@ -521,10 +635,21 @@ export async function resolveWhatsApp(
     },
     metadata: {
       wabaId: waba.id,
-      businessId: waba.businessId || null,
+      businessId: waba.owner_business_info?.id ?? session?.metaBusinessId ?? null,
       phoneNumberId: number.id,
       wabaName: waba.name ?? null,
+      wabaCurrency: waba.currency ?? null,
+      wabaOwnerName: waba.owner_business_info?.name ?? null,
       displayPhoneNumber: number.display_phone_number ?? null,
+      verifiedName: number.verified_name ?? null,
+      phoneStatus: number.status ?? null,
+      qualityRating: number.quality_rating ?? null,
+      codeVerificationStatus: number.code_verification_status ?? null,
+      platformType: number.platform_type ?? null,
+      phoneRegistrationStatus: registration,
+      templateSyncStatus: templates.status,
+      templateSyncError: templates.error,
+      messageTemplates: templates.items,
       tokenExpiresAt,
       connectedAt: new Date().toISOString(),
       connectedVia: 'meta_embedded_signup',
@@ -532,6 +657,70 @@ export async function resolveWhatsApp(
       connectionAttemptId: session?.connectionAttemptId ?? null,
     },
   };
+}
+
+export type WhatsAppPhone = {
+  id: string; cc?: string; country_dial_code?: string; display_phone_number?: string;
+  verified_name?: string; status?: string; quality_rating?: string;
+  search_visibility?: string; platform_type?: string; code_verification_status?: string;
+};
+
+/** One-number policy centralized for later multi-number selection support. */
+export function selectPrimaryWhatsAppPhoneNumber(
+  numbers: WhatsAppPhone[], embeddedSignupPhoneNumberId?: string,
+): WhatsAppPhone | undefined {
+  if (embeddedSignupPhoneNumberId) {
+    return numbers.find((number) => number.id === embeddedSignupPhoneNumberId);
+  }
+  return numbers[0];
+}
+
+async function fetchWhatsAppTemplates(
+  wabaId: string, accessToken: string, connectionAttemptId?: string,
+): Promise<{ status: 'READY' | 'ERROR'; items: Array<Record<string, unknown>>; error: string | null }> {
+  try {
+    const fields = 'id,language,name,rejected_reason,status,category,sub_category,last_updated_time,components,quality_score';
+    const response = await graphGet<{ data?: Array<Record<string, unknown>> }>(
+      `/${wabaId}/message_templates?fields=${encodeURIComponent(fields)}&limit=50`, accessToken,
+    );
+    const items = response.data ?? [];
+    logger.info({ event: 'WHATSAPP_TEMPLATES_FETCHED', connectionAttemptId, wabaId, count: items.length }, 'WhatsApp templates fetched');
+    return { status: 'READY', items, error: null };
+  } catch (error) {
+    logger.warn({ event: 'WHATSAPP_TEMPLATES_FETCH_FAILED', connectionAttemptId, wabaId, errorCode: error instanceof AppError ? error.code : 'UNKNOWN' }, 'WhatsApp template synchronization failed');
+    return { status: 'ERROR', items: [], error: 'Template synchronization failed; messaging setup can continue.' };
+  }
+}
+
+export async function ensureWhatsAppPhoneRegistration(
+  phone: WhatsAppPhone, accessToken: string, connectionAttemptId?: string,
+): Promise<'ALREADY_REGISTERED' | 'REGISTERED' | 'UNKNOWN'> {
+  const status = String(phone.status ?? '').toUpperCase();
+  const verification = String(phone.code_verification_status ?? '').toUpperCase();
+  const alreadyRegistered = status === 'CONNECTED';
+  logger.info({ event: 'WHATSAPP_PHONE_REGISTRATION_CHECKED', connectionAttemptId, phoneNumberId: phone.id, status: status || 'UNKNOWN', codeVerificationStatus: verification || 'UNKNOWN', alreadyRegistered }, 'WhatsApp phone registration checked');
+  if (alreadyRegistered) return 'ALREADY_REGISTERED';
+
+  // Meta can omit these fields. Absence is not evidence that registration is
+  // needed, so never create a PIN or call /register speculatively.
+  const explicitlyReadyToRegister = ['VERIFIED', 'COMPLETED'].includes(verification) && Boolean(status);
+  if (!explicitlyReadyToRegister) return 'UNKNOWN';
+  if (!env.meta.whatsappRegistrationPin) {
+    throw new AppError('PHONE_REGISTRATION_REQUIRED', 400, 'Meta reports that this WhatsApp phone still requires Cloud API registration. Configure the secure WhatsApp registration PIN and reconnect.');
+  }
+  const response = await fetch(`${graph()}/${phone.id}/register`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messaging_product: 'whatsapp', pin: env.meta.whatsappRegistrationPin }),
+  });
+  const result = await response.json().catch(() => ({})) as { success?: boolean; error?: { code?: number; error_subcode?: number; message?: string } };
+  if (!response.ok || !result.success) {
+    throw new AppError('PHONE_REGISTRATION_FAILED', 502, result.error?.message ?? 'Meta could not register the WhatsApp phone for Cloud API.', {
+      metaCode: result.error?.code, metaSubcode: result.error?.error_subcode,
+    });
+  }
+  logger.info({ event: 'WHATSAPP_PHONE_REGISTERED', connectionAttemptId, phoneNumberId: phone.id }, 'WhatsApp phone registered for Cloud API');
+  return 'REGISTERED';
 }
 
 /** The Facebook Page authorised for Messenger. Instagram never enters here. */

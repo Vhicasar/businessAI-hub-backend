@@ -1233,6 +1233,30 @@ model ChannelAccount {
   @@index([organizationId])
 }
 
+/// Durable, expiring and single-use correlation for WhatsApp Embedded Signup.
+/// Provider credentials never live here; only non-secret progress identifiers.
+model WhatsAppConnectionAttempt {
+  id                    String   @id @default(uuid())
+  organizationId        String
+  userId                String
+  status                String   @default("PENDING")
+  connectionMode        String
+  wabaId                String?
+  phoneNumberId         String?
+  metaBusinessId        String?
+  oauthCodeReceivedAt   DateTime?
+  sessionInfoReceivedAt DateTime?
+  channelAccountId      String?
+  errorCode             String?
+  expiresAt             DateTime
+  completedAt           DateTime?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@index([organizationId, status])
+  @@index([expiresAt])
+}
+
 model Conversation {
   id               String             @id @default(cuid())
   organizationId   String

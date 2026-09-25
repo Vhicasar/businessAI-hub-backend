@@ -374,7 +374,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
     if (!res.ok) {
       throw new AppError('CHANNEL_MISCONFIGURED', 400, 'WhatsApp token or phone number id invalid');
     }
-    return 'Credentials verified. Vhicasar uses the platform-level WhatsApp webhook; no business-specific callback setup is required.';
+    return 'Credentials verified. Because these credentials belong to a customer-managed Meta App, configure that app with the callback URL and verify token shown below, then subscribe its WhatsApp Webhooks product to the messages field.';
   }
 }
 

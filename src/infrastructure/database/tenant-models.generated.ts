@@ -14,6 +14,7 @@ export const TENANT_MODELS: ReadonlySet<string> = new Set([
   'Customer',
   'CustomerIdentity',
   'ChannelAccount',
+  'WhatsAppConnectionAttempt',
   'Conversation',
   'Message',
   'Call',

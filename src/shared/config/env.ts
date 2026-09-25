@@ -42,6 +42,7 @@ const envSchema = z
     META_WEBHOOK_VERIFY_TOKEN: z.string().min(16).optional().or(z.literal('')),
     /** Embedded Signup configuration id from the Meta app dashboard. */
     META_WHATSAPP_CONFIG_ID: z.string().optional().or(z.literal('')),
+    META_WHATSAPP_REGISTRATION_PIN: z.string().regex(/^\d{6}$/).optional().or(z.literal('')),
     /** Overridable so a staging app can pin an older Graph version. */
     META_GRAPH_VERSION: z.string().default('v21.0'),
     /**
@@ -307,6 +308,7 @@ export const env = {
     appSecret: raw.META_APP_SECRET || '',
     webhookVerifyToken: raw.META_WEBHOOK_VERIFY_TOKEN || '',
     whatsappConfigId: raw.META_WHATSAPP_CONFIG_ID || '',
+    whatsappRegistrationPin: raw.META_WHATSAPP_REGISTRATION_PIN || '',
     graphVersion: raw.META_GRAPH_VERSION,
     /** Base + version, which is what every Graph call actually needs. */
     graphUrl: `${raw.META_GRAPH_BASE_URL.replace(/\/$/, '')}/${raw.META_GRAPH_VERSION}`,
