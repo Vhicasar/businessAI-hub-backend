@@ -103,20 +103,23 @@ export class MetaMessagingAdapter implements ChannelAdapter {
           out.push({
             ...base,
             contentType:
-              kind === 'image' ? 'IMAGE' : kind === 'video' ? 'VIDEO' : kind === 'audio' ? 'AUDIO' : 'DOCUMENT',
+              shared ? 'TEXT' : kind === 'image' ? 'IMAGE' : kind === 'video' ? 'VIDEO' : kind === 'audio' ? 'AUDIO' : 'DOCUMENT',
             messageType: sharedType ?? (kind === 'image' ? 'image' : kind === 'video' ? 'video' : kind === 'audio' ? 'audio' : 'document'),
             text: attachment?.payload?.title,
-            attachments: msg.attachments.map((item) => ({
+            attachments: shared ? undefined : msg.attachments.map((item) => ({
               type: item.type === 'image' || item.type === 'video' || item.type === 'audio' ? item.type : item.type === 'file' ? 'document' : 'unknown',
               url: item.payload?.url, caption: item.payload?.title,
             })),
             referencedContent: shared ? [{
               provider: this.channelType.toLowerCase(), type: sharedType === 'reel_share' ? 'reel' : 'shared_post',
               externalId: attachment?.payload?.external_id, externalProductId: attachment?.payload?.product_id,
-              permalink: url, mediaUrl: url, caption: attachment?.payload?.title,
+              // A share URL is an Instagram/Facebook webpage, not a CDN media
+              // asset. Keep it as a link for the reference card; attempting to
+              // ingest it stores HTML rather than the reel/post.
+              permalink: url, caption: attachment?.payload?.title,
             }] : undefined,
-            mediaUrl: url,
-            media: url
+            mediaUrl: shared ? undefined : url,
+            media: !shared && url
               ? { url }
               : undefined,
           });

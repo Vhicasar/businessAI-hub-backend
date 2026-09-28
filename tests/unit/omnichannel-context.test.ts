@@ -7,7 +7,10 @@ describe('omnichannel message normalization', () => {
   it('preserves a shared Instagram reel as referenced content instead of a document placeholder', () => {
     const adapter = new MetaMessagingAdapter('INSTAGRAM', 'instagram');
     const messages = adapter.parseInbound({ object: 'instagram', entry: [{ messaging: [{ sender: { id: 'customer' }, timestamp: 1, message: { mid: 'm1', attachments: [{ type: 'share', payload: { url: 'https://instagram.com/reel/ABC', title: 'New Air Max arrivals', external_id: 'ABC' } }] } }] }] });
-    expect(messages[0]).toMatchObject({ messageType: 'reel_share', referencedContent: [{ type: 'reel', externalId: 'ABC', caption: 'New Air Max arrivals' }] });
+    expect(messages[0]).toMatchObject({ contentType: 'TEXT', messageType: 'reel_share', referencedContent: [{ type: 'reel', externalId: 'ABC', permalink: 'https://instagram.com/reel/ABC', caption: 'New Air Max arrivals' }] });
+    expect(messages[0]?.media).toBeUndefined();
+    expect(messages[0]?.mediaUrl).toBeUndefined();
+    expect(messages[0]?.attachments).toBeUndefined();
   });
 
   it('normalizes WhatsApp quoted catalog context and catalog orders', () => {
