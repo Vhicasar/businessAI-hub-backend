@@ -19,6 +19,12 @@ export interface NormalizedInbound {
   profileEnrichment?: ProviderProfileEnrichment;
   contentType: MessageContentType;
   text?: string;
+  messageType?: NormalizedMessageType;
+  attachments?: NormalizedAttachment[];
+  replyTo?: MessageReference;
+  referencedContent?: ReferencedContent[];
+  /** Relevant provider fields retained for later resolvers; never credentials. */
+  metadata?: Record<string, unknown>;
   /** Original thread subject for subject-based channels such as email. */
   subject?: string;
   /** Direct media URL when the provider exposes one. */
@@ -35,6 +41,44 @@ export interface NormalizedInbound {
   media?: InboundMedia;
   sentAt?: Date;
   raw?: unknown;
+}
+
+export type NormalizedMessageType =
+  | 'text' | 'image' | 'video' | 'audio' | 'document' | 'shared_media'
+  | 'product_reference' | 'story_reply' | 'post_reply' | 'reel_share'
+  | 'catalog_item' | 'link' | 'reply' | 'mixed' | 'unknown';
+
+export interface NormalizedAttachment {
+  externalId?: string;
+  type: 'image' | 'video' | 'audio' | 'document' | 'link' | 'unknown';
+  url?: string;
+  thumbnailUrl?: string;
+  filename?: string;
+  mimeType?: string;
+  caption?: string;
+}
+
+export interface MessageReference {
+  externalMessageId: string;
+  text?: string;
+  mediaType?: string;
+}
+
+export interface ReferencedContent {
+  provider: string;
+  externalId?: string;
+  externalPostId?: string;
+  externalProductId?: string;
+  catalogId?: string;
+  type: string;
+  caption?: string;
+  text?: string;
+  mediaUrl?: string;
+  thumbnailUrl?: string;
+  permalink?: string;
+  productUrl?: string;
+  sku?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export type ProfileEnrichmentReason =

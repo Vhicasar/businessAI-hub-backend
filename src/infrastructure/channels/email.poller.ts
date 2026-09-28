@@ -201,6 +201,7 @@ async function pollAccount(account: {
         const subject = parsed.subject?.trim();
         const bodyText = (parsed.text ?? '').trim().slice(0, 4000);
         const text = subject ? `${subject}\n\n${bodyText}` : bodyText || '[empty email]';
+        const links = text.match(/https?:\/\/[^\s<>"']+/g) ?? [];
 
         await requestContext.run(
           { requestId: randomUUID(), organizationId: account.organizationId },
@@ -216,6 +217,12 @@ async function pollAccount(account: {
                   ...(parsed.from?.value?.[0]?.name ? { firstName: parsed.from.value[0].name.split(/\s+/)[0], lastName: parsed.from.value[0].name.split(/\s+/).slice(1).join(' ') || undefined } : {}),
                 },
                 contentType: 'TEXT',
+                messageType: parsed.attachments.length ? 'mixed' : links.length ? 'link' : 'text',
+                attachments: parsed.attachments.slice(0, 10).map((attachment) => ({
+                  type: attachment.contentType.startsWith('image/') ? 'image' : attachment.contentType.startsWith('video/') ? 'video' : attachment.contentType.startsWith('audio/') ? 'audio' : 'document',
+                  filename: attachment.filename ?? undefined, mimeType: attachment.contentType,
+                })),
+                referencedContent: links.map((url) => ({ provider: 'email', type: 'link', productUrl: url, permalink: url })),
                 text,
                 subject: subject || undefined,
                 sentAt: parsed.date ?? receivedAt ?? undefined,

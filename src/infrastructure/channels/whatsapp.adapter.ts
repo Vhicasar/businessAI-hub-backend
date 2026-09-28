@@ -36,6 +36,7 @@ interface WaWebhookBody {
           id: string;
           timestamp?: string;
           type: string;
+          context?: { id?: string; from?: string; referred_product?: { catalog_id?: string; product_retailer_id?: string } };
           text?: { body?: string };
           /// Media arrives as an id, not a link: it is exchanged for a
           /// short-lived URL using the account's own token.
@@ -44,6 +45,7 @@ interface WaWebhookBody {
           video?: { caption?: string; id?: string; mime_type?: string };
           audio?: { id?: string; mime_type?: string };
           location?: { latitude: number; longitude: number };
+          order?: { catalog_id?: string; product_items?: Array<{ product_retailer_id?: string; quantity?: string; item_price?: string; currency?: string }> };
         }[];
         /// Receipts for messages we sent earlier — not messages themselves.
         statuses?: {
@@ -132,15 +134,22 @@ export class WhatsAppAdapter implements ChannelAdapter {
             senderProfile: { phone: msg.from, ...(name ? { firstName: name.split(/\s+/)[0], lastName: name.split(/\s+/).slice(1).join(' ') || undefined } : {}) },
             sentAt: msg.timestamp ? new Date(Number(msg.timestamp) * 1000) : undefined,
             raw: msg,
+            replyTo: msg.context?.id ? { externalMessageId: msg.context.id } : undefined,
+            referencedContent: msg.context?.referred_product ? [{
+              provider: 'whatsapp', type: 'catalog_item', catalogId: msg.context.referred_product.catalog_id,
+              externalProductId: msg.context.referred_product.product_retailer_id,
+              sku: msg.context.referred_product.product_retailer_id,
+            }] : undefined,
           };
           switch (msg.type) {
             case 'text':
-              out.push({ ...base, contentType: 'TEXT', text: msg.text?.body });
+              out.push({ ...base, contentType: 'TEXT', text: msg.text?.body, messageType: msg.context?.id ? 'reply' : 'text' });
               break;
             case 'image':
               out.push({
                 ...base,
                 contentType: 'IMAGE',
+                messageType: 'image',
                 text: msg.image?.caption,
                 media: msg.image?.id
                   ? { externalId: msg.image.id, mimeType: msg.image.mime_type }
@@ -151,6 +160,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
               out.push({
                 ...base,
                 contentType: 'VIDEO',
+                messageType: 'video',
                 text: msg.video?.caption,
                 media: msg.video?.id
                   ? { externalId: msg.video.id, mimeType: msg.video.mime_type }
@@ -168,6 +178,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
                     }
                   : undefined,
                 contentType: 'DOCUMENT',
+                messageType: 'document',
                 text: msg.document?.caption ?? msg.document?.filename,
               });
               break;
@@ -176,9 +187,23 @@ export class WhatsAppAdapter implements ChannelAdapter {
               out.push({
                 ...base,
                 contentType: 'AUDIO',
+                messageType: 'audio',
                 media: msg.audio?.id
                   ? { externalId: msg.audio.id, mimeType: msg.audio.mime_type }
                   : undefined,
+              });
+              break;
+            case 'order':
+              out.push({
+                ...base,
+                contentType: 'TEXT',
+                messageType: 'catalog_item',
+                text: 'Customer shared WhatsApp catalog items.',
+                referencedContent: (msg.order?.product_items ?? []).map((item) => ({
+                  provider: 'whatsapp', type: 'catalog_item', catalogId: msg.order?.catalog_id,
+                  externalProductId: item.product_retailer_id, sku: item.product_retailer_id,
+                  metadata: { quantity: item.quantity, itemPrice: item.item_price, currency: item.currency },
+                })),
               });
               break;
             case 'location':

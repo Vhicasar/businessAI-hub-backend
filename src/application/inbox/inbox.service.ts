@@ -22,6 +22,8 @@ import type {
 import { ingestInboundMedia } from './inbox-media.service';
 import { markChannelConnected, markChannelError, markOutboundMessageSent } from './channel-health.service';
 import { workflowService } from '../crm/workflow.service';
+import { messageContextResolver, type ResolvedMessageContext } from './message-context-resolver.service';
+import { filesService } from '../files/files.service';
 
 export const listConversationsSchema = z.object({
   status: z.enum(['OPEN', 'PENDING', 'RESOLVED', 'SNOOZED', 'SPAM']).optional(),
@@ -382,6 +384,24 @@ export const inboxService = {
     });
     if (existing) return 'DUPLICATE';
 
+    const replyTo = inbound.replyTo?.externalMessageId
+      ? await prisma.message.findFirst({
+          where: { conversationId: conversation.id, providerMessageId: inbound.replyTo.externalMessageId },
+          select: { id: true },
+        })
+      : null;
+    let richContext: ResolvedMessageContext | null = null;
+    try {
+      richContext = await messageContextResolver.resolve({
+        organizationId: account.organizationId,
+        conversationId: conversation.id,
+        channelType: account.channelType,
+        inbound,
+      });
+    } catch (error) {
+      logger.warn({ error, event: 'product_match_failed', conversationId: conversation.id, channelType: account.channelType }, 'Message context resolution failed');
+    }
+
     let message;
     try {
       message = await prisma.message.create({
@@ -394,6 +414,10 @@ export const inboxService = {
           body: inbound.text ?? null,
           status: 'DELIVERED',
           providerMessageId: inbound.providerMessageId,
+          replyToId: replyTo?.id ?? null,
+          normalizedType: richContext?.messageType ?? inbound.messageType ?? inbound.contentType.toLowerCase(),
+          providerMetadata: messageContextResolver.providerMetadata(inbound),
+          contextSnapshot: richContext as unknown as Prisma.InputJsonValue ?? undefined,
           sentAt: inbound.sentAt ?? new Date(),
         },
       });
@@ -478,16 +502,22 @@ export const inboxService = {
       identity.customer.isProvisional = false;
     }
 
-    await prisma.$transaction([
+    const preview = inbound.text?.trim()
+      || richContext?.references[0]?.caption
+      || richContext?.references[0]?.text
+      || (richContext?.products[0] ? `Shared product: ${richContext.products[0].name}` : null)
+      || `Customer shared ${richContext?.messageType?.replace(/_/g, ' ') ?? inbound.contentType.toLowerCase()}`;
+    const [updatedConversation] = await prisma.$transaction([
       prisma.conversation.update({
         where: { id: conversation.id },
         data: {
           status: conversation.status === 'RESOLVED' ? 'OPEN' : conversation.status,
           lastMessageAt: message.createdAt,
-          lastMessageText: inbound.text?.slice(0, 200) ?? `[${inbound.contentType.toLowerCase()}]`,
+          lastMessageText: preview.slice(0, 200),
           ...(inbound.subject?.trim() ? { subject: inbound.subject.trim() } : {}),
           unreadCount: { increment: 1 },
         },
+        select: { unreadCount: true, lastMessageAt: true, lastMessageText: true },
       }),
       prisma.customer.update({
         where: { id: identity.customerId },
@@ -503,8 +533,15 @@ export const inboxService = {
         authorType: message.authorType,
         contentType: message.contentType,
         body: message.body,
+        normalizedType: message.normalizedType,
+        contextSnapshot: message.contextSnapshot,
+        attachments: [],
+        status: message.status,
+        errorMessage: message.errorMessage,
+        aiGenerated: message.aiGenerated,
         createdAt: message.createdAt,
       },
+      conversation: updatedConversation,
     };
     emitToOrg(account.organizationId, SOCKET_EVENTS.INBOX_MESSAGE_NEW, payload);
     emitToConversation(conversation.id, SOCKET_EVENTS.INBOX_MESSAGE_NEW, payload);
@@ -674,9 +711,8 @@ export const inboxService = {
         data: { status: 'SENT', providerMessageId: result.providerMessageId, sentAt: new Date() },
       });
       await markOutboundMessageSent(conversation.channelAccount.id);
-      // A send that worked is the same proof a webhook is: the credentials are
-      // good. WhatsApp remains SETUP_REQUIRED until an inbound signed webhook
-      // proves that Meta can reach us; outbound success alone is not inbound proof.
+      // A successful send proves most credentials are usable, but it cannot
+      // prove that a customer-managed WhatsApp callback was configured.
       if (conversation.channelAccount.channelType !== 'WHATSAPP' && conversation.channelAccount.status !== 'CONNECTED') {
         await markChannelConnected(conversation.channelAccount.id);
       }
@@ -768,7 +804,16 @@ export const inboxService = {
             authorType: true,
             authorUserId: true,
             contentType: true,
+            normalizedType: true,
             body: true,
+            contextSnapshot: true,
+            replyTo: { select: { id: true, body: true, normalizedType: true, contentType: true } },
+            attachments: {
+              select: {
+                id: true, caption: true,
+                file: { select: { id: true, fileName: true, mimeType: true, sizeBytes: true } },
+              },
+            },
             status: true,
             aiGenerated: true,
             errorMessage: true,
@@ -778,7 +823,20 @@ export const inboxService = {
       },
     });
     if (!conversation) throw new NotFoundError('Conversation');
-    return conversation;
+    const attachmentFileIds = conversation.messages.flatMap((message) => message.attachments.map((attachment) => attachment.file.id));
+    const urls = await filesService.urlMap(attachmentFileIds);
+    return {
+      ...conversation,
+      messages: conversation.messages.map((message) => ({
+        ...message,
+        attachments: message.attachments.map((attachment) => ({
+          id: attachment.id, caption: attachment.caption,
+          fileId: attachment.file.id, fileName: attachment.file.fileName,
+          mimeType: attachment.file.mimeType, sizeBytes: attachment.file.sizeBytes,
+          url: urls.get(attachment.file.id) ?? null,
+        })),
+      })),
+    };
   },
 
   // ---------------------------------------------------------------- actions

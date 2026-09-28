@@ -1,5 +1,5 @@
 import type {
-  ChannelAccountRef, ChannelAdapter, NormalizedInbound, OutboundPayload,
+  ChannelAccountRef, ChannelAdapter, DownloadedMedia, InboundMedia, NormalizedInbound, OutboundPayload,
   SendResult, WebhookRequestLike,
 } from '../../application/inbox/channel-adapter';
 import { AppError } from '../../shared/errors';
@@ -10,6 +10,8 @@ type TwilioInbound = {
   From?: string;
   Body?: string;
   NumMedia?: string;
+  [key: `MediaUrl${number}`]: string | undefined;
+  [key: `MediaContentType${number}`]: string | undefined;
 };
 
 /** Twilio Programmable SMS adapter. */
@@ -24,14 +26,34 @@ export class SmsAdapter implements ChannelAdapter {
     const message = body as TwilioInbound;
     const id = message.MessageSid ?? message.SmsMessageSid;
     if (!id || !message.From) return [];
+    const mediaCount = Math.min(Number(message.NumMedia ?? 0), 10);
+    const attachments = Array.from({ length: mediaCount }, (_, index) => ({
+      type: (message[`MediaContentType${index}`]?.startsWith('video/') ? 'video' : message[`MediaContentType${index}`]?.startsWith('audio/') ? 'audio' : message[`MediaContentType${index}`]?.startsWith('image/') ? 'image' : 'document') as 'image' | 'video' | 'audio' | 'document',
+      url: message[`MediaUrl${index}`], mimeType: message[`MediaContentType${index}`],
+    }));
     return [{
       providerMessageId: id,
       senderExternalId: message.From,
       senderProfile: { phone: message.From },
       contentType: Number(message.NumMedia ?? 0) > 0 ? 'IMAGE' : 'TEXT',
+      messageType: mediaCount ? (message.Body?.trim() ? 'mixed' : 'image') : (/https?:\/\//i.test(message.Body ?? '') ? 'link' : 'text'),
+      attachments,
+      media: attachments[0]?.url ? { url: attachments[0].url, mimeType: attachments[0].mimeType } : undefined,
+      referencedContent: (message.Body?.match(/https?:\/\/[^\s]+/g) ?? []).map((url) => ({ provider: 'sms', type: 'link', productUrl: url, permalink: url })),
       text: message.Body,
       raw: body,
     }];
+  }
+
+  async downloadMedia(media: InboundMedia, account: ChannelAccountRef): Promise<DownloadedMedia | null> {
+    if (!media.url || !account.credentials.accountSid || !account.credentials.authToken) return null;
+    const response = await fetch(media.url, {
+      headers: { Authorization: `Basic ${Buffer.from(`${account.credentials.accountSid}:${account.credentials.authToken}`).toString('base64')}` },
+    });
+    if (!response.ok) return null;
+    const mimeType = response.headers.get('content-type')?.split(';')[0] ?? media.mimeType ?? 'application/octet-stream';
+    const extension = mimeType.split('/')[1]?.replace(/[^a-z0-9]/gi, '') || 'bin';
+    return { buffer: Buffer.from(await response.arrayBuffer()), mimeType, filename: `mms-${Date.now()}.${extension}` };
   }
 
   async sendMessage(payload: OutboundPayload, account: ChannelAccountRef): Promise<SendResult> {

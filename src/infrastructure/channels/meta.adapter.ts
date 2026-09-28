@@ -27,7 +27,8 @@ interface MetaMessagingEvent {
     mid?: string;
     text?: string;
     is_echo?: boolean;
-    attachments?: { type?: string; payload?: { url?: string } }[];
+    reply_to?: { mid?: string };
+    attachments?: { type?: string; payload?: { url?: string; title?: string; external_id?: string; product_id?: string } }[];
   };
   postback?: { title?: string; payload?: string };
 }
@@ -89,18 +90,34 @@ export class MetaMessagingAdapter implements ChannelAdapter {
           senderExternalId: senderId,
           sentAt: event.timestamp ? new Date(event.timestamp) : undefined,
           raw: event,
+          replyTo: msg.reply_to?.mid ? { externalMessageId: msg.reply_to.mid } : undefined,
         };
         if (msg.text) {
-          out.push({ ...base, contentType: 'TEXT', text: msg.text });
+          out.push({ ...base, contentType: 'TEXT', text: msg.text, messageType: msg.reply_to?.mid ? 'reply' as const : 'text' as const });
         } else if (msg.attachments?.length) {
-          const kind = msg.attachments[0]?.type;
+          const attachment = msg.attachments[0];
+          const kind = attachment?.type;
+          const url = attachment?.payload?.url;
+          const shared = kind === 'share' || kind === 'fallback';
+          const sharedType = /\/reel\//i.test(url ?? '') ? 'reel_share' : shared ? 'shared_media' : undefined;
           out.push({
             ...base,
             contentType:
               kind === 'image' ? 'IMAGE' : kind === 'video' ? 'VIDEO' : kind === 'audio' ? 'AUDIO' : 'DOCUMENT',
-            mediaUrl: msg.attachments[0]?.payload?.url,
-            media: msg.attachments[0]?.payload?.url
-              ? { url: msg.attachments[0]!.payload!.url }
+            messageType: sharedType ?? (kind === 'image' ? 'image' : kind === 'video' ? 'video' : kind === 'audio' ? 'audio' : 'document'),
+            text: attachment?.payload?.title,
+            attachments: msg.attachments.map((item) => ({
+              type: item.type === 'image' || item.type === 'video' || item.type === 'audio' ? item.type : item.type === 'file' ? 'document' : 'unknown',
+              url: item.payload?.url, caption: item.payload?.title,
+            })),
+            referencedContent: shared ? [{
+              provider: this.channelType.toLowerCase(), type: sharedType === 'reel_share' ? 'reel' : 'shared_post',
+              externalId: attachment?.payload?.external_id, externalProductId: attachment?.payload?.product_id,
+              permalink: url, mediaUrl: url, caption: attachment?.payload?.title,
+            }] : undefined,
+            mediaUrl: url,
+            media: url
+              ? { url }
               : undefined,
           });
         }

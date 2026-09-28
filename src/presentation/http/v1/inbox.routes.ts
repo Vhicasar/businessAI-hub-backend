@@ -20,7 +20,9 @@ import { allowanceFor } from '../../../application/inbox/channel-allowance.servi
 import type { ChannelType } from '@prisma/client';
 import { env } from '../../../shared/config/env';
 import { logger } from '../../../shared/logger';
-import { markChannelAwaitingWebhook, markChannelSetupFailed, markWebhookSubscription } from '../../../application/inbox/channel-health.service';
+import { markChannelConnected, markChannelSetupFailed, markWebhookSubscription } from '../../../application/inbox/channel-health.service';
+import { messageContextResolver } from '../../../application/inbox/message-context-resolver.service';
+import { prisma } from '../../../infrastructure/database/prisma';
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<void>): RequestHandler =>
@@ -83,6 +85,38 @@ inboxRoutes.post(
     await inboxService.markRead(req.params.id as string);
     res.json({ success: true, data: { message: 'Marked read' } });
   })
+);
+
+inboxRoutes.patch(
+  '/messages/:id/product-context',
+  requirePermission('inbox.reply'),
+  validate({ body: z.object({ productId: z.string().min(1), saveMapping: z.boolean().default(true) }) }),
+  wrap(async (req, res) => {
+    const data = await messageContextResolver.correctProduct({
+      organizationId: req.auth!.organizationId!, messageId: req.params.id as string,
+      productId: req.body.productId, saveMapping: req.body.saveMapping,
+    });
+    if (!data) throw new AppError('PRODUCT_CONTEXT_NOT_FOUND', 404, 'The message or product could not be found.');
+    res.json({ success: true, data });
+  }),
+);
+
+inboxRoutes.get(
+  '/product-context/options',
+  requirePermission('inbox.reply'),
+  validate({ query: z.object({ search: z.string().trim().min(2).max(100) }) }),
+  wrap(async (req, res) => {
+    const search = String(req.query.search);
+    const items = await prisma.product.findMany({
+      where: {
+        organizationId: req.auth!.organizationId!, deletedAt: null, status: 'ACTIVE', sellable: true,
+        OR: [{ name: { contains: search, mode: 'insensitive' } }, { variants: { some: { sku: { contains: search, mode: 'insensitive' }, deletedAt: null } } }],
+      },
+      select: { id: true, name: true, variants: { where: { deletedAt: null, isActive: true }, take: 1, select: { sku: true } } },
+      take: 20,
+    });
+    res.json({ success: true, data: { items } });
+  }),
 );
 
 inboxRoutes.post(
@@ -157,14 +191,6 @@ inboxRoutes.post(
   wrap(async (req, res) => {
     const data = await channelsService.connect(req.auth!.organizationId!, req.body);
     res.status(201).json({ success: true, data });
-  })
-);
-
-inboxRoutes.post(
-  '/channels/:id/diagnostic',
-  requirePermission('inbox.manage_channels', 'settings.manage_integrations'),
-  wrap(async (req, res) => {
-    res.json({ success: true, data: await channelsService.diagnose(req.params.id as string) });
   })
 );
 
@@ -251,7 +277,7 @@ inboxRoutes.post(
       metaBusinessId: body.metaBusinessId, connectionMode: body.connectionMode,
     });
     if (attempt.alreadyCompletedAccountId) {
-      res.json({ success: true, data: { accountId: attempt.alreadyCompletedAccountId, status: 'SETUP_REQUIRED', replayed: true } });
+      res.json({ success: true, data: { accountId: attempt.alreadyCompletedAccountId, status: 'CONNECTED', replayed: true } });
       return;
     }
     const wabaId = body.wabaId ?? attempt.wabaId;
@@ -274,11 +300,11 @@ inboxRoutes.post(
       logger.info({ event: 'WHATSAPP_WABA_SUBSCRIBE_STARTED', connectionAttemptId: body.connectionAttemptId, tenantId: connection.organizationId }, 'WhatsApp WABA subscription started');
       await subscribeWebhooks(connection);
       await markWebhookSubscription(account.id, 'READY');
-      await markChannelAwaitingWebhook(account.id, 'WHATSAPP');
+      await markChannelConnected(account.id);
       logger.info({ event: 'WHATSAPP_WABA_SUBSCRIBED', connectionAttemptId: body.connectionAttemptId, tenantId: connection.organizationId, channelAccountId: account.id }, 'WhatsApp WABA subscription verified');
-      logger.info({ event: 'WHATSAPP_CONNECTION_READY', connectionAttemptId: body.connectionAttemptId, tenantId: connection.organizationId, channelAccountId: account.id }, 'WhatsApp connection awaiting first signed webhook');
+      logger.info({ event: 'WHATSAPP_CONNECTION_READY', connectionAttemptId: body.connectionAttemptId, tenantId: connection.organizationId, channelAccountId: account.id }, 'WhatsApp connection ready');
       await finishWhatsAppConnectionAttempt(body.connectionAttemptId, account.id);
-      res.json({ success: true, data: { accountId: account.id, accountName: account.name, status: 'SETUP_REQUIRED' } });
+      res.json({ success: true, data: { accountId: account.id, accountName: account.name, status: 'CONNECTED' } });
     } catch (error) {
       if (savedAccountId) {
         await markWebhookSubscription(savedAccountId, 'FAILED');

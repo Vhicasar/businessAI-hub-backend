@@ -18,6 +18,7 @@ import { notifyService } from '../notifications/notify.service';
 import { currentOrgId, resolveEntitlements } from '../billing/entitlements';
 import { env } from '../../shared/config/env';
 import { filesService } from '../files/files.service';
+import { messageContextResolver } from '../inbox/message-context-resolver.service';
 
 /** Clamp a model-provided priority to the ticket priority enum. */
 function normalizePriority(p?: string): 'LOW' | 'MEDIUM' | 'HIGH' | 'URGENT' {
@@ -61,7 +62,7 @@ async function conversationTranscript(conversationId: string, limit = 50) {
       messages: {
         orderBy: { createdAt: 'desc' },
         take: limit,
-        select: { direction: true, authorType: true, body: true, contentType: true, createdAt: true },
+        select: { direction: true, authorType: true, body: true, contentType: true, normalizedType: true, contextSnapshot: true, createdAt: true },
       },
     },
   });
@@ -69,7 +70,15 @@ async function conversationTranscript(conversationId: string, limit = 50) {
 
   const lines = [...conversation.messages].reverse().map((m) => {
     const who = m.direction === 'INBOUND' ? 'Customer' : m.authorType === 'BOT' ? 'Bot' : 'Agent';
-    return `${who}: ${m.body ?? `[${m.contentType.toLowerCase()}]`}`;
+    const context = (m.contextSnapshot && typeof m.contextSnapshot === 'object' && !Array.isArray(m.contextSnapshot))
+      ? m.contextSnapshot as Record<string, unknown> : null;
+    const products = context && Array.isArray(context.products)
+      ? (context.products as Array<{ name?: string }>).map((product) => product.name).filter(Boolean).join(', ')
+      : '';
+    const fallback = m.normalizedType !== 'text'
+      ? `Customer shared ${m.normalizedType.replace(/_/g, ' ')}${products ? ` referring to: ${products}` : ''}.`
+      : `[${m.contentType.toLowerCase()}]`;
+    return `${who}: ${m.body ?? fallback}`;
   });
   return { conversation, transcript: lines.join('\n') };
 }
@@ -466,6 +475,9 @@ export const aiService = {
     const { provider, ownKey } = await resolveAi();
     if (!ownKey) await aiCredits.consume();
     const { conversation, transcript } = await conversationTranscript(conversationId);
+    const referencedProducts = await messageContextResolver.conversationProducts(conversation.organizationId, conversationId);
+    const liveProductContext = referencedProducts.map((product) => `${product.name} (${Math.round(product.confidence * 100)}% ${product.matchMethod}): ` +
+      product.variants.map((variant) => `${variant.name ?? 'Default'} ${variant.currency} ${variant.price}, available ${variant.available}`).join('; ')).join('\n');
 
     const messages: AiMessage[] = [
       {
@@ -474,12 +486,13 @@ export const aiService = {
           'You draft replies for a customer-support agent. Write ONE reply the agent could ' +
           'send as-is: helpful, warm, concise (under 80 words), matching the customer\'s language. ' +
           'Never invent order numbers, prices, stock levels or policies — if information is ' +
-          'missing, the draft should ask for it or say the agent will check. ' +
+          'missing, the draft should ask for it or say the agent will check. Use only the live ' +
+          'referenced-product data supplied below; ask for clarification below 90% confidence. ' +
           'Output only the reply text.',
       },
       {
         role: 'user',
-        content: `Channel: ${conversation.channelAccount.channelType}\nCustomer profile: ${conversation.customer.aiSummary ?? 'n/a'}\n\nConversation:\n${transcript}\n\nDraft the next agent reply.`,
+        content: `Channel: ${conversation.channelAccount.channelType}\nCustomer profile: ${conversation.customer.aiSummary ?? 'n/a'}\n\nReferenced products (live):\n${liveProductContext || '(none)'}\n\nConversation:\n${transcript}\n\nDraft the next agent reply.`,
       },
     ];
     const suggestion = (await provider.complete(messages, { maxTokens: 250, temperature: 0.5, dataSources: ['vhicasar_business'] })).trim();
@@ -617,6 +630,13 @@ export const aiService = {
         return `- ${p.name} [productId=${p.id}; images=${p.images.length}]: ${price}${desc}`;
       })
       .join('\n');
+    const referencedProducts = await messageContextResolver.conversationProducts(conversation.organizationId, conversationId);
+    const referencedProductsCtx = referencedProducts.map((product) =>
+      `- ${product.name} [productId=${product.productId}; confidence=${product.confidence}; method=${product.matchMethod}]\n` +
+      product.variants.map((variant) =>
+        `  - ${variant.name ?? 'Default'} [variantId=${variant.id}; sku=${variant.sku}]: ${variant.currency} ${variant.price.toLocaleString()}; available=${variant.available}; options=${JSON.stringify(variant.options ?? {})}`
+      ).join('\n')
+    ).join('\n');
 
     // Property recommendations and stay availability. IDs are supplied only as
     // machine-action handles; customer-facing replies use titles/references.
@@ -762,6 +782,12 @@ export const aiService = {
             'placing the later confirmed order. Mention relevant active promotions from OFFERS without ' +
             'inventing eligibility. If a supplied code is absent from OFFERS, explain it cannot be ' +
             'verified and ask them to check it. If unsure whether they confirmed, ask again and omit "order".\n' +
+            'REFERENCED PRODUCTS contains the live catalog records for items the customer shared or ' +
+            'referred to earlier. Use it to resolve words such as this, it, both, the first one, colours ' +
+            'and sizes. Availability is the current available value, not a promise from an old message. ' +
+            'If a match confidence is below 0.90, or multiple items/variants fit the request, ask one ' +
+            'clear clarification question and do not create an order. Never treat sharing, price or ' +
+            'availability questions as order confirmation.\n' +
             'RECOMMENDATIONS: infer practical preferences from the customer description (use case, ' +
             'location, budget, bedrooms, amenities, dates, product features) and recommend at most three ' +
             'best matches from PRODUCTS and PROPERTIES. Explain each match briefly using only listed facts. ' +
@@ -796,6 +822,7 @@ export const aiService = {
             'ALWAYS include a friendly "reply", even when handoff is true.\n\n' +
             `KNOWLEDGE:\n${knowledge || '(none retrieved for this message)'}\n\n` +
             `PRODUCTS:\n${productsCtx || '(no products available)'}\n\n` +
+            `REFERENCED PRODUCTS (live inventory):\n${referencedProductsCtx || '(none resolved)'}\n\n` +
             `PROPERTIES:\n${propertiesCtx || '(no properties available)'}\n\n` +
             `OFFERS:\n${offersCtx || '(no active offers)'}\n\n` +
             `PAYMENTS:\n${payCtx.text}\n\n` +

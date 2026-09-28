@@ -142,6 +142,9 @@ const messageSchema = z.object({
   visitorId: z.string().min(10).max(64),
   text: z.string().trim().min(1).max(2000),
   clientMessageId: z.string().trim().regex(/^[a-zA-Z0-9_-]{8,80}$/).optional(),
+  pageUrl: z.string().url().max(2000).optional(),
+  productId: z.string().max(100).optional(),
+  productName: z.string().trim().max(200).optional(),
 });
 
 webchatRoutes.post(
@@ -165,6 +168,12 @@ webchatRoutes.post(
             senderExternalId: req.body.visitorId,
             contentType: 'TEXT',
             text: req.body.text,
+            messageType: req.body.productId || req.body.pageUrl ? 'mixed' : 'text',
+            referencedContent: req.body.productId || req.body.pageUrl ? [{
+              provider: 'webchat', type: req.body.productId ? 'product_reference' : 'page_context',
+              externalProductId: req.body.productId, productUrl: req.body.pageUrl,
+              permalink: req.body.pageUrl, text: req.body.productName,
+            }] : undefined,
           }
         )
     );

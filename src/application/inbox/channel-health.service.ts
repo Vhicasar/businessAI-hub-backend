@@ -149,19 +149,6 @@ export async function markChannelConnected(accountId: string): Promise<void> {
     .catch((err) => logger.warn({ err, accountId }, 'Could not mark channel connected'));
 }
 
-/** Subscription succeeded, but no signed provider delivery has proved the route yet. */
-export async function markChannelAwaitingWebhook(accountId: string, channelType: string): Promise<void> {
-  await prismaUnscoped.channelAccount.update({
-    where: { id: accountId },
-    data: {
-      status: 'SETUP_REQUIRED',
-      isActive: false,
-      lastError: `${channelLabel(channelType)} authorization and provider subscription succeeded. Waiting for the first signed webhook delivery.`,
-      lastErrorAt: new Date(),
-    },
-  });
-}
-
 /** Record a real inbound customer message separately from status-only webhooks. */
 export async function markInboundMessageReceived(accountId: string): Promise<void> {
   const account = await prismaUnscoped.channelAccount.findUnique({

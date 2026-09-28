@@ -10,7 +10,7 @@ import {
   subscribeWebhooks,
 } from '../../application/inbox/channel-oauth.service';
 import { channelsService } from '../../application/inbox/channels.service';
-import { markChannelAwaitingWebhook, markChannelConnected, markChannelSetupFailed, markWebhookSubscription } from '../../application/inbox/channel-health.service';
+import { markChannelConnected, markChannelSetupFailed, markWebhookSubscription } from '../../application/inbox/channel-health.service';
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<void>): RequestHandler =>
@@ -95,8 +95,7 @@ channelOAuthRoutes.get(
       try {
         await subscribeWebhooks(connection);
         await markWebhookSubscription(account.id, 'READY');
-        if (channelType === 'WHATSAPP') await markChannelAwaitingWebhook(account.id, channelType);
-        else await markChannelConnected(account.id);
+        await markChannelConnected(account.id);
       } catch (subscribeError) {
         await markWebhookSubscription(account.id, 'FAILED');
         await markChannelSetupFailed(
@@ -108,7 +107,7 @@ channelOAuthRoutes.get(
       }
 
       res.redirect(
-        `${settings}&connect=${channelType === 'WHATSAPP' ? 'setup' : 'success'}&channel=${channelType.toLowerCase()}` +
+        `${settings}&connect=success&channel=${channelType.toLowerCase()}` +
           `&account=${encodeURIComponent(account.name)}`
       );
     } catch (err) {

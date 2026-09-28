@@ -34,6 +34,7 @@ export const TENANT_MODELS: ReadonlySet<string> = new Set([
   'ProductCategory',
   'Brand',
   'Product',
+  'ProductExternalReference',
   'ProductVariant',
   'PriceList',
   'ProductBundle',

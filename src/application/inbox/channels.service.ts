@@ -6,7 +6,6 @@ import { decrypt, encrypt } from '../../shared/crypto';
 import { env } from '../../shared/config/env';
 import {
   newWebhookSecret,
-  inspectWhatsAppReadiness,
   oauthUnavailableReason,
   subscribeWebhooks,
   supportsOAuth,
@@ -18,7 +17,7 @@ import { getAdapter, supportedChannels } from '../../infrastructure/channels/reg
 import { activityService } from '../crm/activity.service';
 import { requestContext } from '../../shared/context';
 import { logger } from '../../shared/logger';
-import { friendlyMessage, markChannelAwaitingWebhook, markChannelConnected, markChannelError, markChannelSetupFailed, markWebhookSubscription } from './channel-health.service';
+import { markChannelConnected, markChannelSetupFailed, markWebhookSubscription } from './channel-health.service';
 import {
   allowanceFor,
   allowanceSummary,
@@ -467,94 +466,6 @@ export const channelsService = {
       webhookUrl,
       setupNote,
     };
-  },
-
-  /** Re-check credentials and repair provider-side webhook registration. */
-  async diagnose(accountId: string) {
-    const account = await prisma.channelAccount.findFirst({ where: { id: accountId, deletedAt: null } });
-    if (!account) throw new NotFoundError('Channel account');
-    const credentials = account.credentialsEnc
-      ? JSON.parse(decrypt(account.credentialsEnc)) as Record<string, string>
-      : {};
-    const adapter = getAdapter(account.channelType);
-    const correlationId = randomUUID();
-    logger.info({ correlationId, accountId, channelType: account.channelType, phase: 'started' }, 'Channel diagnostic');
-    try {
-      let whatsappReadiness = account.channelType === 'WHATSAPP'
-        ? await inspectWhatsAppReadiness(credentials)
-        : null;
-      const whatsappOperationalChecks = () => {
-        const metadata = account.metadata && typeof account.metadata === 'object' && !Array.isArray(account.metadata)
-          ? account.metadata as Record<string, unknown> : {};
-        return whatsappReadiness ? {
-          ...whatsappReadiness,
-          callbackUrlExpected: `${env.API_BASE_URL}/api/webhooks/whatsapp`,
-          webhookVerifyTokenConfigured: Boolean(env.meta.webhookVerifyToken),
-          metaDashboardCallback: 'UNKNOWN',
-          messagesWebhookField: 'UNKNOWN',
-          actualInboundPostObserved: Boolean(account.lastWebhookAt),
-          actualInboundMessageObserved: Boolean(metadata.lastInboundMessageAt),
-          lastInboundMessageAt: metadata.lastInboundMessageAt ?? null,
-          lastOutboundMessageAt: metadata.lastOutboundMessageAt ?? null,
-        } : null;
-      };
-      if (adapter.onAccountConnected) {
-        await adapter.onAccountConnected(
-          { id: account.id, organizationId: account.organizationId, externalId: account.externalId, credentials, webhookSecret: account.webhookSecret },
-          `${env.API_BASE_URL}/api/webhooks/${account.channelType === 'FACEBOOK_MESSENGER' ? 'messenger' : account.channelType.toLowerCase()}`,
-        );
-      }
-      if (['WHATSAPP', 'FACEBOOK_MESSENGER', 'INSTAGRAM'].includes(account.channelType)) {
-        await subscribeWebhooks({
-          organizationId: account.organizationId,
-          userId: requestContext.get()?.userId ?? 'diagnostic',
-          returnTo: '', channelType: account.channelType, externalId: account.externalId,
-          displayName: account.name, credentials,
-          metadata: (account.metadata as Record<string, unknown> | null) ?? {},
-        });
-        await markWebhookSubscription(account.id, 'READY');
-        if (account.channelType === 'WHATSAPP') {
-          whatsappReadiness = await inspectWhatsAppReadiness(credentials);
-          const oldMetadata = account.metadata && typeof account.metadata === 'object' && !Array.isArray(account.metadata)
-            ? account.metadata as Record<string, unknown> : {};
-          await prisma.channelAccount.update({
-            where: { id: account.id },
-            data: { metadata: { ...oldMetadata, whatsappReadiness, whatsappReadinessCheckedAt: new Date().toISOString() } as never },
-          });
-          if (whatsappReadiness.wabaSubscription !== 'ACTIVE') {
-            await markChannelSetupFailed(account.id, account.channelType, 'The Vhicasar Meta App is not subscribed to this WABA.');
-            return {
-              healthy: false, status: 'ERROR',
-              message: 'WhatsApp authorization exists, but the Vhicasar Meta App subscription is not active for this WhatsApp Business Account.',
-              checks: whatsappOperationalChecks(),
-            };
-          }
-        }
-      }
-      const metadata = (account.metadata as Record<string, unknown> | null) ?? {};
-      const customerManagedMeta = metadata.connectedVia === 'manual_credentials'
-        && ['WHATSAPP', 'FACEBOOK_MESSENGER', 'INSTAGRAM'].includes(account.channelType);
-      if ((customerManagedMeta || account.channelType === 'WHATSAPP') && !account.lastWebhookAt) {
-        await markChannelAwaitingWebhook(account.id, account.channelType);
-        logger.info({ correlationId, accountId, channelType: account.channelType, phase: 'setup_required' }, 'Channel diagnostic');
-        return {
-          healthy: false,
-          status: 'SETUP_REQUIRED',
-          message: 'Credentials and WABA subscription are valid, but no correctly signed WhatsApp webhook has reached Vhicasar yet.',
-          ...(whatsappReadiness ? { checks: whatsappOperationalChecks() } : {}),
-        };
-      }
-      await markChannelConnected(account.id);
-      logger.info({ correlationId, accountId, channelType: account.channelType, phase: 'passed' }, 'Channel diagnostic');
-      return { healthy: true, status: 'CONNECTED', message: 'Credentials and inbound webhook registration are ready.', ...(whatsappReadiness ? { checks: whatsappOperationalChecks() } : {}) };
-    } catch (error) {
-      if (['WHATSAPP', 'FACEBOOK_MESSENGER', 'INSTAGRAM'].includes(account.channelType)) {
-        await markWebhookSubscription(account.id, 'FAILED');
-      }
-      const status = await markChannelError(account.id, account.channelType, (error as Error).message);
-      logger.warn({ correlationId, accountId, channelType: account.channelType, phase: 'failed', status, errorCode: error instanceof Error ? error.name : 'UNKNOWN' }, 'Channel diagnostic');
-      return { healthy: false, status, message: friendlyMessage(account.channelType, status) };
-    }
   },
 
   /**

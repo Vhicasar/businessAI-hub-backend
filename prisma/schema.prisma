@@ -1306,6 +1306,10 @@ model Message {
   aiGenerated       Boolean            @default(false)
   aiIntent          String?
   aiSentiment       String?
+  /// Provider-independent rich-message classification and resolved business context.
+  normalizedType    String             @default("text")
+  providerMetadata  Json?
+  contextSnapshot   Json?
   errorMessage      String?
   sentAt            DateTime?
   deliveredAt       DateTime?
@@ -1845,6 +1849,7 @@ model Product {
   brand            Brand?             @relation(fields: [brandId], references: [id])
   variants         ProductVariant[]
   images           ProductImage[]
+  externalReferences ProductExternalReference[]
   bundleItems      BundleItem[]       @relation("BundleChild")
   bundles          ProductBundle[]
   suppliers        SupplierProduct[]
@@ -1858,6 +1863,29 @@ model Product {
   @@index([organizationId, subscriptionDraftAt])
   @@index([categoryId])
   @@index([brandId])
+}
+
+/// Tenant-owned mapping between provider content and a catalog product.
+/// One product can be represented by many posts, reels, catalog entries or URLs.
+model ProductExternalReference {
+  id             String   @id @default(cuid())
+  organizationId String
+  productId      String
+  channel        String
+  externalId     String
+  type           String
+  url            String?
+  catalogId      String?
+  campaignId     String?
+  metadata       Json?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, channel, externalId])
+  @@index([organizationId, url])
+  @@index([productId])
 }
 
 model ProductVariant {

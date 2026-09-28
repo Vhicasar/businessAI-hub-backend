@@ -37,6 +37,10 @@ export interface ChannelCapabilities {
   replyWindowHours: number | null;
   /** Whether outbound sending is possible at all on this channel. */
   outbound: boolean;
+  supportsReplyReference: boolean;
+  supportsMediaMetadata: boolean;
+  supportsSharedPosts: boolean;
+  supportsProductCatalog: boolean;
 }
 
 const NONE: ChannelCapabilities = {
@@ -44,6 +48,8 @@ const NONE: ChannelCapabilities = {
   location: false, reactions: false, templates: false, readReceipts: false,
   typingIndicator: false, buttons: false, quickReplies: false,
   replyWindowHours: null, outbound: false,
+  supportsReplyReference: false, supportsMediaMetadata: false,
+  supportsSharedPosts: false, supportsProductCatalog: false,
 };
 
 const CAPABILITIES: Record<ChannelType, ChannelCapabilities> = {
@@ -52,6 +58,7 @@ const CAPABILITIES: Record<ChannelType, ChannelCapabilities> = {
     text: true, image: true, video: true, audio: true, document: true,
     location: true, reactions: true, templates: true, readReceipts: true,
     buttons: true, quickReplies: true, outbound: true,
+    supportsReplyReference: true, supportsMediaMetadata: true, supportsProductCatalog: true,
     // Meta's customer service window. Outside it only a template will send.
     replyWindowHours: 24,
   },
@@ -60,6 +67,7 @@ const CAPABILITIES: Record<ChannelType, ChannelCapabilities> = {
     text: true, image: true, video: true, audio: true, document: true,
     reactions: true, readReceipts: true, typingIndicator: true,
     buttons: true, quickReplies: true, outbound: true,
+    supportsReplyReference: true, supportsMediaMetadata: true, supportsSharedPosts: true,
     replyWindowHours: 24,
   },
   INSTAGRAM: {
@@ -67,6 +75,7 @@ const CAPABILITIES: Record<ChannelType, ChannelCapabilities> = {
     text: true, image: true, video: true, audio: true,
     reactions: true, readReceipts: true, typingIndicator: true,
     quickReplies: true, outbound: true,
+    supportsReplyReference: true, supportsMediaMetadata: true, supportsSharedPosts: true,
     // No documents and no templates on Instagram messaging.
     replyWindowHours: 24,
   },
@@ -75,13 +84,15 @@ const CAPABILITIES: Record<ChannelType, ChannelCapabilities> = {
     text: true, image: true, video: true, audio: true, document: true,
     location: true, reactions: true, typingIndicator: true,
     buttons: true, quickReplies: true, outbound: true,
+    supportsReplyReference: true, supportsMediaMetadata: true,
   },
-  EMAIL: { ...NONE, text: true, image: true, document: true, outbound: true },
-  SMS: { ...NONE, text: true, outbound: true },
+  EMAIL: { ...NONE, text: true, image: true, document: true, outbound: true, supportsReplyReference: true, supportsMediaMetadata: true },
+  SMS: { ...NONE, text: true, image: true, outbound: true, supportsMediaMetadata: true },
   WEB_CHAT: {
     ...NONE,
     text: true, image: true, document: true, readReceipts: true,
     typingIndicator: true, quickReplies: true, outbound: true,
+    supportsReplyReference: true, supportsMediaMetadata: true, supportsProductCatalog: true,
   },
   // Read-only or not yet carrying messages: listed explicitly so a new channel
   // type cannot be added without deciding what it can do.
