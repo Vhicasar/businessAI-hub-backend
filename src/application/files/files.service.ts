@@ -11,9 +11,34 @@ import { env } from '../../shared/config/env';
  * here for a browser URL — they never touch the storage driver directly.
  */
 
-/** What we accept. Images for the visual features; PDF for documents. */
+/** What we accept. Keep these explicit: a provider-supplied MIME type is not trusted input. */
 const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml'];
 const DOC_TYPES = ['application/pdf'];
+const INBOX_MEDIA_TYPES = [
+  ...IMAGE_TYPES,
+  ...DOC_TYPES,
+  'video/mp4',
+  'video/quicktime',
+  'video/3gpp',
+  'audio/mpeg',
+  'audio/mp4',
+  'audio/aac',
+  'audio/ogg',
+  'audio/opus',
+  'audio/amr',
+  'text/plain',
+];
+
+export type UploadAllowance = 'image' | 'any' | 'inbox-media';
+
+export function isAllowedUploadType(mimeType: string, allowance: UploadAllowance = 'image'): boolean {
+  const allowed = allowance === 'inbox-media'
+    ? INBOX_MEDIA_TYPES
+    : allowance === 'any'
+      ? [...IMAGE_TYPES, ...DOC_TYPES]
+      : IMAGE_TYPES;
+  return allowed.includes(mimeType.toLowerCase().trim());
+}
 
 export interface UploadedFile {
   buffer: Buffer;
@@ -30,7 +55,7 @@ export interface UploadOptions {
   entityType?: string;
   entityId?: string;
   isPublic?: boolean;
-  allow?: 'image' | 'any';
+  allow?: UploadAllowance;
 }
 
 export const filesService = {
@@ -49,8 +74,7 @@ export const filesService = {
     if (file.size > env.storage.maxBytes) {
       throw new ValidationError(`File is too large (max ${env.storage.maxBytes / 1024 / 1024}MB)`);
     }
-    const allowed = opts.allow === 'any' ? [...IMAGE_TYPES, ...DOC_TYPES] : IMAGE_TYPES;
-    if (!allowed.includes(file.mimetype)) {
+    if (!isAllowedUploadType(file.mimetype, opts.allow)) {
       throw new ValidationError(`Unsupported file type "${file.mimetype}"`);
     }
 

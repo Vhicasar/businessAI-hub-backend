@@ -82,8 +82,10 @@ export async function ingestInboundMedia(input: {
         // Customer attachments are not public: they reach the agent through
         // the app, which already knows who may read this conversation.
         isPublic: false,
-        // Customers send documents and voice notes, not only pictures.
-        allow: 'any',
+        // Provider messages can contain a narrowly allow-listed set of images,
+        // documents, audio and video. This is deliberately separate from
+        // ordinary user uploads so enabling reels does not broaden every route.
+        allow: 'inbox-media',
       }
     );
 
