@@ -473,7 +473,7 @@ export const smsWalletService = {
           type: 'sms.low_balance',
           title: 'Messaging credit is running low',
           body: `${wallet.currency} ${Number(result.balance).toFixed(2)} remains. Top up to avoid interrupted sends.`,
-          data: { path: '/settings/billing' },
+          data: { path: '/billing' },
         });
       }
     }

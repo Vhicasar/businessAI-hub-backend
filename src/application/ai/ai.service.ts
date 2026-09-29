@@ -19,6 +19,16 @@ import { currentOrgId, resolveEntitlements } from '../billing/entitlements';
 import { env } from '../../shared/config/env';
 import { filesService } from '../files/files.service';
 import { messageContextResolver } from '../inbox/message-context-resolver.service';
+import { requestContext } from '../../shared/context';
+import { isOwnerMembership, permissionsForRole } from '../roles/role-permissions';
+import { modulesFor } from '../modules/business-modules';
+import { channelPolicy, isChannelEnabled } from '../settings/workspace-config';
+import {
+  WORKSPACE_DESTINATIONS,
+  destinationAccess,
+  relevantDestinations,
+  resolveCurrentDestination,
+} from './workspace-navigation.registry';
 
 /** Clamp a model-provided priority to the ticket priority enum. */
 function normalizePriority(p?: string): 'LOW' | 'MEDIUM' | 'HIGH' | 'URGENT' {
@@ -404,33 +414,78 @@ export const aiService = {
     }
     if (!ownKey) await aiCredits.consume(organizationId);
 
-    const org = await prisma.organization.findUniqueOrThrow({
-      where: { id: organizationId },
-      select: { name: true, businessType: true, currency: true },
-    });
-    const navigation = [
-      ['Dashboard', '/'],
-      ['Inbox', '/inbox'],
-      ['Customers', '/customers'],
-      ['CRM', '/crm'],
-      ['Products', '/catalog'],
-      ['Orders', '/orders'],
-      ['Invoices', '/invoices'],
-      ['Marketing', '/marketing'],
-      ['Analytics', '/analytics'],
-      ['Settings', '/settings'],
-      ['Billing & plans', '/settings/billing'],
-      ['Assistant knowledge', '/settings/knowledge'],
-    ] as const;
+    const ctx = requestContext.get();
+    const [org, enabledModules, membership, connectedChannels, activeAddOns] = await Promise.all([
+      prisma.organization.findUniqueOrThrow({
+        where: { id: organizationId },
+        select: { name: true, businessType: true, currency: true },
+      }),
+      modulesFor(organizationId),
+      ctx?.membershipId ? prisma.membership.findFirst({
+        where: { id: ctx.membershipId, isActive: true, deletedAt: null },
+        select: {
+          isOwner: true,
+          jobTitle: true,
+          user: { select: { firstName: true, lastName: true } },
+          role: { select: { name: true } },
+        },
+      }) : null,
+      prisma.channelAccount.findMany({
+        where: { isActive: true, deletedAt: null },
+        select: { channelType: true, name: true, status: true },
+        orderBy: { createdAt: 'asc' },
+      }),
+      prisma.addOnPurchase.findMany({
+        where: { OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
+        select: { addOnId: true, title: true, expiresAt: true },
+      }),
+    ]);
+    const rolePermissions = ctx?.roleId ? await permissionsForRole(ctx.roleId) : new Set<string>();
+    const owner = membership?.isOwner ?? (ctx?.membershipId ? await isOwnerMembership(ctx.membershipId) : false);
+    const offeredChannels = new Set<string>();
+    for (const channel of ['EMAIL', 'SMS', 'WHATSAPP', 'WEB_CHAT'] as const) {
+      if (isChannelEnabled(channel) && channelPolicy(channel).available) offeredChannels.add(channel);
+    }
+    const decisions = WORKSPACE_DESTINATIONS.map((item) => destinationAccess(item, {
+      permissions: rolePermissions,
+      bypassPermissions: Boolean(ctx?.isSuperAdmin || ctx?.bypassTenant || owner),
+      features: ent.features,
+      businessType: org.businessType,
+      modules: new Set(enabledModules),
+      offeredChannels,
+    }));
+    const allowed = decisions.filter((decision) => decision.allowed).map((decision) => decision.destination);
+    const relevantUnavailable = relevantDestinations(prompt, decisions, false, 4);
+    const currentDestination = resolveCurrentDestination(currentPath);
+    const connectedSummary = connectedChannels.length
+      ? connectedChannels.map((channel) => `${channel.channelType}:${channel.status}`).join(', ')
+      : 'none';
+    const navigation = allowed
+      .map((item) => `${item.label}=${item.path} — ${item.description}` +
+        (item.actions?.length ? ` Actions: ${item.actions.join('; ')}.` : ''))
+      .join('\n');
+    const unavailable = relevantUnavailable.length
+      ? relevantUnavailable.map(({ destination: item, reason }) => `${item.label}: ${reason}`).join(', ')
+      : 'none relevant to this question';
+    const userName = membership ? `${membership.user.firstName} ${membership.user.lastName}`.trim() : 'current user';
     const system =
-      `You are the in-app Vhicasar Hub AI Assistant for ${org.name}. Help a staff member use ` +
-      `their workspace. Be direct, friendly and practical. The business type is ${org.businessType} ` +
-      `and preferred currency is ${org.currency}. Current page: ${currentPath || 'unknown'}. ` +
-      `You are read-only: never claim you created, changed, sent, deleted or approved anything. ` +
-      `Explain the exact page and steps the user should take. Do not invent customer, financial, ` +
-      `inventory or account data. If asked for data you do not have, say so and direct them to the ` +
-      `relevant page. Keep answers under 180 words and use short bullets when helpful.\n` +
-      `Available navigation: ${navigation.map(([label, path]) => `${label}=${path}`).join(', ')}.`;
+      `You are the in-app Vhicasar Hub AI Assistant. You help ${userName} use the ${org.name} workspace.\n` +
+      `Workspace context: business type=${org.businessType}; currency=${org.currency}; ` +
+      `plan=${ent.planName} (${ent.status}); role=${membership?.role.name ?? 'unknown'}; ` +
+      `job title=${membership?.jobTitle ?? 'not set'}; owner=${owner}; ` +
+      `effective permissions=${owner || ctx?.isSuperAdmin ? 'all workspace permissions' : [...rolePermissions].join(', ') || 'none'}; ` +
+      `enabled modules=${enabledModules.join(', ') || 'none'}; enabled plan features=${[...ent.features].join(', ') || 'none'}; ` +
+      `active add-ons=${activeAddOns.map((item) => item.title || item.addOnId).join(', ') || 'none'}; ` +
+      `connected channels and lifecycle states=${connectedSummary}.\n` +
+      `Current client=web; current page=${currentDestination ? `${currentDestination.label} (${currentDestination.path})` : currentPath || 'unknown'}.\n` +
+      `Classify the request before answering. PRODUCT HELP means how or where to use Vhicasar: name the exact accessible page and give short numbered steps. ` +
+      `BUSINESS REQUEST means asking you to inspect or change business data: you are read-only, so never claim you created, changed, sent, deleted, approved, or inspected data you were not given. ` +
+      `For a business request, explain what information is missing or direct the user to the relevant accessible page. ` +
+      `Never invent routes, buttons, features, records, settings, or integration state. A channel is connected only when its lifecycle state above says CONNECTED. ` +
+      `Only mention a URL from ACCESSIBLE WEB DESTINATIONS below. If a relevant destination is unavailable, explain the reason in plain language and do not tell the user to open it. ` +
+      `Mobile navigation differs from web; do not claim a web path exists in mobile. Keep answers under 180 words.\n\n` +
+      `ACCESSIBLE WEB DESTINATIONS:\n${navigation}\n\n` +
+      `RELEVANT BUT UNAVAILABLE DESTINATIONS (reason codes: permission, plan, business_type, module, channel_unavailable): ${unavailable}.`;
     const reply = (await provider.complete(
       [
         { role: 'system', content: system },
@@ -443,14 +498,10 @@ export const aiService = {
       { maxTokens: 450, temperature: 0.35, dataSources: ['user_provided', 'vhicasar_business'] },
     )).trim();
 
-    const lower = `${prompt} ${reply}`.toLowerCase();
-    const suggestedActions = navigation
-      .filter(([label, path]) =>
-        lower.includes(label.toLowerCase()) ||
-        (path !== '/' && lower.includes(path.slice(1).split('/')[0]!)),
-      )
-      .slice(0, 3)
-      .map(([label, path]) => ({ label: `Open ${label}`, path }));
+    // Model prose is deliberately excluded: a hallucinated URL can never
+    // become a clickable action.
+    const suggestedActions = relevantDestinations(prompt, decisions, true, 3)
+      .map(({ destination: item }) => ({ label: `Open ${item.label}`, path: item.path }));
     return { reply, suggestedActions };
   },
 
