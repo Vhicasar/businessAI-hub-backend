@@ -27,6 +27,11 @@ import type { ChannelType } from '@prisma/client';
 /** Anything larger is left with the provider rather than pulled into storage. */
 const MAX_BYTES = 25 * 1024 * 1024;
 
+export function isHtmlResponseMimeType(value: string): boolean {
+  const mimeType = value.split(';')[0]?.trim().toLowerCase();
+  return mimeType === 'text/html' || mimeType === 'application/xhtml+xml';
+}
+
 export async function ingestInboundMedia(input: {
   messageId: string;
   organizationId: string;
@@ -58,6 +63,35 @@ export async function ingestInboundMedia(input: {
       webhookSecret: account.webhookSecret,
     });
     if (!downloaded) return null;
+
+    const failureReason = downloaded.failureReason ?? (isHtmlResponseMimeType(downloaded.mimeType) ? 'unexpected_html_response' : undefined);
+    if (failureReason) {
+      let sourceHost: string | undefined;
+      try { sourceHost = media.url ? new URL(media.url).hostname : undefined; } catch { /* never log an unsafe URL */ }
+      if (failureReason === 'unexpected_html_response') {
+        logger.warn(
+          {
+            event: 'html_response_detected', action: 'classified_as_failed_media_download',
+            messageId: input.messageId, channelType, sourceHost,
+          },
+          'Claimed inbound media returned HTML and was not stored'
+        );
+      }
+      const current = await prisma.message.findUnique({
+        where: { id: input.messageId }, select: { providerMetadata: true },
+      }).catch(() => null);
+      const existingMetadata = current?.providerMetadata && typeof current.providerMetadata === 'object' && !Array.isArray(current.providerMetadata)
+        ? current.providerMetadata as Record<string, unknown> : {};
+      await prisma.message.update({
+        where: { id: input.messageId },
+        data: { providerMetadata: { ...existingMetadata, mediaResolution: { status: 'FAILED', reason: failureReason } } },
+      }).catch(() => undefined);
+      logger.warn(
+        { event: 'external_media_download_failed', messageId: input.messageId, channelType, reason: failureReason, sourceHost },
+        'Inbound media download did not return binary media'
+      );
+      return null;
+    }
 
     if (downloaded.buffer.length > MAX_BYTES) {
       logger.warn(

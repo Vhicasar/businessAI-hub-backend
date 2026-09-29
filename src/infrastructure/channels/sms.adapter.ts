@@ -2,6 +2,7 @@ import type {
   ChannelAccountRef, ChannelAdapter, DownloadedMedia, InboundMedia, NormalizedInbound, OutboundPayload,
   SendResult, WebhookRequestLike,
 } from '../../application/inbox/channel-adapter';
+import { mediaDownloadFailure, normalizedMimeType } from '../../application/inbox/channel-adapter';
 import { AppError } from '../../shared/errors';
 
 type TwilioInbound = {
@@ -50,8 +51,11 @@ export class SmsAdapter implements ChannelAdapter {
     const response = await fetch(media.url, {
       headers: { Authorization: `Basic ${Buffer.from(`${account.credentials.accountSid}:${account.credentials.authToken}`).toString('base64')}` },
     });
-    if (!response.ok) return null;
-    const mimeType = response.headers.get('content-type')?.split(';')[0] ?? media.mimeType ?? 'application/octet-stream';
+    const mimeType = normalizedMimeType(response.headers.get('content-type'), media.mimeType);
+    if (!response.ok) return { buffer: Buffer.alloc(0), mimeType, filename: 'failed-download', failureReason: mediaDownloadFailure(response.status) };
+    if (mimeType === 'text/html' || mimeType === 'application/xhtml+xml') {
+      return { buffer: Buffer.alloc(0), mimeType, filename: 'unexpected-html', failureReason: 'unexpected_html_response' };
+    }
     const extension = mimeType.split('/')[1]?.replace(/[^a-z0-9]/gi, '') || 'bin';
     return { buffer: Buffer.from(await response.arrayBuffer()), mimeType, filename: `mms-${Date.now()}.${extension}` };
   }

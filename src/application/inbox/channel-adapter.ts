@@ -71,6 +71,15 @@ export interface ReferencedContent {
   externalProductId?: string;
   catalogId?: string;
   type: string;
+  /** Stable, user-facing URL. Temporary media CDN URLs belong in mediaUrl. */
+  url?: string;
+  title?: string;
+  description?: string;
+  siteName?: string;
+  authorName?: string;
+  mediaType?: string;
+  productId?: string;
+  resolved?: boolean;
   caption?: string;
   text?: string;
   mediaUrl?: string;
@@ -113,6 +122,18 @@ export interface DownloadedMedia {
   buffer: Buffer;
   mimeType: string;
   filename: string;
+  failureReason?: 'unexpected_html_response' | 'unauthorized' | 'forbidden' | 'not_found' | 'download_failed';
+}
+
+export function normalizedMimeType(value: string | null | undefined, fallback = 'application/octet-stream'): string {
+  return value?.split(';')[0]?.trim().toLowerCase() || fallback;
+}
+
+export function mediaDownloadFailure(status: number): DownloadedMedia['failureReason'] {
+  if (status === 401) return 'unauthorized';
+  if (status === 403) return 'forbidden';
+  if (status === 404) return 'not_found';
+  return 'download_failed';
 }
 
 export interface OutboundPayload {

@@ -13,6 +13,13 @@ describe('omnichannel message normalization', () => {
     expect(messages[0]?.attachments).toBeUndefined();
   });
 
+  it('preserves customer text alongside a shared Instagram reel', () => {
+    const adapter = new MetaMessagingAdapter('INSTAGRAM', 'instagram');
+    const [message] = adapter.parseInbound({ object: 'instagram', entry: [{ messaging: [{ sender: { id: 'customer' }, message: { mid: 'mixed', text: 'Do you have this in black?', attachments: [{ type: 'share', payload: { url: 'https://instagram.com/reel/MIXED', title: 'Black trainers' } }] } }] }] });
+    expect(message).toMatchObject({ text: 'Do you have this in black?', messageType: 'reel_share', referencedContent: [{ caption: 'Black trainers' }] });
+    expect(message?.media).toBeUndefined();
+  });
+
   it('normalizes WhatsApp quoted catalog context and catalog orders', () => {
     const adapter = new WhatsAppAdapter();
     const messages = adapter.parseInbound({ object: 'whatsapp_business_account', entry: [{ changes: [{ value: { messages: [{ from: '234', id: 'm2', type: 'text', text: { body: 'How much?' }, context: { id: 'quoted', referred_product: { catalog_id: 'cat', product_retailer_id: 'SKU-1' } } }, { from: '234', id: 'm3', type: 'order', order: { catalog_id: 'cat', product_items: [{ product_retailer_id: 'SKU-2', quantity: '2' }] } }] } }] }] });

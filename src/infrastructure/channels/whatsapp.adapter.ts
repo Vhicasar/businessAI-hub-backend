@@ -11,6 +11,7 @@ import type {
   SendResult,
   WebhookRequestLike,
 } from '../../application/inbox/channel-adapter';
+import { mediaDownloadFailure, normalizedMimeType } from '../../application/inbox/channel-adapter';
 import { mediaKindFor } from '../../application/inbox/channel-adapter';
 import { AppError } from '../../shared/errors';
 
@@ -269,14 +270,17 @@ export class WhatsAppAdapter implements ChannelAdapter {
     const lookup = await fetch(`${graph()}/${encodeURIComponent(media.externalId)}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
-    if (!lookup.ok) return null;
+    if (!lookup.ok) return { buffer: Buffer.alloc(0), mimeType: 'application/octet-stream', filename: 'failed-download', failureReason: mediaDownloadFailure(lookup.status) };
     const meta = (await lookup.json()) as { url?: string; mime_type?: string };
     if (!meta.url) return null;
 
     const file = await fetch(meta.url, { headers: { Authorization: `Bearer ${token}` } });
-    if (!file.ok) return null;
+    const mimeType = normalizedMimeType(file.headers.get('content-type'), meta.mime_type ?? media.mimeType);
+    if (!file.ok) return { buffer: Buffer.alloc(0), mimeType, filename: 'failed-download', failureReason: mediaDownloadFailure(file.status) };
+    if (mimeType === 'text/html' || mimeType === 'application/xhtml+xml') {
+      return { buffer: Buffer.alloc(0), mimeType, filename: 'unexpected-html', failureReason: 'unexpected_html_response' };
+    }
 
-    const mimeType = meta.mime_type ?? media.mimeType ?? 'application/octet-stream';
     return {
       buffer: Buffer.from(await file.arrayBuffer()),
       mimeType,

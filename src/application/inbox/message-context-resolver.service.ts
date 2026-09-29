@@ -2,6 +2,7 @@ import type { ChannelType, Prisma } from '@prisma/client';
 import { prismaUnscoped } from '../../infrastructure/database/prisma';
 import { logger } from '../../shared/logger';
 import type { NormalizedInbound, NormalizedMessageType, ReferencedContent } from './channel-adapter';
+import { sharedContentResolver } from './shared-content-resolver.service';
 
 export type ProductMatchMethod = 'external_reference' | 'external_product_id' | 'product_url' | 'sku' | 'exact_name' | 'caption_text' | 'conversation_memory';
 
@@ -108,6 +109,10 @@ async function matchReferences(organizationId: string, references: ReferencedCon
   }
 
   for (const ref of references) {
+    if (ref.productId) {
+      const explicit = await prismaUnscoped.product.findFirst({ where: { id: ref.productId, organizationId, deletedAt: null }, select: { id: true } });
+      if (explicit) candidates.set(explicit.id, { confidence: 1, method: 'external_product_id' });
+    }
     const productPath = (ref.productUrl ?? ref.permalink)?.match(/\/products\/([^/?#]+)/i)?.[1];
     if (productPath) {
       const urlProduct = await prismaUnscoped.product.findFirst({ where: { organizationId, deletedAt: null, OR: [{ id: productPath }, { slug: productPath }] }, select: { id: true } });
@@ -191,7 +196,7 @@ export const messageContextResolver = {
   },
 
   async resolve(input: { organizationId: string; conversationId: string; channelType: ChannelType; inbound: NormalizedInbound }): Promise<ResolvedMessageContext> {
-    const references = input.inbound.referencedContent ?? [];
+    const references = sharedContentResolver.resolve({ ...input, inbound: input.inbound });
     logger.info({ event: 'message_normalized', organizationId: input.organizationId, conversationId: input.conversationId, channelType: input.channelType, messageType: inferMessageType(input.inbound), referenceCount: references.length }, 'Inbound message normalized');
     if (references.length) logger.info({ event: 'reference_detected', organizationId: input.organizationId, conversationId: input.conversationId, referenceTypes: references.map((reference) => reference.type) }, 'Referenced content detected');
     logger.info({ event: 'product_match_attempted', organizationId: input.organizationId, conversationId: input.conversationId }, 'Product context match attempted');

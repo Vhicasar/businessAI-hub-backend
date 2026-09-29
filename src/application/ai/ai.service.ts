@@ -75,10 +75,22 @@ async function conversationTranscript(conversationId: string, limit = 50) {
     const products = context && Array.isArray(context.products)
       ? (context.products as Array<{ name?: string }>).map((product) => product.name).filter(Boolean).join(', ')
       : '';
+    const references = context && Array.isArray(context.references)
+      ? (context.references as Array<{ type?: string; provider?: string; title?: string; caption?: string; text?: string; url?: string; permalink?: string }>)
+        .slice(0, 5)
+        .map((reference) => [
+          reference.provider,
+          reference.type,
+          reference.title ?? reference.caption ?? reference.text,
+          reference.url ?? reference.permalink,
+        ].filter(Boolean).join(' · '))
+        .filter(Boolean)
+        .join('; ')
+      : '';
     const fallback = m.normalizedType !== 'text'
       ? `Customer shared ${m.normalizedType.replace(/_/g, ' ')}${products ? ` referring to: ${products}` : ''}.`
       : `[${m.contentType.toLowerCase()}]`;
-    return `${who}: ${m.body ?? fallback}`;
+    return `${who}: ${m.body ?? fallback}${references ? `\nShared context: ${references}` : ''}`;
   });
   return { conversation, transcript: lines.join('\n') };
 }

@@ -12,7 +12,7 @@ import type {
   SendResult,
   WebhookRequestLike,
 } from '../../application/inbox/channel-adapter';
-import { mediaKindFor } from '../../application/inbox/channel-adapter';
+import { mediaDownloadFailure, mediaKindFor, normalizedMimeType } from '../../application/inbox/channel-adapter';
 import { AppError } from '../../shared/errors';
 import { extensionFor, validateMetaTokenOwnership, verifyMetaSignature } from './whatsapp.adapter';
 
@@ -92,37 +92,42 @@ export class MetaMessagingAdapter implements ChannelAdapter {
           raw: event,
           replyTo: msg.reply_to?.mid ? { externalMessageId: msg.reply_to.mid } : undefined,
         };
-        if (msg.text) {
-          out.push({ ...base, contentType: 'TEXT', text: msg.text, messageType: msg.reply_to?.mid ? 'reply' as const : 'text' as const });
-        } else if (msg.attachments?.length) {
-          const attachment = msg.attachments[0];
+        if (msg.attachments?.length) {
+          const sharedAttachments = msg.attachments.filter((item) => item.type === 'share' || item.type === 'fallback');
+          const binaryAttachments = msg.attachments.filter((item) => item.type !== 'share' && item.type !== 'fallback');
+          const attachment = binaryAttachments[0] ?? sharedAttachments[0];
           const kind = attachment?.type;
           const url = attachment?.payload?.url;
-          const shared = kind === 'share' || kind === 'fallback';
+          const shared = sharedAttachments.length > 0 && binaryAttachments.length === 0;
           const sharedType = /\/reel\//i.test(url ?? '') ? 'reel_share' : shared ? 'shared_media' : undefined;
           out.push({
             ...base,
             contentType:
               shared ? 'TEXT' : kind === 'image' ? 'IMAGE' : kind === 'video' ? 'VIDEO' : kind === 'audio' ? 'AUDIO' : 'DOCUMENT',
             messageType: sharedType ?? (kind === 'image' ? 'image' : kind === 'video' ? 'video' : kind === 'audio' ? 'audio' : 'document'),
-            text: attachment?.payload?.title,
-            attachments: shared ? undefined : msg.attachments.map((item) => ({
+            text: msg.text ?? attachment?.payload?.title,
+            attachments: binaryAttachments.length === 0 ? undefined : binaryAttachments.map((item) => ({
               type: item.type === 'image' || item.type === 'video' || item.type === 'audio' ? item.type : item.type === 'file' ? 'document' : 'unknown',
               url: item.payload?.url, caption: item.payload?.title,
             })),
-            referencedContent: shared ? [{
-              provider: this.channelType.toLowerCase(), type: sharedType === 'reel_share' ? 'reel' : 'shared_post',
-              externalId: attachment?.payload?.external_id, externalProductId: attachment?.payload?.product_id,
+            referencedContent: sharedAttachments.map((item) => {
+              const sharedUrl = item.payload?.url;
+              const referenceType = /\/reel\//i.test(sharedUrl ?? '') ? 'reel' : 'shared_post';
+              return {
+              provider: this.channelType.toLowerCase(), type: referenceType,
+              externalId: item.payload?.external_id, externalProductId: item.payload?.product_id,
               // A share URL is an Instagram/Facebook webpage, not a CDN media
               // asset. Keep it as a link for the reference card; attempting to
               // ingest it stores HTML rather than the reel/post.
-              permalink: url, caption: attachment?.payload?.title,
-            }] : undefined,
+              permalink: sharedUrl, caption: item.payload?.title,
+            }; }),
             mediaUrl: shared ? undefined : url,
             media: !shared && url
               ? { url }
               : undefined,
           });
+        } else if (msg.text) {
+          out.push({ ...base, contentType: 'TEXT', text: msg.text, messageType: msg.reply_to?.mid ? 'reply' as const : 'text' as const });
         }
       }
     }
@@ -242,11 +247,11 @@ export class MetaMessagingAdapter implements ChannelAdapter {
   async downloadMedia(media: InboundMedia): Promise<DownloadedMedia | null> {
     if (!media.url) return null;
     const res = await fetch(media.url);
-    if (!res.ok) return null;
-    const mimeType =
-      res.headers.get('content-type')?.split(';')[0]?.trim() ??
-      media.mimeType ??
-      'application/octet-stream';
+    const mimeType = normalizedMimeType(res.headers.get('content-type'), media.mimeType);
+    if (!res.ok) return { buffer: Buffer.alloc(0), mimeType, filename: media.filename ?? 'failed-download', failureReason: mediaDownloadFailure(res.status) };
+    if (mimeType === 'text/html' || mimeType === 'application/xhtml+xml') {
+      return { buffer: Buffer.alloc(0), mimeType, filename: media.filename ?? 'unexpected-html', failureReason: 'unexpected_html_response' };
+    }
     return {
       buffer: Buffer.from(await res.arrayBuffer()),
       mimeType,
