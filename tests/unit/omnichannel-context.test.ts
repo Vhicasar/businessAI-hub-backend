@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { inferMessageType, detectSalesIntent, messageContextResolver } from '../../src/application/inbox/message-context-resolver.service';
 import { MetaMessagingAdapter } from '../../src/infrastructure/channels/meta.adapter';
 import { WhatsAppAdapter } from '../../src/infrastructure/channels/whatsapp.adapter';
+import { originalInboundBody } from '../../src/application/inbox/channel-adapter';
 
 describe('omnichannel message normalization', () => {
   afterEach(() => vi.restoreAllMocks());
@@ -39,6 +40,12 @@ describe('omnichannel message normalization', () => {
       referencedContent: [{ provider: 'instagram', type: 'reel', externalId: 'media-42', permalink: 'https://www.instagram.com/reel/ABC/' }],
     }, { id: 'account', organizationId: 'org', externalId: 'ig', webhookSecret: null, credentials: { accessToken: 'secret' } });
     expect(enriched.referencedContent?.[0]).toMatchObject({ caption: 'Caption returned by Meta', mediaType: 'VIDEO', authorName: 'shop' });
+  });
+
+  it('preserves the complete original caption verbatim ahead of generated fallback metadata', () => {
+    const caption = '🔥 NEW ARRIVAL 🔥\n\nNike Air Max 270\nSizes: 40–45\nPrice: ₦120,000\n\nDM us today! 🚚  ';
+    expect(originalInboundBody({ caption, referencedContent: [{ provider: 'instagram', type: 'reel', description: 'Customer shared a Reel' }] })).toBe(caption);
+    expect(originalInboundBody({ text: 'Do you have this?', caption })).toBe('Do you have this?');
   });
 
   it('normalizes WhatsApp quoted catalog context and catalog orders', () => {

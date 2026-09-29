@@ -19,6 +19,7 @@ import type {
   NormalizedInbound,
   NormalizedStatus,
 } from './channel-adapter';
+import { originalInboundBody } from './channel-adapter';
 import { ingestInboundMedia } from './inbox-media.service';
 import { markChannelConnected, markChannelError, markOutboundMessageSent } from './channel-health.service';
 import { workflowService } from '../crm/workflow.service';
@@ -402,6 +403,10 @@ export const inboxService = {
       logger.warn({ error, event: 'product_match_failed', conversationId: conversation.id, channelType: account.channelType }, 'Message context resolution failed');
     }
 
+    // Persist only original channel content here. Generated descriptions stay
+    // in normalizedType/system context and are fallback presentation metadata.
+    const originalBody = originalInboundBody(inbound, richContext?.references);
+
     let message;
     try {
       message = await prisma.message.create({
@@ -411,7 +416,7 @@ export const inboxService = {
           direction: 'INBOUND',
           authorType: 'CUSTOMER',
           contentType: inbound.contentType,
-          body: inbound.text ?? null,
+          body: originalBody ?? null,
           status: 'DELIVERED',
           providerMessageId: inbound.providerMessageId,
           replyToId: replyTo?.id ?? null,
@@ -438,7 +443,7 @@ export const inboxService = {
         channelType: account.channelType,
         accountId: account.id,
         media: inbound.media,
-        caption: inbound.text,
+        caption: originalBody,
       }).catch((err) => {
         // The text/message identity is already durable. A temporary media CDN
         // or download failure must not hide the WhatsApp message from Inbox.
@@ -457,7 +462,7 @@ export const inboxService = {
     {
       const wfPayload = {
         channel: account.channelType,
-        text: inbound.text ?? '',
+        text: originalBody ?? '',
         contentType: inbound.contentType,
         customerId: identity.customerId,
         conversationId: conversation.id,
@@ -502,7 +507,7 @@ export const inboxService = {
       identity.customer.isProvisional = false;
     }
 
-    const preview = inbound.text?.trim()
+    const preview = originalBody?.trim()
       || richContext?.references[0]?.caption
       || richContext?.references[0]?.text
       || (richContext?.products[0] ? `Shared product: ${richContext.products[0].name}` : null)
@@ -559,7 +564,7 @@ export const inboxService = {
         {
           type: 'inbox.message',
           title: `New message from ${senderName}`,
-          body: inbound.text?.trim().slice(0, 180) || `[${inbound.contentType.toLowerCase()}]`,
+          body: originalBody?.trim().slice(0, 180) || `[${inbound.contentType.toLowerCase()}]`,
           data: {
             conversationId: conversation.id,
             channelType: account.channelType,

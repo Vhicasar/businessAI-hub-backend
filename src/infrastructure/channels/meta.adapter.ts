@@ -57,7 +57,8 @@ interface MetaWebhookBody {
 }
 
 function metaPayloadCaption(payload: MetaAttachmentPayload): string | undefined {
-  return payload.caption?.trim() || payload.description?.trim() || payload.title?.trim() || payload.name?.trim() || undefined;
+  return [payload.caption, payload.description, payload.title, payload.name]
+    .find((value): value is string => Boolean(value?.trim()));
 }
 
 function isSharedMetaAttachment(item: NonNullable<NonNullable<MetaMessagingEvent['message']>['attachments']>[number]): boolean {
@@ -126,12 +127,14 @@ export class MetaMessagingAdapter implements ChannelAdapter {
           const url = attachment?.payload?.url;
           const shared = sharedAttachments.length > 0 && binaryAttachments.length === 0;
           const sharedType = /\/reel\//i.test(url ?? '') ? 'reel_share' : shared ? 'shared_media' : undefined;
+          const originalCaption = metaPayloadCaption(attachment?.payload ?? {});
           out.push({
             ...base,
             contentType:
               shared ? 'TEXT' : kind === 'image' ? 'IMAGE' : kind === 'video' ? 'VIDEO' : kind === 'audio' ? 'AUDIO' : 'DOCUMENT',
             messageType: sharedType ?? (kind === 'image' ? 'image' : kind === 'video' ? 'video' : kind === 'audio' ? 'audio' : 'document'),
             text: msg.text,
+            caption: originalCaption,
             attachments: binaryAttachments.length === 0 ? undefined : binaryAttachments.map((item) => ({
               type: item.type === 'image' || item.type === 'video' || item.type === 'audio' ? item.type : item.type === 'file' ? 'document' : 'unknown',
               url: item.payload?.url, caption: metaPayloadCaption(item.payload ?? {}),
@@ -183,7 +186,7 @@ export class MetaMessagingAdapter implements ChannelAdapter {
         };
         return {
           ...reference,
-          caption: media.caption?.trim() || reference.caption,
+          caption: media.caption?.trim() ? media.caption : reference.caption,
           mediaType: media.media_type ?? reference.mediaType,
           mediaUrl: media.media_url ?? reference.mediaUrl,
           thumbnailUrl: media.thumbnail_url ?? reference.thumbnailUrl,
@@ -195,7 +198,8 @@ export class MetaMessagingAdapter implements ChannelAdapter {
         return reference;
       }
     }));
-    return { ...inbound, referencedContent: references };
+    const resolvedCaption = references.find((reference) => reference.caption?.trim())?.caption;
+    return { ...inbound, caption: inbound.caption ?? resolvedCaption, referencedContent: references };
   }
 
   async enrichInbound(inbound: NormalizedInbound, account: ChannelAccountRef): Promise<NormalizedInbound> {

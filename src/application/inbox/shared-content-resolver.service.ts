@@ -50,7 +50,9 @@ function normalize(reference: ReferencedContent): ReferencedContent | null {
     url: canonical,
     permalink: canonical,
     siteName: reference.siteName ?? url.hostname.replace(/^www\./, ''),
-    title: reference.title ?? reference.caption ?? reference.text,
+    // Caption remains separate so Inbox can render it below the preview and
+    // preserve it verbatim instead of treating it as a generated card title.
+    title: reference.title,
     resolved: reference.resolved ?? Boolean(reference.title || reference.caption || reference.text || reference.externalId),
   };
 }

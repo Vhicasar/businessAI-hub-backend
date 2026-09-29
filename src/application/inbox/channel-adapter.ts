@@ -18,7 +18,10 @@ export interface NormalizedInbound {
   /** Privacy-safe outcome of an optional provider profile lookup. */
   profileEnrichment?: ProviderProfileEnrichment;
   contentType: MessageContentType;
+  /** Original user-written message text, never a generated fallback. */
   text?: string;
+  /** Original provider/attachment caption, kept separate from user-written text. */
+  caption?: string;
   messageType?: NormalizedMessageType;
   attachments?: NormalizedAttachment[];
   replyTo?: MessageReference;
@@ -88,6 +91,19 @@ export interface ReferencedContent {
   productUrl?: string;
   sku?: string;
   metadata?: Record<string, unknown>;
+}
+
+/** Select original provider/customer content without trimming or generating text. */
+export function originalInboundBody(
+  inbound: Pick<NormalizedInbound, 'text' | 'caption' | 'referencedContent'>,
+  references: ReferencedContent[] = inbound.referencedContent ?? [],
+): string | undefined {
+  return [
+    inbound.text,
+    inbound.caption,
+    references.find((reference) => reference.caption?.trim())?.caption,
+    references.find((reference) => reference.description?.trim())?.description,
+  ].find((value): value is string => Boolean(value?.trim()));
 }
 
 export type ProfileEnrichmentReason =

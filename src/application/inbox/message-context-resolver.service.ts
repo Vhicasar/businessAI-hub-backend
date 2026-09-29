@@ -155,7 +155,7 @@ async function matchReferences(organizationId: string, references: ReferencedCon
 
 export const messageContextResolver = {
   providerMetadata(inbound: NormalizedInbound): Prisma.InputJsonValue {
-    return safeProviderValue({ raw: inbound.raw, metadata: inbound.metadata, attachments: inbound.attachments, replyTo: inbound.replyTo, referencedContent: inbound.referencedContent }) as Prisma.InputJsonValue;
+    return safeProviderValue({ raw: inbound.raw, metadata: inbound.metadata, caption: inbound.caption, attachments: inbound.attachments, replyTo: inbound.replyTo, referencedContent: inbound.referencedContent }) as Prisma.InputJsonValue;
   },
 
   async conversationProducts(organizationId: string, conversationId: string): Promise<ResolvedProductContext[]> {
