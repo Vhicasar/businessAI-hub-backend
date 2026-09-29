@@ -88,11 +88,18 @@ export async function enrichInboundProfiles(
       bySender.set(message.senderExternalId, pending);
     }
     const enriched = await pending;
-    return {
+    const withProfile = {
       ...message,
       senderDisplayName: enriched.senderDisplayName,
       senderProfile: enriched.senderProfile,
       profileEnrichment: enriched.profileEnrichment,
     };
+    if (!adapter.enrichContent) return withProfile;
+    try {
+      return await adapter.enrichContent(withProfile, account);
+    } catch (error) {
+      logger.warn({ err: error, accountId: account.id, channelType: adapter.channelType }, 'Provider content enrichment failed; preserving inbound message');
+      return withProfile;
+    }
   }));
 }

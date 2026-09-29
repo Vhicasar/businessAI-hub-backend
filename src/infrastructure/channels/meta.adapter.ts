@@ -20,6 +20,17 @@ import { extensionFor, validateMetaTokenOwnership, verifyMetaSignature } from '.
 // a stub or a version bump reaches every adapter alike.
 const graph = () => env.meta.graphUrl;
 
+interface MetaAttachmentPayload {
+  url?: string;
+  title?: string;
+  caption?: string;
+  description?: string;
+  name?: string;
+  external_id?: string;
+  product_id?: string;
+  thumbnail_url?: string;
+}
+
 interface MetaMessagingEvent {
   sender?: { id?: string };
   timestamp?: number;
@@ -28,7 +39,7 @@ interface MetaMessagingEvent {
     text?: string;
     is_echo?: boolean;
     reply_to?: { mid?: string };
-    attachments?: { type?: string; payload?: { url?: string; title?: string; external_id?: string; product_id?: string } }[];
+    attachments?: { type?: string; payload?: MetaAttachmentPayload }[];
   };
   postback?: { title?: string; payload?: string };
 }
@@ -43,6 +54,21 @@ interface MetaWebhookBody {
       read?: { watermark?: number };
     })[];
   }[];
+}
+
+function metaPayloadCaption(payload: MetaAttachmentPayload): string | undefined {
+  return payload.caption?.trim() || payload.description?.trim() || payload.title?.trim() || payload.name?.trim() || undefined;
+}
+
+function isSharedMetaAttachment(item: NonNullable<NonNullable<MetaMessagingEvent['message']>['attachments']>[number]): boolean {
+  if (item.type === 'share' || item.type === 'fallback') return true;
+  try {
+    const url = new URL(item.payload?.url ?? '');
+    const socialHost = /(^|\.)(instagram\.com|facebook\.com)$/i.test(url.hostname) || url.hostname === 'fb.watch';
+    return socialHost && /\/(reel|reels|p|stories|share|watch)(\/|$)/i.test(url.pathname);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -93,8 +119,8 @@ export class MetaMessagingAdapter implements ChannelAdapter {
           replyTo: msg.reply_to?.mid ? { externalMessageId: msg.reply_to.mid } : undefined,
         };
         if (msg.attachments?.length) {
-          const sharedAttachments = msg.attachments.filter((item) => item.type === 'share' || item.type === 'fallback');
-          const binaryAttachments = msg.attachments.filter((item) => item.type !== 'share' && item.type !== 'fallback');
+          const sharedAttachments = msg.attachments.filter(isSharedMetaAttachment);
+          const binaryAttachments = msg.attachments.filter((item) => !isSharedMetaAttachment(item));
           const attachment = binaryAttachments[0] ?? sharedAttachments[0];
           const kind = attachment?.type;
           const url = attachment?.payload?.url;
@@ -105,10 +131,10 @@ export class MetaMessagingAdapter implements ChannelAdapter {
             contentType:
               shared ? 'TEXT' : kind === 'image' ? 'IMAGE' : kind === 'video' ? 'VIDEO' : kind === 'audio' ? 'AUDIO' : 'DOCUMENT',
             messageType: sharedType ?? (kind === 'image' ? 'image' : kind === 'video' ? 'video' : kind === 'audio' ? 'audio' : 'document'),
-            text: msg.text ?? attachment?.payload?.title,
+            text: msg.text,
             attachments: binaryAttachments.length === 0 ? undefined : binaryAttachments.map((item) => ({
               type: item.type === 'image' || item.type === 'video' || item.type === 'audio' ? item.type : item.type === 'file' ? 'document' : 'unknown',
-              url: item.payload?.url, caption: item.payload?.title,
+              url: item.payload?.url, caption: metaPayloadCaption(item.payload ?? {}),
             })),
             referencedContent: sharedAttachments.map((item) => {
               const sharedUrl = item.payload?.url;
@@ -119,7 +145,9 @@ export class MetaMessagingAdapter implements ChannelAdapter {
               // A share URL is an Instagram/Facebook webpage, not a CDN media
               // asset. Keep it as a link for the reference card; attempting to
               // ingest it stores HTML rather than the reel/post.
-              permalink: sharedUrl, caption: item.payload?.title,
+              permalink: sharedUrl,
+              caption: metaPayloadCaption(item.payload ?? {}),
+              thumbnailUrl: item.payload?.thumbnail_url,
             }; }),
             mediaUrl: shared ? undefined : url,
             media: !shared && url
@@ -132,6 +160,42 @@ export class MetaMessagingAdapter implements ChannelAdapter {
       }
     }
     return out;
+  }
+
+  async enrichContent(inbound: NormalizedInbound, account: ChannelAccountRef): Promise<NormalizedInbound> {
+    if (this.channelType !== 'INSTAGRAM' || !inbound.referencedContent?.length) return inbound;
+    const directInstagram = Boolean(account.credentials.accessToken);
+    const token = directInstagram ? account.credentials.accessToken : account.credentials.pageAccessToken;
+    if (!token) return inbound;
+    const base = directInstagram ? env.instagram.graphUrl : graph();
+    const references = await Promise.all(inbound.referencedContent.map(async (reference) => {
+      if (reference.caption || !reference.externalId) return reference;
+      const query = new URLSearchParams({
+        fields: 'id,caption,media_type,media_url,thumbnail_url,permalink,username',
+        access_token: token,
+      });
+      try {
+        const response = await fetch(`${base}/${encodeURIComponent(reference.externalId)}?${query.toString()}`);
+        if (!response.ok) return reference;
+        const media = await response.json() as {
+          caption?: string; media_type?: string; media_url?: string;
+          thumbnail_url?: string; permalink?: string; username?: string;
+        };
+        return {
+          ...reference,
+          caption: media.caption?.trim() || reference.caption,
+          mediaType: media.media_type ?? reference.mediaType,
+          mediaUrl: media.media_url ?? reference.mediaUrl,
+          thumbnailUrl: media.thumbnail_url ?? reference.thumbnailUrl,
+          permalink: media.permalink ?? reference.permalink,
+          authorName: media.username ?? reference.authorName,
+          resolved: Boolean(media.caption || media.thumbnail_url || media.permalink || reference.resolved),
+        };
+      } catch {
+        return reference;
+      }
+    }));
+    return { ...inbound, referencedContent: references };
   }
 
   async enrichInbound(inbound: NormalizedInbound, account: ChannelAccountRef): Promise<NormalizedInbound> {

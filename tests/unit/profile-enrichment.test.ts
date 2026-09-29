@@ -45,6 +45,22 @@ describe('profile enrichment orchestration', () => {
     expect(results.map((item) => [item.providerMessageId, item.text])).toEqual([['m1', 'text-m1'], ['m2', 'text-m2']]);
   });
 
+  it('runs message-specific content enrichment even when sender profile data is cached', async () => {
+    findFirst.mockResolvedValue({
+      displayName: 'Ada', profileUrl: null,
+      customer: { customFields: { channelProfiles: { INSTAGRAM: {
+        displayName: 'Ada', enrichment: { status: 'SUCCESS', attemptedAt: new Date().toISOString() },
+      } } } },
+    });
+    const enrichContent = vi.fn(async (inbound: NormalizedInbound) => ({
+      ...inbound, referencedContent: [{ provider: 'instagram', type: 'reel', caption: `caption-${inbound.providerMessageId}` }],
+    }));
+    const adapter = { channelType: 'INSTAGRAM', enrichInbound: vi.fn(), enrichContent } as unknown as ChannelAdapter;
+    const results = await enrichInboundProfiles(adapter, account, [message('m1'), message('m2')]);
+    expect(enrichContent).toHaveBeenCalledTimes(2);
+    expect(results.map((item) => item.referencedContent?.[0]?.caption)).toEqual(['caption-m1', 'caption-m2']);
+  });
+
   it('converts an adapter exception into a non-fatal diagnostic', async () => {
     findFirst.mockResolvedValue(null);
     const adapter = {

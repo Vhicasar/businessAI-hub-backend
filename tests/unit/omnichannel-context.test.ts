@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { inferMessageType, detectSalesIntent, messageContextResolver } from '../../src/application/inbox/message-context-resolver.service';
 import { MetaMessagingAdapter } from '../../src/infrastructure/channels/meta.adapter';
 import { WhatsAppAdapter } from '../../src/infrastructure/channels/whatsapp.adapter';
 
 describe('omnichannel message normalization', () => {
+  afterEach(() => vi.restoreAllMocks());
   it('preserves a shared Instagram reel as referenced content instead of a document placeholder', () => {
     const adapter = new MetaMessagingAdapter('INSTAGRAM', 'instagram');
     const messages = adapter.parseInbound({ object: 'instagram', entry: [{ messaging: [{ sender: { id: 'customer' }, timestamp: 1, message: { mid: 'm1', attachments: [{ type: 'share', payload: { url: 'https://instagram.com/reel/ABC', title: 'New Air Max arrivals', external_id: 'ABC' } }] } }] }] });
@@ -18,6 +19,26 @@ describe('omnichannel message normalization', () => {
     const [message] = adapter.parseInbound({ object: 'instagram', entry: [{ messaging: [{ sender: { id: 'customer' }, message: { mid: 'mixed', text: 'Do you have this in black?', attachments: [{ type: 'share', payload: { url: 'https://instagram.com/reel/MIXED', title: 'Black trainers' } }] } }] }] });
     expect(message).toMatchObject({ text: 'Do you have this in black?', messageType: 'reel_share', referencedContent: [{ caption: 'Black trainers' }] });
     expect(message?.media).toBeUndefined();
+  });
+
+  it('recognizes an Instagram Reel webpage even when Meta labels it as a file', () => {
+    const adapter = new MetaMessagingAdapter('INSTAGRAM', 'instagram');
+    const [message] = adapter.parseInbound({ object: 'instagram', entry: [{ messaging: [{ sender: { id: 'customer' }, message: { mid: 'webpage', attachments: [{ type: 'file', payload: { url: 'https://www.instagram.com/reel/REAL/', caption: 'Actual Reel caption', external_id: 'media-42' } }] } }] }] });
+    expect(message).toMatchObject({ contentType: 'TEXT', messageType: 'reel_share', referencedContent: [{ type: 'reel', caption: 'Actual Reel caption', externalId: 'media-42' }] });
+    expect(message?.media).toBeUndefined();
+  });
+
+  it('enriches a missing Reel caption through the supported Meta media lookup', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      caption: 'Caption returned by Meta', media_type: 'VIDEO',
+      thumbnail_url: 'https://cdn.example/reel.jpg', permalink: 'https://www.instagram.com/reel/ABC/', username: 'shop',
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    const adapter = new MetaMessagingAdapter('INSTAGRAM', 'instagram');
+    const enriched = await adapter.enrichContent!({
+      providerMessageId: 'caption', senderExternalId: 'customer', contentType: 'TEXT',
+      referencedContent: [{ provider: 'instagram', type: 'reel', externalId: 'media-42', permalink: 'https://www.instagram.com/reel/ABC/' }],
+    }, { id: 'account', organizationId: 'org', externalId: 'ig', webhookSecret: null, credentials: { accessToken: 'secret' } });
+    expect(enriched.referencedContent?.[0]).toMatchObject({ caption: 'Caption returned by Meta', mediaType: 'VIDEO', authorName: 'shop' });
   });
 
   it('normalizes WhatsApp quoted catalog context and catalog orders', () => {

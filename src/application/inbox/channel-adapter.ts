@@ -229,6 +229,9 @@ export interface ChannelAdapter {
   /** Fetch profile fields omitted from webhook payloads (notably Meta PSIDs). */
   enrichInbound?(inbound: NormalizedInbound, account: ChannelAccountRef): Promise<NormalizedInbound>;
 
+  /** Enrich message-specific references; unlike profiles, this is never cached by sender. */
+  enrichContent?(inbound: NormalizedInbound, account: ChannelAccountRef): Promise<NormalizedInbound>;
+
   /**
    * Extract delivery receipts from the same webhook delivery.
    *
