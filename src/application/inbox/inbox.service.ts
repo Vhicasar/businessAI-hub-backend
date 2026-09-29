@@ -43,6 +43,7 @@ export type ListConversationsDto = z.infer<typeof listConversationsSchema>;
 
 const conversationListSelect = {
   id: true,
+  organizationId: true,
   status: true,
   lastMessageAt: true,
   lastMessageText: true,
@@ -828,10 +829,23 @@ export const inboxService = {
       },
     });
     if (!conversation) throw new NotFoundError('Conversation');
+    const organization = await prisma.organization.findFirst({
+      where: { id: conversation.organizationId },
+      select: { id: true, name: true, logoFileId: true },
+    });
+    if (!organization) throw new NotFoundError('Organization');
     const attachmentFileIds = conversation.messages.flatMap((message) => message.attachments.map((attachment) => attachment.file.id));
-    const urls = await filesService.urlMap(attachmentFileIds);
+    const [urls, organizationLogoUrl] = await Promise.all([
+      filesService.urlMap(attachmentFileIds),
+      filesService.urlFor(organization.logoFileId),
+    ]);
     return {
       ...conversation,
+      organization: {
+        id: organization.id,
+        name: organization.name,
+        logoUrl: organizationLogoUrl,
+      },
       messages: conversation.messages.map((message) => ({
         ...message,
         attachments: message.attachments.map((attachment) => ({
