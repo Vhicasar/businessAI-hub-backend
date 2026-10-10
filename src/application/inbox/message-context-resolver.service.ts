@@ -76,7 +76,7 @@ const productSelect = {
 
 async function liveProduct(organizationId: string, id: string, confidence: number, matchMethod: ProductMatchMethod): Promise<ResolvedProductContext | null> {
   const product = await prismaUnscoped.product.findFirst({
-    where: { id, organizationId, deletedAt: null, status: 'ACTIVE', sellable: true },
+    where: { id, organizationId, deletedAt: null, status: 'ACTIVE', sellable: true, manufacturingType: { not: 'RAW_MATERIAL' } },
     select: productSelect,
   });
   if (!product) return null;

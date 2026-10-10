@@ -59,6 +59,16 @@ export interface UploadOptions {
 }
 
 export const filesService = {
+  async listImages(limit = 60) {
+    const rows = await prisma.file.findMany({
+      where: { deletedAt: null, mimeType: { startsWith: 'image/' }, isPublic: true },
+      orderBy: { createdAt: 'desc' },
+      take: Math.min(100, Math.max(1, limit)),
+      select: { id: true, key: true, driver: true, isPublic: true, fileName: true, mimeType: true, sizeBytes: true, createdAt: true },
+    });
+    return Promise.all(rows.map(async (row) => ({ ...row, url: await storage.url(row.key, row.driver, row.isPublic) })));
+  },
+
   /**
    * Store an uploaded file and record it.
    *

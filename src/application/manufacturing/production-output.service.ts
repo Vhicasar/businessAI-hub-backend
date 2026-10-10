@@ -4,6 +4,10 @@ import { NotFoundError, ValidationError } from '../../shared/errors';
 import { auditService } from '../audit/audit.service';
 import { applyMovement } from './stock-ledger';
 import { manufacturingSettings } from './settings.service';
+import { canRecordProduction, enforceGuard } from './production-guards';
+import { Prisma } from '@prisma/client';
+import { assertCanManage } from '../inventory/warehouse-access';
+import { finishedGoodsReceiptsService } from './finished-goods-receipts.service';
 
 /**
  * What came off the line, and the batch it became.
@@ -48,10 +52,12 @@ export const productionOutputService = {
         id: true, organizationId: true, orderNumber: true, status: true,
         plannedQuantity: true, actualQuantity: true, rejectedQuantity: true,
         finishedWarehouseId: true, warehouseId: true,
+        materials: { select: { requiredQuantity: true, issuedQuantity: true, receivedQuantity: true } },
+        outputs: { select: { producedQuantity: true } },
         product: {
           select: {
             id: true, name: true, batchTracked: true, expiryTracked: true,
-            variants: { where: { deletedAt: null }, select: { id: true, sku: true }, take: 2 },
+            variants: { where: { deletedAt: null }, select: { id: true, sku: true } },
           },
         },
       },
@@ -62,10 +68,16 @@ export const productionOutputService = {
         `Output cannot be recorded against a ${order.status.toLowerCase()} production order.`,
       );
     }
+    enforceGuard(canRecordProduction({
+      ...order,
+      // Guard total physical output, including prior rejects, because those
+      // units also consumed recipe inputs.
+      actualQuantity: order.outputs.reduce((sum, item) => sum + Number(item.producedQuantity), 0),
+    }, dto.producedQuantity));
 
     if (dto.idempotencyKey) {
       const seen = await prisma.productionOutput.findFirst({
-        where: { productionOrderId, notes: { contains: dto.idempotencyKey } },
+        where: { organizationId: order.organizationId, idempotencyKey: dto.idempotencyKey },
         select: { id: true },
       });
       if (seen) return { alreadyRecorded: true, outputId: seen.id };
@@ -75,12 +87,20 @@ export const productionOutputService = {
     if (!variantId) {
       throw new ValidationError(`${order.product.name} has no variant to book output against.`);
     }
+    if (!order.product.variants.some((variant) => variant.id === variantId)) {
+      throw new ValidationError('Output must use a variant of the production order product.');
+    }
     const warehouseId = dto.warehouseId ?? order.finishedWarehouseId ?? order.warehouseId;
     if (!warehouseId) {
       throw new ValidationError(
         'This production order has no finished-goods warehouse, so there is nowhere to book the output.',
       );
     }
+    await assertCanManage(warehouseId);
+    const destination = await prisma.warehouse.findFirst({
+      where: { id: warehouseId, isActive: true, deletedAt: null }, select: { id: true },
+    });
+    if (!destination) throw new ValidationError('Select an active finished-goods warehouse belonging to this business.');
 
     const good = dto.producedQuantity - dto.rejectedQuantity;
     if (good < 0) {
@@ -89,18 +109,23 @@ export const productionOutputService = {
 
     const settings = await manufacturingSettings.get();
     const needsQc = settings.requireQcBeforeRelease;
+    const automaticBookIn = settings.finishedGoodsReceivingMode === 'AUTOMATIC';
     const sku = order.product.variants.find((v) => v.id === variantId)?.sku ?? 'BATCH';
     const productionDate = dto.productionDate ?? new Date();
 
     const result = await prisma.$transaction(async (tx) => {
       // ── The batch ──────────────────────────────────────────────────────
       let batchId: string | null = null;
-      let batchNumber: string | null = null;
-      if (order.product.batchTracked || dto.batchNumber) {
-        batchNumber =
-          dto.batchNumber ??
-          (await generateBatchNumber(tx, settings.batchNumberFormat, sku, productionDate));
-        const batch = await tx.batch.create({
+      // Every production output is traceable. The UI's blank value is a real
+      // instruction to generate—not permission to omit the batch record.
+      const batchNumber = dto.batchNumber?.trim() ||
+        (await generateBatchNumber(tx, order.organizationId, settings.batchNumberFormat, sku, productionDate));
+      await tx.$executeRaw(Prisma.sql`SELECT pg_advisory_xact_lock(hashtext(${`${order.organizationId}:batch:${batchNumber}`}))`);
+      const existingBatch = await tx.batch.findFirst({
+        where: { organizationId: order.organizationId, batchNumber }, select: { id: true },
+      });
+      if (existingBatch) throw new ValidationError(`Batch number "${batchNumber}" is already in use.`);
+      const batch = await tx.batch.create({
           data: {
             organizationId: order.organizationId,
             batchNumber,
@@ -110,18 +135,17 @@ export const productionOutputService = {
             expiryDate: order.product.expiryTracked ? dto.expiryDate ?? null : null,
             quantityProduced: good,
             quantityAvailable: good,
-            warehouseId,
-            qcStatus: 'PENDING',
+            warehouseId: automaticBookIn ? warehouseId : null,
+            qcStatus: needsQc ? 'PENDING' : 'PASSED',
           },
           select: { id: true, batchNumber: true },
-        });
-        batchId = batch.id;
-      }
+      });
+      batchId = batch.id;
 
       // ── Stock in ───────────────────────────────────────────────────────
       // Only the good quantity. Rejects are recorded on the output row and on
       // the order, and deliberately never become stock.
-      if (good > 0) {
+      if (good > 0 && automaticBookIn) {
         await applyMovement(tx, {
           organizationId: order.organizationId,
           warehouseId,
@@ -186,6 +210,13 @@ export const productionOutputService = {
         }
       }
 
+      // In confirmation mode the batch exists physically at production but
+      // no destination warehouse owns it yet. QC still needs an explicit hold
+      // record, without creating or reserving destination stock.
+      if (good > 0 && !automaticBookIn && needsQc && batchId) {
+        await tx.quarantineRecord.create({ data: { organizationId: order.organizationId, batchId, quantity: good, reason: 'Awaiting quality inspection', status: 'HELD', heldByUserId: actorUserId } });
+      }
+
       const output = await tx.productionOutput.create({
         data: {
           organizationId: order.organizationId,
@@ -202,6 +233,7 @@ export const productionOutputService = {
           responsibleEmployeeId: dto.responsibleEmployeeId ?? null,
           recordedByUserId: actorUserId,
           notes: [dto.notes, dto.idempotencyKey].filter(Boolean).join(' · ') || null,
+          idempotencyKey: dto.idempotencyKey ?? null,
         },
         select: { id: true, goodQuantity: true, producedQuantity: true, rejectedQuantity: true },
       });
@@ -234,6 +266,10 @@ export const productionOutputService = {
       })
       .catch(() => {});
 
+    if (!needsQc && good > 0) {
+      await finishedGoodsReceiptsService.ensureForOutput(result.output.id, actorUserId);
+    }
+
     return {
       alreadyRecorded: false,
       outputId: result.output.id,
@@ -244,6 +280,7 @@ export const productionOutputService = {
       goodQuantity: good,
       /** True when the stock is on the shelf but not yet sellable. */
       heldForQualityControl: needsQc && good > 0,
+      awaitingWarehouseReceipt: !automaticBookIn && !needsQc && good > 0,
     };
   },
 
@@ -271,22 +308,29 @@ export const productionOutputService = {
  */
 async function generateBatchNumber(
   tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0],
+  organizationId: string,
   format: string,
   sku: string,
   date: Date,
 ): Promise<string> {
   const yyyymmdd = date.toISOString().slice(0, 10).replace(/-/g, '');
-  const base = format
+  const formatted = format
     .replace('{SKU}', sku)
     .replace('{YYYYMMDD}', yyyymmdd)
     .replace('{YYYY}', String(date.getUTCFullYear()));
+  const base = formatted.includes('{SEQ}') ? formatted : `${formatted}-{SEQ}`;
+
+  // Serialize allocation for this tenant/day/SKU inside the same transaction
+  // as the batch and stock movement. This prevents simultaneous workers from
+  // both observing the same free sequence number.
+  await tx.$executeRaw(Prisma.sql`SELECT pg_advisory_xact_lock(hashtext(${`${organizationId}:${sku}:${yyyymmdd}`}))`);
 
   // Sequence within the day, so two runs of the same product on the same date
   // are distinguishable — which is exactly what a recall needs.
   for (let seq = 1; seq <= 999; seq++) {
     const candidate = base.replace('{SEQ}', String(seq).padStart(3, '0'));
     const clash = await tx.batch.findFirst({
-      where: { batchNumber: candidate },
+      where: { organizationId, batchNumber: candidate },
       select: { id: true },
     });
     if (!clash) return candidate;

@@ -61,7 +61,7 @@ import { developerRoutes } from './presentation/http/v1/developer.routes';
 import { publicApiRoutes } from './presentation/http/public/public-api.routes';
 import { sitesRoutes } from './presentation/http/v1/sites.routes';
 import { designsRoutes } from './presentation/http/v1/designs.routes';
-import { customDomainHost, siteHostRoutes } from './presentation/http/site-host.routes';
+import { customDomainHost, siteHostRoutes, sitePreviewRoutes } from './presentation/http/site-host.routes';
 import { analyticsRoutes } from './presentation/http/v1/analytics.routes';
 import { billingRoutes } from './presentation/http/v1/billing.routes';
 import { serviceRoutes } from './presentation/http/v1/service.routes';
@@ -141,7 +141,9 @@ export function createApp(): Express {
   app.use(
     pinoHttp({
       logger,
-      autoLogging: { ignore: (req) => req.url?.startsWith('/api/v1/health') ?? false },
+      // Preview URLs contain temporary bearer credentials in the path. Never
+      // place those raw URLs in access logs.
+      autoLogging: { ignore: (req) => (req.url?.startsWith('/api/v1/health') || req.url?.startsWith('/preview/')) ?? false },
     })
   );
 
@@ -309,6 +311,7 @@ export function createApp(): Express {
 
   // Public website hosting: renders a published site's pages by subdomain.
   app.use('/site', cors({ origin: true, credentials: false }), siteHostRoutes);
+  app.use('/preview', cors({ origin: true, credentials: false }), sitePreviewRoutes);
   app.get('/widget.js', (_req, res) => {
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     res.setHeader('Access-Control-Allow-Origin', '*');

@@ -20,6 +20,7 @@ export const warehouseSchema = z.object({
   postalCode: z.string().trim().max(30).nullable().optional(),
   country: z.string().trim().length(2).toUpperCase().nullable().optional(),
   phone: z.string().trim().max(40).nullable().optional(),
+  warehouseType: z.enum(['GENERAL', 'RAW_MATERIAL', 'PACKAGING', 'WORK_IN_PROGRESS', 'FINISHED_GOODS', 'SPARE_PARTS', 'QUARANTINE']).optional(),
   isDefault: z.boolean().optional(),
 });
 export const updateWarehouseSchema = warehouseSchema.partial();
@@ -51,6 +52,7 @@ export const listStockSchema = z.object({
   warehouseId: z.string().optional(),
   search: z.string().trim().max(120).optional(),
   lowStockOnly: z.coerce.boolean().optional(),
+  itemKind: z.enum(['PRODUCT', 'RAW_MATERIAL', 'ALL']).default('PRODUCT'),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });
@@ -79,7 +81,7 @@ export const inventoryService = {
       select: {
         id: true, name: true, code: true, managerId: true,
         addressLine1: true, addressLine2: true, city: true, state: true,
-        postalCode: true, country: true, phone: true, isDefault: true, isActive: true,
+        postalCode: true, country: true, phone: true, warehouseType: true, isDefault: true, isActive: true,
         _count: { select: { stockLevels: true } },
       },
       orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
@@ -117,6 +119,7 @@ export const inventoryService = {
         postalCode: dto.postalCode ?? null,
         country: dto.country ?? null,
         phone: dto.phone ?? null,
+        warehouseType: dto.warehouseType ?? 'GENERAL',
         isDefault: dto.isDefault ?? false,
       },
     });
@@ -146,6 +149,7 @@ export const inventoryService = {
         ...(dto.postalCode !== undefined ? { postalCode: dto.postalCode } : {}),
         ...(dto.country !== undefined ? { country: dto.country } : {}),
         ...(dto.phone !== undefined ? { phone: dto.phone } : {}),
+        ...(dto.warehouseType !== undefined ? { warehouseType: dto.warehouseType } : {}),
         ...(dto.isDefault !== undefined ? { isDefault: dto.isDefault } : {}),
       },
     });
@@ -183,6 +187,14 @@ export const inventoryService = {
         ...(dto.warehouseId ? { warehouseId: dto.warehouseId } : await warehouseFieldFilter()),
         variant: {
           deletedAt: null,
+          product: {
+            ...(dto.itemKind === 'RAW_MATERIAL'
+              ? { manufacturingType: 'RAW_MATERIAL' as const }
+              : dto.itemKind === 'PRODUCT'
+                ? { NOT: { manufacturingType: 'RAW_MATERIAL' as const } }
+                : {}),
+            ...(dto.search ? { name: { contains: dto.search, mode: 'insensitive' as const } } : {}),
+          },
           ...(dto.search
             ? {
                 OR: [
@@ -210,7 +222,7 @@ export const inventoryService = {
             price: true,
             // The unit is what makes a quantity mean anything on a shelf: "12"
             // is a different delivery in cartons than in bottles.
-            product: { select: { id: true, name: true, unit: true } },
+            product: { select: { id: true, name: true, unit: true, manufacturingType: true } },
           },
         },
       },

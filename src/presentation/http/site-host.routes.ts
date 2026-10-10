@@ -1,57 +1,210 @@
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import express from 'express';
-import { siteService, recordSiteLead } from '../../application/sites/site.service';
+import { randomUUID } from 'node:crypto';
+import { prismaUnscoped } from '../../infrastructure/database/prisma';
+import { requestContext } from '../../shared/context';
+import { sitePublicService } from '../../application/sites/site-public.service';
+import { siteBuilderService } from '../../application/sites/site-builder.service';
+import { customersService } from '../../application/customers/customers.service';
+import { ordersService } from '../../application/orders/orders.service';
+import { paymentLinksService } from '../../application/payments/payment-links.service';
+import { resolveEntitlements } from '../../application/billing/entitlements';
+import { ValidationError } from '../../shared/errors';
+import { domainConfigService } from '../../application/sites/domain-config.service';
 
-/**
- * Public hosting for published websites, path-based: /site/<subdomain>[/<slug>].
- * Serves server-rendered HTML and accepts contact-form posts as CRM leads.
- */
 export const siteHostRoutes = Router();
 siteHostRoutes.use(express.urlencoded({ extended: true }));
+export const sitePreviewRoutes = Router();
+sitePreviewRoutes.use(express.urlencoded({ extended: true }));
 
-const notFound = (res: Response) =>
-  res.status(404).type('html').send(
-    '<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;text-align:center;padding:80px"><h1>Site not found</h1></body>'
-  );
+const notFound = (res: Response) => res.status(404).type('html').send('<!doctype html><meta charset="utf-8"><title>Not found</title><body style="font-family:system-ui;text-align:center;padding:80px"><h1>Website not found</h1></body>');
+const thankYou = (res: Response, back: string) => res.type('html').send(`<!doctype html><meta charset="utf-8"><title>Thank you</title><body style="font-family:system-ui;text-align:center;padding:80px"><h1>Thank you.</h1><p>Your message has been received.</p><a href="${encodeURI(back)}">Back to website</a></body>`);
+const previewState = (res: Response, title: string, message: string, status = 410) => {
+  websiteHeaders(res, true);
+  return res.status(status).type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow,noarchive"><title>${title}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f5f1;color:#171717;font:16px/1.6 system-ui}.card{max-width:560px;margin:24px;padding:48px;border:1px solid #dedad3;border-radius:20px;background:#fff;box-shadow:0 24px 70px #00000010}h1{font-size:38px;line-height:1.1;margin:0 0 16px}</style></head><body><main class="card"><h1>${title}</h1><p>${message}</p><p>Return to Vhicasar Hub AI and generate a new preview.</p></main></body></html>`);
+};
+const websiteHeaders = (res: Response, preview = false) => {
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'self'");
+  if (preview) {
+    res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+  }
+};
 
-// Contact form → CRM lead, then a thank-you page.
-siteHostRoutes.post('/:subdomain/submit', (req, res, next) => {
-  const sub = req.params.subdomain as string;
-  recordSiteLead(sub, { name: req.body.name, email: req.body.email, message: req.body.message })
-    .catch(() => undefined)
-    .finally(() => {
-      res.type('html').send(
-        `<!doctype html><meta charset="utf-8"><title>Thanks</title>` +
-          `<body style="font-family:system-ui;text-align:center;padding:80px"><h1>Thanks!</h1>` +
-          `<p>We got your message and will be in touch.</p>` +
-          `<a href="/site/${encodeURIComponent(sub)}">&larr; Back to the site</a></body>`
-      );
-    })
-    .catch(next);
+sitePreviewRoutes.post('/:token/forms/:kind', async (req, res, next) => {
+  try {
+    const previewPath = String(req.body.previewPath ?? '').replace(/^\/+|\/+$/g, '');
+    if (previewPath && !/^[a-z0-9][a-z0-9/-]*$/i.test(previewPath)) return previewState(res, 'Preview unavailable', 'The preview return path is invalid.', 400);
+    const result = await sitePublicService.resolvePreview(req.params.token as string, previewPath);
+    if (result.state === 'expired') return previewState(res, 'Preview expired', 'This secure preview link has expired.');
+    if (result.state !== 'ok' || !result.html) return previewState(res, 'Preview unavailable', 'This preview link or page is no longer available.', 404);
+    const back = `/preview/${encodeURIComponent(req.params.token as string)}/${previewPath ? previewPath.split('/').map(encodeURIComponent).join('/') : ''}`;
+    websiteHeaders(res, true);
+    return res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow,noarchive"><title>Preview form submitted</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f5f1;color:#171717;font:16px/1.6 system-ui}.card{max-width:580px;margin:24px;padding:48px;border:1px solid #dedad3;border-radius:18px;background:#fff;box-shadow:0 24px 70px #0001;text-align:center}h1{font-size:38px;line-height:1.1;margin:0 0 16px}.button{display:inline-block;margin-top:18px;padding:12px 20px;border-radius:10px;background:#171717;color:#fff;text-decoration:none;font-weight:750}</style></head><body><main class="card"><h1>Preview form submitted</h1><p>No CRM lead, notification, email or production record was created.</p><a class="button" href="${back}">Back to preview</a></main></body></html>`);
+  } catch (error) { next(error); }
 });
 
-async function serve(req: Request, res: Response) {
-  const html = await siteService.renderHtml(req.params.subdomain as string, (req.params.slug as string) ?? '');
-  if (!html) return notFound(res);
-  res.type('html').send(html);
+sitePreviewRoutes.post('/:token/checkout', (_req, res) => {
+  res.status(409).json({ success: false, error: { code: 'PREVIEW_CHECKOUT', message: 'Checkout is simulated in preview. No order or payment was created.' } });
+});
+
+sitePreviewRoutes.post('/:token/site-event', (_req, res) => res.status(204).end());
+
+sitePreviewRoutes.get('/:token/*?', async (req, res, next) => {
+  try {
+    const path = String((req.params as Record<string, string>)[0] ?? '');
+    const result = await sitePublicService.resolvePreview(req.params.token as string, path);
+    if (result.state === 'expired') return previewState(res, 'Preview expired', 'This secure preview link has expired.');
+    if (result.state === 'invalid') return previewState(res, 'Preview unavailable', 'This preview link is invalid or is no longer available.', 404);
+    if (!result.html) return previewState(res, 'Page not found', 'This page does not exist in the current website draft.', 404);
+    websiteHeaders(res, true);
+    return res.type('html').send(result.html);
+  } catch (error) { next(error); }
+});
+
+async function siteBySubdomain(subdomain: string) {
+  return prismaUnscoped.site.findFirst({ where: { subdomain: subdomain.toLowerCase(), status: 'PUBLISHED' }, select: { id: true, organizationId: true, publishedSnapshot: true } });
 }
 
-siteHostRoutes.get('/:subdomain', (req, res, next) => serve(req, res).catch(next));
-siteHostRoutes.get('/:subdomain/:slug', (req, res, next) => serve(req, res).catch(next));
+async function capture(site: { id: string; organizationId: string }, kind: string, body: Record<string, unknown>, page: string) {
+  const name = String(body.name ?? 'Website visitor').trim();
+  const [firstName, ...last] = name.split(/\s+/);
+  await prismaUnscoped.lead.create({ data: {
+    organizationId: site.organizationId, firstName: firstName || 'Website', lastName: last.join(' ') || null,
+    email: body.email ? String(body.email).slice(0, 320) : null, source: 'WEBSITE', status: 'NEW',
+    customFields: { websiteSiteId: site.id, websitePage: page, websiteForm: kind, message: String(body.message ?? '').slice(0, 5000) },
+  } });
+  await siteBuilderService.recordEvent(site.id, 'FORM_SUBMITTED', page, undefined, undefined, { form: kind });
+}
 
-/** Serve verified customer domains. Mounted last so API and app routes always win. */
+async function checkout(site: { id: string; organizationId: string; publishedSnapshot?: unknown }, body: Record<string, unknown>) {
+  const snapshot = site.publishedSnapshot as { site?: { settings?: { commerce?: { enabled?: boolean } } } } | null;
+  if (snapshot?.site?.settings?.commerce?.enabled !== true) throw new ValidationError('Commerce is not enabled for this website');
+  const email = String(body.email ?? '').trim().toLowerCase();
+  const name = String(body.name ?? '').trim();
+  const phone = String(body.phone ?? '').trim() || undefined;
+  const items = Array.isArray(body.items) ? body.items.map((item) => item as Record<string, unknown>).map((item) => ({ variantId: String(item.variantId ?? ''), quantity: Math.max(1, Math.min(100, Math.floor(Number(item.quantity) || 1))) })).filter((item) => item.variantId) : [];
+  if (!email || !name || !items.length) throw new ValidationError('Name, email and at least one cart item are required');
+  const [firstName, ...last] = name.split(/\s+/);
+  return requestContext.run({ requestId: `site-checkout:${randomUUID()}`, correlationId: randomUUID(), organizationId: site.organizationId }, async () => {
+    let customer = await prismaUnscoped.customer.findFirst({ where: { organizationId: site.organizationId, email, deletedAt: null }, select: { id: true } });
+    if (!customer) {
+      const entitlements = await resolveEntitlements(site.organizationId);
+      const used = await prismaUnscoped.customer.count({ where: { organizationId: site.organizationId, deletedAt: null, subscriptionDraftAt: null } });
+      if (entitlements.limits.maxContacts !== null && used >= entitlements.limits.maxContacts) throw new ValidationError('This store cannot accept a new customer at the moment. Please contact the business.');
+      customer = await customersService.create({ firstName: firstName || 'Website', lastName: last.join(' ') || undefined, email, phone, marketingOptIn: false });
+    }
+    const order = await ordersService.create({ customerId: customer.id, source: 'WEB', shippingTotal: 0, items }, null);
+    const payment = await paymentLinksService.create({ resourceType: 'ORDER', resourceId: order.id, customerId: customer.id, allowPartial: false }, null);
+    await siteBuilderService.recordEvent(site.id, 'CHECKOUT_STARTED', '/checkout', undefined, undefined, { orderId: order.id });
+    return { orderId: order.id, url: payment.url };
+  });
+}
+
+siteHostRoutes.post('/:subdomain/forms/:kind', async (req, res, next) => {
+  try {
+    const site = await siteBySubdomain(req.params.subdomain as string);
+    if (!site) return notFound(res);
+    await capture(site, req.params.kind as string, req.body as Record<string, unknown>, String(req.get('referer') ?? ''));
+    return thankYou(res, `/site/${encodeURIComponent(req.params.subdomain as string)}`);
+  } catch (error) { next(error); }
+});
+
+siteHostRoutes.post('/:subdomain/site-event', async (req, res, next) => {
+  try {
+    const site = await siteBySubdomain(req.params.subdomain as string);
+    if (site) await siteBuilderService.recordEvent(site.id, String(req.body.type), String(req.body.path ?? '/'), String(req.body.session ?? ''), String(req.body.referrer ?? ''));
+    res.status(204).end();
+  } catch (error) { next(error); }
+});
+
+siteHostRoutes.post('/:subdomain/checkout', async (req, res, next) => {
+  try {
+    const site = await siteBySubdomain(req.params.subdomain as string);
+    if (!site) return notFound(res);
+    res.json(await checkout(site, req.body as Record<string, unknown>));
+  } catch (error) { next(error); }
+});
+
+siteHostRoutes.get('/:subdomain/*?', async (req, res, next) => {
+  try {
+    const path = String((req.params as Record<string, string>)[0] ?? '');
+    if (path === 'robots.txt') {
+      const pages = await sitePublicService.discovery(req.params.subdomain as string, 'subdomain');
+      if (!pages) return notFound(res);
+      return res.type('text/plain').send(`User-agent: *\nAllow: /\nSitemap: ${req.protocol}://${req.get('host')}/site/${encodeURIComponent(req.params.subdomain as string)}/sitemap.xml\n`);
+    }
+    if (path === 'sitemap.xml') {
+      const pages = await sitePublicService.discovery(req.params.subdomain as string, 'subdomain');
+      if (!pages) return notFound(res);
+      const base = `${req.protocol}://${req.get('host')}/site/${encodeURIComponent(req.params.subdomain as string)}`;
+      const urls = pages.map((slug) => `<url><loc>${base}${slug ? `/${encodeURIComponent(slug)}` : '/'}</loc></url>`).join('');
+      return res.type('application/xml').send(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls}</urlset>`);
+    }
+    const html = await sitePublicService.resolve(req.params.subdomain as string, path, 'subdomain');
+    if (!html) return notFound(res);
+    websiteHeaders(res);
+    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
+    res.type('html').send(html);
+  } catch (error) { next(error); }
+});
+
+/** Verified custom/managed domains are served last, after application routes. */
 export function customDomainHost(req: Request, res: Response, next: NextFunction) {
-  if (req.method !== 'GET') return next();
   const hostname = req.hostname.toLowerCase();
-  const slug = req.path.replace(/^\/+|\/+$/g, '');
-  if (slug.includes('/')) return next();
+  const path = req.path.replace(/^\/+|\/+$/g, '');
+  const lookup = async () => {
+    const custom = await prismaUnscoped.site.findFirst({ where: { customDomain: hostname, domainVerifiedAt: { not: null }, status: 'PUBLISHED' }, select: { id: true, organizationId: true, publishedSnapshot: true } });
+    if (custom) return custom;
+    const config = await domainConfigService.active();
+    if (!config || !hostname.endsWith(`.${config.baseDomain.toLowerCase()}`)) return null;
+    const subdomain = hostname.slice(0, -(`.${config.baseDomain}`.length));
+    if (!subdomain || subdomain.includes('.')) return null;
+    return siteBySubdomain(subdomain);
+  };
+  if (req.method === 'POST' && path.startsWith('forms/')) {
+    lookup().then(async (site) => {
+      if (!site) return next();
+      await capture(site, path.slice('forms/'.length), req.body as Record<string, unknown>, String(req.get('referer') ?? ''));
+      thankYou(res, '/');
+    }).catch(next);
+    return;
+  }
+  if (req.method === 'POST' && path === 'site-event') {
+    lookup().then(async (site) => {
+      if (site) await siteBuilderService.recordEvent(site.id, String(req.body.type), String(req.body.path ?? '/'), String(req.body.session ?? ''), String(req.body.referrer ?? ''));
+      res.status(204).end();
+    }).catch(next);
+    return;
+  }
+  if (req.method === 'POST' && path === 'checkout') {
+    lookup().then(async (site) => {
+      if (!site) return next();
+      res.json(await checkout(site, req.body as Record<string, unknown>));
+    }).catch(next);
+    return;
+  }
+  if (req.method !== 'GET') return next();
+  if (path === 'robots.txt' || path === 'sitemap.xml') {
+    Promise.all([
+      sitePublicService.discovery(hostname, 'custom'),
+      sitePublicService.discovery(hostname, 'managed'),
+    ]).then(([custom, managed]) => custom ?? managed).then((pages) => {
+      if (!pages) return next();
+      const origin = `${req.protocol}://${req.get('host')}`;
+      if (path === 'robots.txt') return res.type('text/plain').send(`User-agent: *\nAllow: /\nSitemap: ${origin}/sitemap.xml\n`);
+      const urls = pages.map((slug) => `<url><loc>${origin}${slug ? `/${encodeURIComponent(slug)}` : '/'}</loc></url>`).join('');
+      return res.type('application/xml').send(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls}</urlset>`);
+    }).catch(next);
+    return;
+  }
   Promise.all([
-    siteService.renderHtmlByManagedHost(hostname, slug),
-    siteService.renderHtmlByDomain(hostname, slug),
-  ]).then(([managed, custom]) => managed ?? custom)
-    .then((html) => {
-      if (!html) return next();
-      res.type('html').send(html);
-    })
-    .catch(next);
+    sitePublicService.resolve(hostname, path, 'custom'),
+    sitePublicService.resolve(hostname, path, 'managed'),
+  ]).then(([custom, managed]) => custom ?? managed).then((html) => {
+    if (!html) return next();
+    websiteHeaders(res);
+    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
+    res.type('html').send(html);
+  }).catch(next);
 }

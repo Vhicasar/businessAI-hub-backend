@@ -2,6 +2,7 @@ import { randomBytes } from 'crypto';
 import { prisma } from '../../infrastructure/database/prisma';
 import { NotFoundError, ValidationError } from '../../shared/errors';
 import { callerHasPermission } from '../roles/role-permissions';
+import { assertCanRead, warehouseFieldFilter } from '../inventory/warehouse-access';
 
 /**
  * Scannable documents: one place that turns any Vhicasar QR code into the
@@ -26,13 +27,16 @@ import { callerHasPermission } from '../roles/role-permissions';
  *   resolve.
  */
 
-export type DocumentKind = 'mo' | 'wo' | 'po' | 'ir';
+export type DocumentKind = 'mo' | 'wo' | 'po' | 'ir' | 'mi' | 'mr' | 'fgr';
 
 const KIND_LABEL: Record<DocumentKind, string> = {
   mo: 'Production order',
   wo: 'Maintenance work order',
   po: 'Purchase order',
   ir: 'Internal requisition',
+  mi: 'Material issue',
+  mr: 'Material requisition',
+  fgr: 'Finished goods receipt',
 };
 
 /** An action the scanner may be offered once the document is resolved. */
@@ -59,6 +63,9 @@ export interface ResolvedDocument {
   subtitle: string | null;
   status: string;
   actions: DocumentAction[];
+  relatedIssues?: Array<{ id: string; number: string; status: string; warehouseId: string }>;
+  relatedTasks?: Array<{ id: string; number: string; status: string; warehouseId: string }>;
+  details?: Record<string, unknown>;
 }
 
 /** The string encoded into the QR image on a printed document. */
@@ -72,11 +79,12 @@ export function newScanToken(): string {
 
 /** Accepts a full `vhicasar://kind/token` payload or a bare token with a kind. */
 function parse(raw: string): { kind: DocumentKind; token: string } {
-  const match = /^vhicasar:\/\/(mo|wo|po|ir)\/(.+)$/i.exec(raw.trim());
+  const match = /^vhicasar:\/\/(mo|wo|po|ir|mi|fgr|production-material-issue)\/(.+)$/i.exec(raw.trim());
   if (!match) {
     throw new ValidationError('That does not look like a Vhicasar document code.');
   }
-  return { kind: match[1]!.toLowerCase() as DocumentKind, token: match[2]! };
+  const rawKind = match[1]!.toLowerCase();
+  return { kind: rawKind === 'production-material-issue' ? 'mi' : rawKind as DocumentKind, token: match[2]! };
 }
 
 /**
@@ -97,9 +105,33 @@ const onlyAt = (status: string, allowed: string[], reason: string) =>
 export const documentQrService = {
   /** Turn a scanned code into a document plus this caller's permitted actions. */
   async resolve(raw: string): Promise<ResolvedDocument> {
+    if (!raw.trim().toLowerCase().startsWith('vhicasar://')) {
+      const reference = raw.trim();
+      const issue = await prisma.productionMaterialIssue.findFirst({ where: { number: { equals: reference, mode: 'insensitive' } }, select: { scanToken: true } });
+      if (issue) return this.resolve(scanPayload('mi', issue.scanToken));
+      const order = await prisma.productionOrder.findFirst({ where: { orderNumber: { equals: reference, mode: 'insensitive' }, deletedAt: null }, select: { id: true } });
+      if (order) {
+        const payload = await this.productionOrderPayload(order.id);
+        return this.resolve(payload.payload);
+      }
+      const requisition = await prisma.productionMaterialRequisition.findFirst({ where: { number: { equals: reference, mode: 'insensitive' } }, select: { id: true, number: true, status: true, productionOrderId: true } });
+      if (requisition) {
+        const relatedIssues = await prisma.productionMaterialIssue.findMany({ where: { requisitionId: requisition.id, ...(await warehouseFieldFilter()) }, select: { id: true, number: true, status: true, warehouseId: true }, orderBy: { number: 'asc' } });
+        return { kind: 'mr', kindLabel: KIND_LABEL.mr, id: requisition.id, title: requisition.number, subtitle: null, status: requisition.status, actions: [], relatedIssues };
+      }
+      const receipt = await prisma.finishedGoodsReceipt.findFirst({ where: { number: { equals: reference, mode: 'insensitive' } }, select: { id: true, number: true, status: true } });
+      const directTask = await prisma.finishedGoodsReceiptTask.findFirst({ where: { number: { equals: reference, mode: 'insensitive' } }, select: { scanToken: true } });
+      if (directTask) return this.resolve(scanPayload('fgr', directTask.scanToken));
+      if (receipt) {
+        const relatedTasks = await prisma.finishedGoodsReceiptTask.findMany({ where: { receiptId: receipt.id, ...(await warehouseFieldFilter()) }, select: { id: true, number: true, status: true, warehouseId: true }, orderBy: { number: 'asc' } });
+        return { kind: 'fgr', kindLabel: KIND_LABEL.fgr, id: receipt.id, title: receipt.number, subtitle: null, status: receipt.status, actions: [], relatedTasks };
+      }
+    }
     const { kind, token } = parse(raw);
 
     switch (kind) {
+      case 'mr':
+        throw new ValidationError('Material requisition QR payloads must use their opaque issue or production-order code.');
       case 'mo': {
         const order = await prisma.productionOrder.findFirst({
           where: { scanToken: token, deletedAt: null },
@@ -111,6 +143,15 @@ export const documentQrService = {
         });
         if (!order) throw new NotFoundError('Production order');
         const endpoint = `/manufacturing/orders/${order.id}/status`;
+        const relatedIssues = await prisma.productionMaterialIssue.findMany({
+          where: { productionOrderId: order.id, ...(await warehouseFieldFilter()) },
+          select: { id: true, number: true, status: true, warehouseId: true },
+          orderBy: { number: 'asc' },
+        });
+        const relatedTasks = await prisma.finishedGoodsReceiptTask.findMany({
+          where: { receipt: { productionOrderId: order.id }, ...(await warehouseFieldFilter()) },
+          select: { id: true, number: true, status: true, warehouseId: true }, orderBy: { number: 'asc' },
+        });
         return {
           kind, kindLabel: KIND_LABEL[kind], id: order.id,
           title: order.orderNumber,
@@ -120,6 +161,8 @@ export const documentQrService = {
             order.productionLine?.name,
           ].filter(Boolean).join(' · ') || null,
           status: order.status,
+          relatedIssues,
+          relatedTasks,
           actions: await decorate([
             {
               key: 'approve', label: 'Approve', permission: 'production.approve',
@@ -215,6 +258,37 @@ export const documentQrService = {
             },
           ]),
         };
+      }
+
+      case 'mi': {
+        const issue = await prisma.productionMaterialIssue.findFirst({
+          where: { scanToken: token },
+          include: { requisition: { select: { number: true } } },
+        });
+        if (!issue) throw new NotFoundError('Material issue');
+        await assertCanRead(issue.warehouseId);
+        const warehouse = await prisma.warehouse.findFirst({ where: { id: issue.warehouseId }, select: { name: true } });
+        return {
+          kind, kindLabel: KIND_LABEL[kind], id: issue.id,
+          title: issue.number,
+          subtitle: `${warehouse?.name ?? 'Warehouse'} · ${issue.requisition.number}`,
+          status: issue.status,
+          actions: await decorate([
+            {
+              key: 'start-picking', label: 'Start picking', permission: 'material_issue.pick',
+              endpoint: `/manufacturing/material-issues/${issue.id}/start-picking`, method: 'POST',
+              blockedReason: onlyAt(issue.status, ['READY_FOR_PICKING'], `Already ${issue.status.toLowerCase()}`),
+            },
+          ]),
+        };
+      }
+
+      case 'fgr': {
+        const task = await prisma.finishedGoodsReceiptTask.findFirst({ where: { scanToken: token }, include: { receipt: { include: { output: { include: { batch: true, variant: { include: { product: true } } } } } } } });
+        if (!task) throw new NotFoundError('Finished goods receipt');
+        await assertCanRead(task.warehouseId);
+        const warehouse = await prisma.warehouse.findFirst({ where: { id: task.warehouseId }, select: { name: true } });
+        return { kind, kindLabel: KIND_LABEL[kind], id: task.id, title: task.number, subtitle: `${task.receipt.output.variant.product.name} · ${task.receipt.output.batch?.batchNumber ?? 'Batch'} · ${warehouse?.name ?? 'Warehouse'}`, status: task.status, actions: [], details: { product: task.receipt.output.variant.product.name, batchNumber: task.receipt.output.batch?.batchNumber ?? null, warehouse: warehouse?.name ?? null, allocatedQuantity: Number(task.allocatedQuantity), receivedQuantity: Number(task.receivedQuantity), outstandingQuantity: Number(task.allocatedQuantity) - Number(task.receivedQuantity), unit: task.receipt.output.variant.product.unit } };
       }
     }
   },

@@ -87,7 +87,15 @@ export async function applyMovement(tx: Tx, entry: LedgerEntry): Promise<number>
     );
   }
 
-  await tx.stockLevel.update({ where: { id: level.id }, data: { quantity: next } });
+  // Optimistic compare-and-swap makes the availability check concurrency
+  // safe. Two issues cannot both spend the same starting balance.
+  const changed = await tx.stockLevel.updateMany({
+    where: { id: level.id, quantity: level.quantity, reserved: level.reserved },
+    data: { quantity: { increment: entry.quantityChange } },
+  });
+  if (changed.count !== 1) {
+    throw new ValidationError('Stock changed while this operation was being recorded. Refresh availability and try again.');
+  }
   await tx.stockMovement.create({
     data: {
       organizationId: entry.organizationId,

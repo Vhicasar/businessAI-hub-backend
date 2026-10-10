@@ -136,7 +136,12 @@ const variantSelect = {
 /** Active products relevant to the customer's message (for chat suggestions). */
 async function productContext(query: string) {
   const terms = (query.toLowerCase().match(/[a-z0-9]{3,}/g) ?? []).slice(0, 10);
-  const base = { deletedAt: null, status: 'ACTIVE' as const };
+  const base = {
+    deletedAt: null,
+    status: 'ACTIVE' as const,
+    sellable: true,
+    manufacturingType: { not: 'RAW_MATERIAL' as const },
+  };
   const select = {
     id: true,
     name: true,
@@ -360,7 +365,13 @@ async function createDraftOrder(customerId: string, items: { name?: string; quan
     if (!name) continue;
     const quantity = Math.max(1, Math.floor(Number(it.quantity) || 1));
     const product = await prisma.product.findFirst({
-      where: { deletedAt: null, status: 'ACTIVE', name: { contains: name, mode: 'insensitive' } },
+      where: {
+        deletedAt: null,
+        status: 'ACTIVE',
+        sellable: true,
+        manufacturingType: { not: 'RAW_MATERIAL' },
+        name: { contains: name, mode: 'insensitive' },
+      },
       select: { variants: variantSelect },
     });
     const variantId = product?.variants[0]?.id;

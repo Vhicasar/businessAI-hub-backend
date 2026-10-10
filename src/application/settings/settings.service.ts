@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { CURRENCIES, isSupportedCurrency } from '../../shared/currency';
@@ -74,6 +75,23 @@ export const organizationSchema = z.object({
   country: z.string().trim().length(2).toUpperCase().nullable().optional(),
   timezone: z.string().trim().max(64).optional(),
   locale: z.string().trim().max(35).optional(),
+  name: z.string().trim().min(2).max(160).optional(),
+  website: z.string().trim().max(320).nullable().optional(),
+  email: z.string().trim().email().max(320).nullable().optional(),
+  phone: z.string().trim().max(60).nullable().optional(),
+  addressLine1: z.string().trim().max(180).nullable().optional(),
+  addressLine2: z.string().trim().max(180).nullable().optional(),
+  city: z.string().trim().max(100).nullable().optional(),
+  state: z.string().trim().max(100).nullable().optional(),
+  postalCode: z.string().trim().max(30).nullable().optional(),
+  tagline: z.string().trim().max(240).nullable().optional(),
+  description: z.string().trim().max(5000).nullable().optional(),
+  supportEmail: z.string().trim().email().max(320).nullable().optional(),
+  salesEmail: z.string().trim().email().max(320).nullable().optional(),
+  alternativePhone: z.string().trim().max(60).nullable().optional(),
+  whatsappNumber: z.string().trim().max(60).nullable().optional(),
+  openingHours: z.record(z.unknown()).nullable().optional(),
+  socialLinks: z.record(z.string().trim().max(500)).nullable().optional(),
 });
 
 export const settingsService = {
@@ -159,12 +177,13 @@ export const settingsService = {
   },
 
   async getOrganization() {
-    const org = await prisma.organization.findUniqueOrThrow({
+    const [org, profile] = await Promise.all([prisma.organization.findUniqueOrThrow({
       where: { id: orgId() },
-      select: { name: true, currency: true, country: true, timezone: true, locale: true, logoFileId: true },
-    });
+      select: { name: true, currency: true, country: true, timezone: true, locale: true, logoFileId: true, website: true, email: true, phone: true, addressLine1: true, addressLine2: true, city: true, state: true, postalCode: true },
+    }), prisma.businessProfile.findUnique({ where: { organizationId: orgId() }, select: { tagline: true, description: true, supportEmail: true, salesEmail: true, alternativePhone: true, whatsappNumber: true, openingHours: true, socialLinks: true } })]);
     return {
       ...org,
+      ...profile,
       logoUrl: await filesService.urlFor(org.logoFileId),
       currencies: CURRENCIES.map((c) => ({ code: c.code, name: c.name, symbol: c.symbol })),
     };
@@ -197,16 +216,27 @@ export const settingsService = {
    * the UI collects.
    */
   async updateOrganization(dto: z.infer<typeof organizationSchema>) {
-    const org = await prisma.organization.update({
-      where: { id: orgId() },
-      data: {
+    const organizationId = orgId();
+    const [org] = await prisma.$transaction([
+      prisma.organization.update({
+      where: { id: organizationId }, data: {
         currency: dto.currency,
         ...(dto.country !== undefined ? { country: dto.country } : {}),
         ...(dto.timezone !== undefined ? { timezone: dto.timezone } : {}),
         ...(dto.locale !== undefined ? { locale: dto.locale } : {}),
+        ...(dto.name !== undefined ? { name: dto.name } : {}),
+        ...(dto.website !== undefined ? { website: dto.website } : {}),
+        ...(dto.email !== undefined ? { email: dto.email } : {}),
+        ...(dto.phone !== undefined ? { phone: dto.phone } : {}),
+        ...(dto.addressLine1 !== undefined ? { addressLine1: dto.addressLine1 } : {}),
+        ...(dto.addressLine2 !== undefined ? { addressLine2: dto.addressLine2 } : {}),
+        ...(dto.city !== undefined ? { city: dto.city } : {}),
+        ...(dto.state !== undefined ? { state: dto.state } : {}),
+        ...(dto.postalCode !== undefined ? { postalCode: dto.postalCode } : {}),
       },
-      select: { name: true, currency: true, country: true, timezone: true, locale: true },
-    });
+      select: { name: true, currency: true, country: true, timezone: true, locale: true }, }),
+      prisma.businessProfile.upsert({ where: { organizationId }, create: { organizationId, ...(dto.tagline !== undefined ? { tagline: dto.tagline } : {}), ...(dto.description !== undefined ? { description: dto.description } : {}), ...(dto.supportEmail !== undefined ? { supportEmail: dto.supportEmail } : {}), ...(dto.salesEmail !== undefined ? { salesEmail: dto.salesEmail } : {}), ...(dto.alternativePhone !== undefined ? { alternativePhone: dto.alternativePhone } : {}), ...(dto.whatsappNumber !== undefined ? { whatsappNumber: dto.whatsappNumber } : {}), ...(dto.openingHours !== undefined ? { openingHours: dto.openingHours === null ? Prisma.JsonNull : dto.openingHours as Prisma.InputJsonValue } : {}), ...(dto.socialLinks !== undefined ? { socialLinks: dto.socialLinks === null ? Prisma.JsonNull : dto.socialLinks as Prisma.InputJsonValue } : {}) }, update: { ...(dto.tagline !== undefined ? { tagline: dto.tagline } : {}), ...(dto.description !== undefined ? { description: dto.description } : {}), ...(dto.supportEmail !== undefined ? { supportEmail: dto.supportEmail } : {}), ...(dto.salesEmail !== undefined ? { salesEmail: dto.salesEmail } : {}), ...(dto.alternativePhone !== undefined ? { alternativePhone: dto.alternativePhone } : {}), ...(dto.whatsappNumber !== undefined ? { whatsappNumber: dto.whatsappNumber } : {}), ...(dto.openingHours !== undefined ? { openingHours: dto.openingHours === null ? Prisma.JsonNull : dto.openingHours as Prisma.InputJsonValue } : {}), ...(dto.socialLinks !== undefined ? { socialLinks: dto.socialLinks === null ? Prisma.JsonNull : dto.socialLinks as Prisma.InputJsonValue } : {}) } }),
+    ]);
     return org;
   },
 };

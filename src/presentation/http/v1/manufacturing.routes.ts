@@ -57,6 +57,15 @@ import {
 } from '../../../application/manufacturing/analytics.service';
 import { manufacturingAi } from '../../../application/manufacturing/manufacturing-ai.service';
 import { manufacturingAlerts } from '../../../application/manufacturing/manufacturing-alerts.service';
+import {
+  createMaterialRequisitionSchema, issueMaterialDocumentSchema,
+  materialRequisitionsService, receiveMaterialIssueSchema, createMaterialReturnSchema,
+  receiveMaterialReturnSchema,
+} from '../../../application/manufacturing/material-requisitions.service';
+import {
+  allocateFinishedGoodsSchema, finishedGoodsReceiptsService, receiveFinishedGoodsSchema,
+} from '../../../application/manufacturing/finished-goods-receipts.service';
+import { productionJobCardService } from '../../../application/manufacturing/production-job-card.service';
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<void>): RequestHandler =>
@@ -389,6 +398,77 @@ manufacturingRoutes.post(
 );
 
 // ── Materials on the line ──────────────────────────────────────────────────
+manufacturingRoutes.get('/orders/:id/material-allocation', requirePermission('material_request.view'), wrap(async (req, res) => {
+  res.json({ success: true, data: await materialRequisitionsService.allocate(req.params.id as string) });
+}));
+manufacturingRoutes.post('/orders/:id/material-requisition', requirePermission('material_request.create'), validate({ body: createMaterialRequisitionSchema }), wrap(async (req, res) => {
+  res.status(201).json({ success: true, data: await materialRequisitionsService.create(req.params.id as string, req.body) });
+}));
+manufacturingRoutes.get('/orders/:id/material-requisition', requirePermission('material_request.view'), wrap(async (req, res) => {
+  res.json({ success: true, data: await materialRequisitionsService.forOrder(req.params.id as string) });
+}));
+manufacturingRoutes.get('/material-requisitions/:id', requirePermission('material_request.view'), wrap(async (req, res) => {
+  res.json({ success: true, data: await materialRequisitionsService.get(req.params.id as string) });
+}));
+manufacturingRoutes.post('/material-requisitions/:id/approve', requirePermission('material_request.approve'), wrap(async (req, res) => {
+  res.json({ success: true, data: await materialRequisitionsService.approve(req.params.id as string) });
+}));
+manufacturingRoutes.get('/material-issues', requirePermission('material_issue.view'), validate({ query: z.object({ warehouseId: z.string().optional(), status: z.string().optional(), search: z.string().trim().optional() }) }), wrap(async (req, res) => {
+  res.json({ success: true, data: await materialRequisitionsService.listIssues(req.query as never) });
+}));
+manufacturingRoutes.get('/material-issues/lookup', requirePermission('material_issue.view'), validate({ query: z.object({ code: z.string().trim().min(1) }) }), wrap(async (req, res) => {
+  res.json({ success: true, data: await materialRequisitionsService.lookup(String(req.query.code)) });
+}));
+manufacturingRoutes.get('/material-issues/:id', requirePermission('material_issue.view'), wrap(async (req, res) => {
+  res.json({ success: true, data: await materialRequisitionsService.getIssue(req.params.id as string) });
+}));
+manufacturingRoutes.get('/material-issues/scan/:token', requirePermission('material_issue.view'), wrap(async (req, res) => {
+  res.json({ success: true, data: await materialRequisitionsService.byScanToken(req.params.token as string) });
+}));
+manufacturingRoutes.post('/material-issues/:id/start-picking', requirePermission('material_issue.pick'), wrap(async (req, res) => {
+  res.json({ success: true, data: await materialRequisitionsService.startPicking(req.params.id as string) });
+}));
+manufacturingRoutes.post('/material-issues/:id/finish-picking', requirePermission('material_issue.pick'), validate({ body: z.object({ items: z.array(z.object({ lineId: z.string(), quantity: z.coerce.number().min(0) })).optional() }) }), wrap(async (req, res) => {
+  res.json({ success: true, data: await materialRequisitionsService.finishPicking(req.params.id as string, req.body.items) });
+}));
+manufacturingRoutes.post('/material-issues/:id/confirm-issue', requirePermission('material_issue.issue'), validate({ body: issueMaterialDocumentSchema }), wrap(async (req, res) => {
+  res.json({ success: true, data: await materialRequisitionsService.confirmIssue(req.params.id as string, req.body) });
+}));
+manufacturingRoutes.post('/material-issues/:id/confirm-receipt', requirePermission('material_issue.receive'), validate({ body: receiveMaterialIssueSchema }), wrap(async (req, res) => {
+  res.json({ success: true, data: await materialRequisitionsService.confirmReceipt(req.params.id as string, req.body) });
+}));
+manufacturingRoutes.post('/orders/:id/material-returns', requirePermission('material_return.create'), validate({ body: createMaterialReturnSchema }), wrap(async (req, res) => {
+  res.status(201).json({ success: true, data: await materialRequisitionsService.createReturn(req.params.id as string, req.body) });
+}));
+manufacturingRoutes.post('/material-returns/:id/confirm', requirePermission('material_return.receive'), validate({ body: receiveMaterialReturnSchema }), wrap(async (req, res) => {
+  res.json({ success: true, data: await materialRequisitionsService.confirmReturn(req.params.id as string, req.body) });
+}));
+
+manufacturingRoutes.get('/finished-goods-receipts', requirePermission('finished_goods_receipt.view'), validate({ query: z.object({ warehouseId: z.string().optional(), status: z.string().optional(), productionOrderId: z.string().optional() }) }), wrap(async (req, res) => {
+  res.json({ success: true, data: await finishedGoodsReceiptsService.list(req.query as never) });
+}));
+manufacturingRoutes.get('/orders/:id/job-card', requirePermission('production.read'), wrap(async (req, res) => {
+  res.json({ success: true, data: await productionJobCardService.get(req.params.id as string) });
+}));
+manufacturingRoutes.get('/finished-goods-receipts/:id', requirePermission('finished_goods_receipt.view'), wrap(async (req, res) => {
+  res.json({ success: true, data: await finishedGoodsReceiptsService.get(req.params.id as string) });
+}));
+manufacturingRoutes.post('/finished-goods-receipts/:id/allocate', requirePermission('finished_goods_receipt.allocate'), validate({ body: allocateFinishedGoodsSchema }), wrap(async (req, res) => {
+  res.json({ success: true, data: await finishedGoodsReceiptsService.allocate(req.params.id as string, req.body) });
+}));
+manufacturingRoutes.get('/finished-goods-tasks', requirePermission('finished_goods_receipt.view'), validate({ query: z.object({ warehouseId: z.string().optional(), status: z.string().optional() }) }), wrap(async (req, res) => {
+  res.json({ success: true, data: await finishedGoodsReceiptsService.listTasks(req.query as never) });
+}));
+manufacturingRoutes.get('/finished-goods-tasks/lookup', requirePermission('finished_goods_receipt.view'), validate({ query: z.object({ code: z.string().trim().min(1) }) }), wrap(async (req, res) => {
+  res.json({ success: true, data: await finishedGoodsReceiptsService.lookup(String(req.query.code)) });
+}));
+manufacturingRoutes.get('/finished-goods-tasks/:id', requirePermission('finished_goods_receipt.view'), wrap(async (req, res) => {
+  res.json({ success: true, data: await finishedGoodsReceiptsService.getTask(req.params.id as string) });
+}));
+manufacturingRoutes.post('/finished-goods-tasks/:id/receive', requirePermission('finished_goods_receipt.receive'), validate({ body: receiveFinishedGoodsSchema }), wrap(async (req, res) => {
+  res.json({ success: true, data: await finishedGoodsReceiptsService.receive(req.params.id as string, req.body) });
+}));
+
 manufacturingRoutes.get(
   '/orders/:id/material-history',
   requirePermission('production.read'),

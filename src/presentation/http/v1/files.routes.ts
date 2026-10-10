@@ -21,6 +21,15 @@ const upload = multer({
 export const filesRoutes = Router();
 filesRoutes.use(authenticate, requireTenant);
 
+filesRoutes.get(
+  '/',
+  requirePermission('files.upload'),
+  wrap(async (req, res) => {
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 60));
+    res.json({ success: true, data: await filesService.listImages(limit) });
+  }),
+);
+
 /**
  * Generic image upload. Returns { id, url } which the caller then attaches to
  * whatever it's illustrating (an org logo, a product, an employee). Kept

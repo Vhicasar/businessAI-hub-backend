@@ -4,6 +4,7 @@ import { NotFoundError, ValidationError } from '../../shared/errors';
 import { auditService } from '../audit/audit.service';
 import { currentOrgId } from '../billing/entitlements';
 import { applyMovement } from './stock-ledger';
+import { assertCanManage } from '../inventory/warehouse-access';
 
 /**
  * Materials leaving a store for a production line.
@@ -82,17 +83,27 @@ export const materialConsumptionService = {
     actorUserId: string,
   ) {
     const order = await loadOrder(productionOrderId);
+    const managedRequest = await prisma.productionMaterialRequisition.findFirst({
+      where: { productionOrderId, status: { notIn: ['REJECTED', 'CANCELLED'] } }, select: { number: true },
+    });
+    if (managedRequest) {
+      throw new ValidationError(`Use the warehouse-specific material issues under ${managedRequest.number}; direct issue is disabled for this order.`);
+    }
     if (!['APPROVED', 'READY', 'IN_PROGRESS', 'PAUSED'].includes(order.status)) {
       throw new ValidationError(
         `Materials cannot be issued to a ${order.status.toLowerCase()} production order.`,
       );
     }
+    if (order.warehouseId !== dto.warehouseId) {
+      throw new ValidationError('Materials must be issued from the source warehouse selected on this production order.');
+    }
+    await assertCanManage(dto.warehouseId);
 
     // Checked before anything moves, so a repeat of the same request is a
     // no-op rather than a second withdrawal.
     if (dto.idempotencyKey) {
-      const seen = await prisma.materialConsumption.findFirst({
-        where: { productionOrderId, notes: { contains: dto.idempotencyKey } },
+      const seen = await prisma.productionOperation.findFirst({
+        where: { productionOrderId, kind: 'MATERIAL_ISSUE', idempotencyKey: dto.idempotencyKey },
         select: { id: true },
       });
       if (seen) {
@@ -101,12 +112,22 @@ export const materialConsumptionService = {
     }
 
     const warehouse = await prisma.warehouse.findFirst({
-      where: { id: dto.warehouseId, deletedAt: null },
+      where: { id: dto.warehouseId, deletedAt: null, isActive: true },
       select: { id: true, name: true },
     });
     if (!warehouse) throw new NotFoundError('Warehouse');
 
     const issued = await prisma.$transaction(async (tx) => {
+      if (dto.idempotencyKey) {
+        await tx.productionOperation.create({
+          data: {
+            organizationId: order.organizationId,
+            productionOrderId,
+            kind: 'MATERIAL_ISSUE',
+            idempotencyKey: dto.idempotencyKey,
+          },
+        });
+      }
       const lines: IssuedLine[] = [];
       for (const item of dto.items) {
         const material = order.materials.find((m) => m.variantId === item.variantId);

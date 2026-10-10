@@ -245,6 +245,7 @@ enum StockMovementType {
   ADJUSTMENT
   DAMAGE
   PRODUCTION
+  FINISHED_GOODS_RECEIPT
   /// Materials leaving a store for a production line. Distinct from
   /// CONSUMPTION: issued stock has left the shelf but may come back unused,
   /// and a business that cannot tell the two apart cannot explain its variance.
@@ -259,6 +260,19 @@ enum StockMovementType {
   QC_RELEASE
   QC_REJECTION
   MAINTENANCE_CONSUMPTION
+}
+
+enum FinishedGoodsReceivingMode {
+  AUTOMATIC
+  WAREHOUSE_CONFIRMATION
+}
+
+enum FinishedGoodsReceiptStatus {
+  PENDING_ALLOCATION
+  AWAITING_RECEIPT
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
 }
 
 /// What a product is, to a business that makes things.
@@ -316,6 +330,42 @@ enum ProductionPriority {
   NORMAL
   HIGH
   URGENT
+}
+
+enum MaterialIssueApprovalMode {
+  NONE
+  SUPERVISOR
+  WAREHOUSE_MANAGER
+}
+
+enum MaterialRequisitionStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  READY_FOR_ISSUE
+  PARTIALLY_ISSUED
+  ISSUED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  REJECTED
+  CANCELLED
+}
+
+enum ProductionMaterialIssueStatus {
+  READY_FOR_PICKING
+  PICKING
+  READY_FOR_HANDOVER
+  PARTIALLY_ISSUED
+  ISSUED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
+}
+
+enum ProductionMaterialReturnStatus {
+  AWAITING_WAREHOUSE_RECEIPT
+  RECEIVED
+  CANCELLED
 }
 
 enum ProductionLineStatus {
@@ -1860,6 +1910,7 @@ model Product {
 
   @@unique([organizationId, slug])
   @@index([organizationId, status])
+  @@index([organizationId, manufacturingType, status])
   @@index([organizationId, subscriptionDraftAt])
   @@index([categoryId])
   @@index([brandId])
@@ -4872,13 +4923,18 @@ model KnowledgeChunk {
 
 enum SiteStatus {
   DRAFT
+  PUBLISHING
   PUBLISHED
+  FAILED
+  UNPUBLISHED
 }
 
 model Site {
   id                      String     @id @default(cuid())
-  organizationId          String     @unique
+  organizationId          String
   name                    String
+  templateId              String?
+  schemaVersion           Int        @default(2)
   /// Platform subdomain: <subdomain>.sites.host. Unique across the platform.
   subdomain               String?    @unique
   /// Optional customer-owned hostname, e.g. www.example.com.
@@ -4886,15 +4942,28 @@ model Site {
   domainVerificationToken String?
   domainVerifiedAt        DateTime?
   status                  SiteStatus @default(DRAFT)
-  /// { primaryColor, accentColor, font }
+  /// Structured global design tokens used by the editor and renderer.
   theme                   Json?
-  /// { title, description }
+  /// Header, footer and navigation schema.
+  navigation              Json?
+  /// Commerce, forms, analytics, privacy and integration configuration.
+  settings                Json?
+  /// Global SEO defaults.
   seo                     Json?
+  thumbnailUrl            String?
+  /// Immutable live release. Draft edits never mutate this value.
+  publishedSnapshot       Json?
+  publishError            String?
+  lastEditedByUserId      String?
   publishedAt             DateTime?
+  unpublishedAt           DateTime?
   createdAt               DateTime   @default(now())
   updatedAt               DateTime   @updatedAt
 
   pages SitePage[]
+
+  @@index([organizationId])
+  @@index([organizationId, updatedAt])
 }
 
 model SitePage {
@@ -4907,6 +4976,9 @@ model SitePage {
   /// Ordered array of content blocks.
   blocks         Json     @default("[]")
   seo            Json?
+  isHome         Boolean  @default(false)
+  showInNav      Boolean  @default(true)
+  status         String   @default("DRAFT")
   position       Int      @default(0)
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
@@ -4924,10 +4996,29 @@ model SiteVersion {
   label          String
   /// Full snapshot: { site: { name, theme, seo }, pages: [{ title, slug, blocks, seo, position }] }.
   snapshot       Json
+  editorUserId   String?
+  isPublished    Boolean  @default(false)
   createdAt      DateTime @default(now())
 
   @@index([siteId])
   @@index([organizationId])
+}
+
+/// Privacy-safe first-party analytics emitted by published websites.
+model SiteEvent {
+  id             String   @id @default(cuid())
+  organizationId String
+  siteId         String
+  type           String
+  path           String
+  referrerHost   String?
+  sessionHash    String?
+  metadata       Json?
+  createdAt      DateTime @default(now())
+
+  @@index([siteId, createdAt])
+  @@index([organizationId, createdAt])
+  @@index([siteId, type, createdAt])
 }
 
 /// Platform-wide subdomain hosting destinations managed by Vhicasar Admin.
@@ -5980,6 +6071,13 @@ model BusinessProfile {
   tags               String[]
   /// {mon:{open:"08:00",close:"18:00",closed:false}, …}
   openingHours       Json?
+  /// Public contact channels shown on business websites when enabled.
+  supportEmail        String?
+  salesEmail          String?
+  alternativePhone   String?
+  whatsappNumber     String?
+  /// Map of approved public network names to profile URLs.
+  socialLinks         Json?
   latitude           Decimal? @db.Decimal(10, 7)
   longitude          Decimal? @db.Decimal(10, 7)
   /// Rolling average of customer ratings, 0–5.
@@ -6660,6 +6758,8 @@ model ManufacturingSettings {
   batchNumberFormat         String  @default("{SKU}-{YYYYMMDD}-{SEQ}")
   /// Whether a batch must pass QC before its stock counts as sellable.
   requireQcBeforeRelease    Boolean @default(true)
+  materialIssueApprovalMode MaterialIssueApprovalMode @default(NONE)
+  finishedGoodsReceivingMode FinishedGoodsReceivingMode @default(AUTOMATIC)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -6813,6 +6913,7 @@ model ProductionMaterial {
   /// Running totals, updated by issue and consumption transactions.
   issuedQuantity    Decimal @default(0) @db.Decimal(12, 3)
   consumedQuantity  Decimal @default(0) @db.Decimal(12, 3)
+  receivedQuantity  Decimal @default(0) @db.Decimal(12, 3)
   unit              String?
 
   productionOrder ProductionOrder @relation(fields: [productionOrderId], references: [id], onDelete: Cascade)
@@ -6820,6 +6921,165 @@ model ProductionMaterial {
 
   @@unique([productionOrderId, variantId])
   @@index([organizationId])
+}
+
+model ProductionMaterialRequisition {
+  id                String                    @id @default(cuid())
+  organizationId    String
+  number            String
+  productionOrderId String
+  status            MaterialRequisitionStatus @default(DRAFT)
+  requestedByUserId String?
+  requestedAt       DateTime                  @default(now())
+  requiredAt        DateTime?
+  approvedByUserId  String?
+  approvedAt        DateTime?
+  rejectedByUserId  String?
+  rejectedAt        DateTime?
+  rejectionReason   String?
+  notes             String?
+  createdAt         DateTime                  @default(now())
+  updatedAt         DateTime                  @updatedAt
+  lines             ProductionMaterialRequisitionLine[]
+  issues            ProductionMaterialIssue[]
+
+  @@unique([organizationId, number])
+  @@index([organizationId, productionOrderId])
+  @@index([organizationId, status])
+}
+
+model ProductionMaterialRequisitionLine {
+  id                    String   @id @default(cuid())
+  organizationId        String
+  requisitionId         String
+  productionMaterialId  String
+  variantId             String
+  requiredQuantity      Decimal  @db.Decimal(12, 3)
+  allocatedQuantity     Decimal  @default(0) @db.Decimal(12, 3)
+  shortageQuantity      Decimal  @default(0) @db.Decimal(12, 3)
+  unit                   String?
+  requisition            ProductionMaterialRequisition @relation(fields: [requisitionId], references: [id], onDelete: Cascade)
+  allocations            ProductionMaterialAllocation[]
+  issueLines             ProductionMaterialIssueLine[]
+
+  @@unique([requisitionId, productionMaterialId])
+  @@index([organizationId, variantId])
+}
+
+model ProductionMaterialAllocation {
+  id                String   @id @default(cuid())
+  organizationId    String
+  requisitionLineId String
+  warehouseId       String
+  batchId            String?
+  quantity           Decimal  @db.Decimal(12, 3)
+  createdAt          DateTime @default(now())
+  requisitionLine    ProductionMaterialRequisitionLine @relation(fields: [requisitionLineId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, warehouseId])
+  @@index([requisitionLineId])
+}
+
+model ProductionMaterialIssue {
+  id                  String   @id @default(cuid())
+  organizationId      String
+  number              String
+  productionOrderId   String
+  requisitionId       String
+  warehouseId         String
+  status              ProductionMaterialIssueStatus @default(READY_FOR_PICKING)
+  scanToken           String   @unique
+  pickedByUserId      String?
+  pickedAt            DateTime?
+  issuedByUserId      String?
+  issuedAt            DateTime?
+  receivedByUserId    String?
+  receivedAt          DateTime?
+  issueIdempotencyKey String?
+  receiptIdempotencyKey String?
+  notes               String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  requisition         ProductionMaterialRequisition @relation(fields: [requisitionId], references: [id], onDelete: Cascade)
+  lines               ProductionMaterialIssueLine[]
+  discrepancies       ProductionMaterialDiscrepancy[]
+
+  @@unique([organizationId, number])
+  @@unique([organizationId, issueIdempotencyKey])
+  @@unique([organizationId, receiptIdempotencyKey])
+  @@index([organizationId, warehouseId, status])
+  @@index([productionOrderId])
+}
+
+model ProductionMaterialIssueLine {
+  id               String  @id @default(cuid())
+  organizationId   String
+  issueId           String
+  requisitionLineId String
+  variantId        String
+  requestedQuantity Decimal @db.Decimal(12, 3)
+  pickedQuantity    Decimal @default(0) @db.Decimal(12, 3)
+  issuedQuantity    Decimal @default(0) @db.Decimal(12, 3)
+  receivedQuantity  Decimal @default(0) @db.Decimal(12, 3)
+  varianceReason    String?
+  notes             String?
+  issue              ProductionMaterialIssue @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  requisitionLine    ProductionMaterialRequisitionLine @relation(fields: [requisitionLineId], references: [id])
+
+  @@unique([issueId, requisitionLineId])
+  @@index([organizationId, variantId])
+}
+
+model ProductionMaterialDiscrepancy {
+  id               String   @id @default(cuid())
+  organizationId   String
+  issueId           String
+  issueLineId       String
+  expectedQuantity Decimal  @db.Decimal(12, 3)
+  reportedQuantity Decimal  @db.Decimal(12, 3)
+  difference       Decimal  @db.Decimal(12, 3)
+  reason           String
+  notes            String?
+  reportedByUserId String?
+  reportedAt       DateTime @default(now())
+  resolvedAt       DateTime?
+  issue            ProductionMaterialIssue @relation(fields: [issueId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, issueId])
+}
+
+model ProductionMaterialReturn {
+  id                    String   @id @default(cuid())
+  organizationId        String
+  number                String
+  productionOrderId     String
+  warehouseId           String
+  status                ProductionMaterialReturnStatus @default(AWAITING_WAREHOUSE_RECEIPT)
+  requestedByUserId     String?
+  receivedByUserId      String?
+  receivedAt            DateTime?
+  receiptIdempotencyKey String?
+  scanToken             String   @unique
+  notes                 String?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+  lines                 ProductionMaterialReturnLine[]
+
+  @@unique([organizationId, number])
+  @@unique([organizationId, receiptIdempotencyKey])
+  @@index([organizationId, warehouseId, status])
+}
+
+model ProductionMaterialReturnLine {
+  id               String  @id @default(cuid())
+  organizationId   String
+  returnId          String
+  variantId         String
+  requestedQuantity Decimal @db.Decimal(12, 3)
+  receivedQuantity Decimal @default(0) @db.Decimal(12, 3)
+  return            ProductionMaterialReturn @relation(fields: [returnId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, variantId])
 }
 
 /// Material physically leaving a store for a line, and what was really used.
@@ -6870,6 +7130,9 @@ model ProductionOutput {
   responsibleEmployeeId String?
   recordedByUserId      String?
   notes                 String?
+  /// Caller supplied retry key. Unique per tenant prevents a replay from
+  /// booking finished stock twice, even when two requests arrive together.
+  idempotencyKey        String?
 
   createdAt DateTime @default(now())
 
@@ -6877,9 +7140,102 @@ model ProductionOutput {
   variant         ProductVariant  @relation(fields: [variantId], references: [id])
   warehouse       Warehouse       @relation(fields: [warehouseId], references: [id])
   batch           Batch?          @relation(fields: [batchId], references: [id])
+  finishedGoodsReceipt FinishedGoodsReceipt?
 
   @@index([organizationId, productionDate])
   @@index([productionOrderId])
+  @@unique([organizationId, idempotencyKey])
+}
+
+model FinishedGoodsReceipt {
+  id                String @id @default(cuid())
+  organizationId    String
+  number            String
+  productionOrderId String
+  productionOutputId String @unique
+  batchId           String
+  variantId         String
+  approvedQuantity  Decimal @db.Decimal(12, 3)
+  allocatedQuantity Decimal @default(0) @db.Decimal(12, 3)
+  receivedQuantity  Decimal @default(0) @db.Decimal(12, 3)
+  status            FinishedGoodsReceiptStatus @default(PENDING_ALLOCATION)
+  scanToken         String @unique
+  createdByUserId   String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  output            ProductionOutput @relation(fields: [productionOutputId], references: [id], onDelete: Restrict)
+  tasks             FinishedGoodsReceiptTask[]
+
+  @@unique([organizationId, number])
+  @@index([organizationId, productionOrderId, status])
+  @@index([organizationId, batchId])
+}
+
+model FinishedGoodsReceiptTask {
+  id                String @id @default(cuid())
+  organizationId    String
+  receiptId         String
+  number            String
+  warehouseId       String
+  allocatedQuantity Decimal @db.Decimal(12, 3)
+  receivedQuantity  Decimal @default(0) @db.Decimal(12, 3)
+  status            FinishedGoodsReceiptStatus @default(AWAITING_RECEIPT)
+  scanToken         String @unique
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  receipt           FinishedGoodsReceipt @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+  deliveries        FinishedGoodsReceiptDelivery[]
+  discrepancies     FinishedGoodsReceiptDiscrepancy[]
+
+  @@unique([organizationId, number])
+  @@index([organizationId, warehouseId, status])
+}
+
+model FinishedGoodsReceiptDelivery {
+  id             String @id @default(cuid())
+  organizationId String
+  taskId         String
+  quantity       Decimal @db.Decimal(12, 3)
+  storageLocation String?
+  notes          String?
+  idempotencyKey String
+  receivedByUserId String?
+  receivedAt     DateTime @default(now())
+  task           FinishedGoodsReceiptTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, idempotencyKey])
+  @@index([taskId, receivedAt])
+}
+
+model FinishedGoodsReceiptDiscrepancy {
+  id             String @id @default(cuid())
+  organizationId String
+  taskId         String
+  expectedQuantity Decimal @db.Decimal(12, 3)
+  receivedQuantity Decimal @db.Decimal(12, 3)
+  difference     Decimal @db.Decimal(12, 3)
+  reason         String
+  notes          String?
+  reportedByUserId String?
+  reportedAt     DateTime @default(now())
+  resolvedAt     DateTime?
+  task           FinishedGoodsReceiptTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, taskId])
+}
+
+/// Idempotency receipt for multi-row manufacturing mutations such as issuing
+/// several materials. The unique key is acquired inside the stock transaction.
+model ProductionOperation {
+  id                String   @id @default(cuid())
+  organizationId    String
+  productionOrderId String
+  kind              String
+  idempotencyKey    String
+  createdAt         DateTime @default(now())
+
+  @@unique([organizationId, kind, idempotencyKey])
+  @@index([productionOrderId, createdAt])
 }
 
 /// A traceable lot.

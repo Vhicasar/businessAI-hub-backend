@@ -7,6 +7,8 @@ import { callerHasPermission } from '../roles/role-permissions';
 import { bomService } from './bom.service';
 import { availableIn } from './stock-ledger';
 import type { ProductionOrderStatus } from '@prisma/client';
+import { assertCanRead } from '../inventory/warehouse-access';
+import { canCompleteProduction, canStartProduction, enforceGuard } from './production-guards';
 
 /**
  * Production orders — a committed decision to make something.
@@ -25,9 +27,10 @@ export const createProductionOrderSchema = z.object({
   planId: z.string().min(1).optional(),
   productionLineId: z.string().min(1).nullable().optional(),
   /** Where materials are drawn from. */
+  /** Optional preference; allocation may use several warehouses. */
   warehouseId: z.string().min(1).nullable().optional(),
   /** Where finished goods are booked in. */
-  finishedWarehouseId: z.string().min(1).nullable().optional(),
+  finishedWarehouseId: z.string().min(1, 'A finished-goods warehouse is required'),
   startDate: z.coerce.date().nullable().optional(),
   expectedCompletionDate: z.coerce.date().nullable().optional(),
   responsibleEmployeeId: z.string().min(1).nullable().optional(),
@@ -133,7 +136,7 @@ export const productionOrdersService = {
         materials: {
           select: {
             id: true, requiredQuantity: true, issuedQuantity: true,
-            consumedQuantity: true, unit: true,
+            consumedQuantity: true, receivedQuantity: true, unit: true,
             variant: {
               select: {
                 id: true, sku: true,
@@ -145,7 +148,17 @@ export const productionOrdersService = {
       },
     });
     if (!order) throw new NotFoundError('Production order');
-    return order;
+    const start = canStartProduction(order);
+    const complete = canCompleteProduction(order);
+    return {
+      ...order,
+      setupRequired: !order.warehouseId || !order.finishedWarehouseId,
+      capabilities: {
+        start,
+        recordOutput: start,
+        complete,
+      },
+    };
   },
 
   /**
@@ -157,9 +170,16 @@ export const productionOrdersService = {
   async create(dto: z.infer<typeof createProductionOrderSchema>) {
     const product = await prisma.product.findFirst({
       where: { id: dto.productId, deletedAt: null },
-      select: { id: true, name: true, manufacturingEnabled: true },
+      select: { id: true, name: true, manufacturingEnabled: true, manufacturingType: true },
     });
     if (!product) throw new NotFoundError('Product');
+    if (product.manufacturingType === 'RAW_MATERIAL') {
+      throw new ValidationError('A raw material cannot be the finished output of a production order.');
+    }
+    await Promise.all([
+      ...(dto.warehouseId ? [assertProductionWarehouse(dto.warehouseId, 'preferred raw-material')] : []),
+      assertProductionWarehouse(dto.finishedWarehouseId, 'finished-goods'),
+    ]);
 
     const bom = dto.bomId
       ? await prisma.billOfMaterial.findFirst({
@@ -191,7 +211,7 @@ export const productionOrdersService = {
           plannedQuantity: dto.plannedQuantity,
           productionLineId: dto.productionLineId ?? null,
           warehouseId: dto.warehouseId ?? null,
-          finishedWarehouseId: dto.finishedWarehouseId ?? null,
+          finishedWarehouseId: dto.finishedWarehouseId,
           startDate: dto.startDate ?? null,
           expectedCompletionDate: dto.expectedCompletionDate ?? null,
           responsibleEmployeeId: dto.responsibleEmployeeId ?? null,
@@ -242,6 +262,8 @@ export const productionOrdersService = {
     if (before.status === 'COMPLETED' || before.status === 'CANCELLED') {
       throw new ValidationError(`A ${before.status.toLowerCase()} production order cannot be changed.`);
     }
+    if (dto.warehouseId) await assertProductionWarehouse(dto.warehouseId, 'raw-material');
+    if (dto.finishedWarehouseId) await assertProductionWarehouse(dto.finishedWarehouseId, 'finished-goods');
 
     const order = await prisma.productionOrder.update({
       where: { id },
@@ -371,7 +393,11 @@ export const productionOrdersService = {
 
     const order = await prisma.productionOrder.findFirst({
       where: { id, deletedAt: null },
-      select: { id: true, status: true, orderNumber: true },
+      select: {
+        id: true, status: true, orderNumber: true, warehouseId: true,
+        finishedWarehouseId: true, plannedQuantity: true, actualQuantity: true,
+        materials: { select: { requiredQuantity: true, issuedQuantity: true, receivedQuantity: true } },
+      },
     });
     if (!order) throw new NotFoundError('Production order');
 
@@ -385,6 +411,8 @@ export const productionOrdersService = {
               .join(' or ')}.`,
       );
     }
+    if (to === 'IN_PROGRESS') enforceGuard(canStartProduction(order));
+    if (to === 'COMPLETED') enforceGuard(canCompleteProduction(order));
 
     const updated = await prisma.productionOrder.update({
       where: { id },
@@ -480,4 +508,13 @@ async function nextOrderNumber(): Promise<string> {
     if (!clash) return candidate;
   }
   throw new ConflictError('Could not allocate a production order number.');
+}
+
+async function assertProductionWarehouse(id: string, label: string): Promise<void> {
+  await assertCanRead(id);
+  const warehouse = await prisma.warehouse.findFirst({
+    where: { id, deletedAt: null, isActive: true },
+    select: { id: true },
+  });
+  if (!warehouse) throw new ValidationError(`Select an active ${label} warehouse belonging to this business.`);
 }

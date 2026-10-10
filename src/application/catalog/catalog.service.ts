@@ -1,4 +1,4 @@
-import { ConflictError, NotFoundError } from '../../shared/errors';
+import { ConflictError, NotFoundError, ValidationError } from '../../shared/errors';
 import { prisma } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { inventoryService } from '../inventory/inventory.service';
@@ -59,6 +59,10 @@ const productSelect = {
   expiryTracked: true,
   shelfLifeDays: true,
   expiryAlertDays: true,
+  manufacturingType: true,
+  purchaseEnabled: true,
+  sellable: true,
+  manufacturingEnabled: true,
   createdAt: true,
   subscriptionDraftAt: true,
   subscriptionDraftReason: true,
@@ -179,6 +183,11 @@ export const catalogService = {
         deletedAt: null,
         subscriptionDraftAt: dto.subscriptionState === 'draft' ? { not: null } : null,
         ...(dto.status ? { status: dto.status } : {}),
+        ...(dto.itemKind === 'RAW_MATERIAL'
+          ? { manufacturingType: 'RAW_MATERIAL' as const }
+          : dto.itemKind === 'PRODUCT'
+            ? { NOT: { manufacturingType: 'RAW_MATERIAL' as const } }
+            : {}),
         ...(dto.categoryId ? { categoryId: dto.categoryId } : {}),
         ...(dto.brandId ? { brandId: dto.brandId } : {}),
         ...(dto.search
@@ -258,6 +267,11 @@ export const catalogService = {
           brandId: dto.brandId ?? null,
           status: subscriptionDraftReason ? 'DRAFT' : dto.status,
           taxRate: dto.taxRate,
+          manufacturingType: dto.manufacturingType ?? null,
+          purchaseEnabled: dto.purchaseEnabled ?? true,
+          // This is a domain rule, not a UI preference: manufacturing inputs
+          // must never become sales candidates through a crafted request.
+          sellable: dto.manufacturingType === 'RAW_MATERIAL' ? false : (dto.sellable ?? true),
           unit: dto.unit ?? null,
           batchTracked: dto.batchTracked ?? false,
           expiryTracked: dto.expiryTracked ?? false,
@@ -317,7 +331,10 @@ export const catalogService = {
   },
 
   async updateProduct(id: string, dto: UpdateProductDto) {
-    await this.getProduct(id);
+    const existing = await this.getProduct(id);
+    if ((existing.manufacturingType === 'RAW_MATERIAL' || dto.manufacturingType === 'RAW_MATERIAL') && dto.sellable === true) {
+      throw new ValidationError('Raw materials cannot be marked as sellable.');
+    }
     const product = await prisma.product.update({
       where: { id },
       data: {
@@ -332,6 +349,9 @@ export const catalogService = {
         ...(dto.brandId !== undefined ? { brandId: dto.brandId } : {}),
         ...(dto.status !== undefined ? { status: dto.status } : {}),
         ...(dto.taxRate !== undefined ? { taxRate: dto.taxRate } : {}),
+        ...(dto.manufacturingType !== undefined ? { manufacturingType: dto.manufacturingType } : {}),
+        ...(dto.purchaseEnabled !== undefined ? { purchaseEnabled: dto.purchaseEnabled } : {}),
+        ...(dto.sellable !== undefined ? { sellable: dto.manufacturingType === 'RAW_MATERIAL' || existing.manufacturingType === 'RAW_MATERIAL' ? false : dto.sellable } : {}),
       },
       select: productSelect,
     });

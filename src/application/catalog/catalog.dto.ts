@@ -5,6 +5,8 @@ export const listProductsSchema = z.object({
   categoryId: z.string().optional(),
   brandId: z.string().optional(),
   status: z.enum(['DRAFT', 'ACTIVE', 'ARCHIVED']).optional(),
+  /** Catalog management separates manufacturing inputs from sale products. */
+  itemKind: z.enum(['PRODUCT', 'RAW_MATERIAL', 'ALL']).default('PRODUCT'),
   subscriptionState: z.enum(['active', 'draft']).default('active'),
   /**
    * Cursor paging orders by id under the hood, so every sort has to end in a
@@ -48,6 +50,11 @@ export const createProductSchema = z.object({
   brandId: z.string().nullable().optional(),
   status: z.enum(['DRAFT', 'ACTIVE', 'ARCHIVED']).default('ACTIVE'),
   taxRate: z.coerce.number().min(0).max(100).default(0),
+  manufacturingType: z.enum([
+    'RAW_MATERIAL', 'PACKAGING', 'WORK_IN_PROGRESS', 'FINISHED_GOOD', 'SPARE_PART', 'CONSUMABLE',
+  ]).nullable().optional(),
+  purchaseEnabled: z.boolean().optional(),
+  sellable: z.boolean().optional(),
   /**
    * How this product is counted — "kg", "bag", "case". Free text, because a
    * business's own vocabulary is what its warehouse staff read on the shelf.

@@ -4,6 +4,7 @@ import { ConflictError, NotFoundError, ValidationError } from '../../shared/erro
 import { auditService } from '../audit/audit.service';
 import { currentOrgId } from '../billing/entitlements';
 import { quarantineService } from './quarantine.service';
+import { finishedGoodsReceiptsService } from './finished-goods-receipts.service';
 
 /**
  * Quality control (§14).
@@ -340,6 +341,10 @@ export const qualityControlService = {
           actorUserId,
         );
       }
+    }
+
+    if (inspection.batchId && (dto.status === 'PASSED' || dto.status === 'CONDITIONAL')) {
+      await finishedGoodsReceiptsService.ensureForBatch(inspection.batchId, actorUserId);
     }
 
     await auditService

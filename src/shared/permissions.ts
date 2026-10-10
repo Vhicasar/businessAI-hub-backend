@@ -44,6 +44,10 @@ export const PERMISSION_MODULES = {
     // rights from deciding a run should happen at all.
     'issue_material', 'record_output',
   ],
+  material_request: ['view', 'create', 'submit', 'approve', 'reject'],
+  material_issue: ['view', 'pick', 'issue', 'receive', 'report_discrepancy'],
+  material_return: ['view', 'create', 'receive'],
+  finished_goods_receipt: ['view', 'create', 'allocate', 'receive', 'report_discrepancy', 'resolve_discrepancy', 'cancel'],
   qc: ['read', 'inspect', 'approve', 'reject', 'quarantine', 'release'],
   equipment: ['read', 'create', 'update', 'delete'],
   // Physical locations the business trades from. Kept apart from
@@ -203,7 +207,7 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, { description: string; permis
     description: 'Inventory, suppliers, purchasing, receiving and dispatch',
     permissions: [
       'dashboard.view',
-      ...keysFor('inventory', 'purchasing', 'suppliers'),
+      ...keysFor('inventory', 'purchasing', 'suppliers', 'material_issue', 'material_return', 'finished_goods_receipt'),
       // Stock is held at a branch, so a warehouse hand has to be able to name
       // one. Opening and closing them is a manager's decision.
       'branches.read',
@@ -222,7 +226,10 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, { description: string; permis
     description: 'Plans and runs production; sees what it costs and where it went wrong',
     permissions: [
       'dashboard.view',
-      ...keysFor('manufacturing', 'bom', 'production'),
+      ...keysFor('manufacturing', 'bom', 'production', 'material_request'),
+      'material_issue.view', 'material_issue.receive', 'material_issue.report_discrepancy',
+      'material_return.create', 'material_return.view',
+      ...keysFor('finished_goods_receipt').filter((key) => !key.endsWith('.receive')),
       // Needs to see stock and materials to plan against them, and to raise a
       // requisition when short — but not to change what is on the shelf.
       'inventory.read', 'inventory.requisition_create',
@@ -266,7 +273,7 @@ export const SYSTEM_ROLE_TEMPLATES: Record<string, { description: string; permis
     description: 'Everything in manufacturing, including its settings',
     permissions: [
       'dashboard.view',
-      ...keysFor('manufacturing', 'bom', 'production', 'qc', 'equipment', 'maintenance'),
+      ...keysFor('manufacturing', 'bom', 'production', 'material_request', 'material_issue', 'material_return', 'finished_goods_receipt', 'qc', 'equipment', 'maintenance'),
       ...keysFor('inventory', 'purchasing', 'suppliers'),
       'catalog.read', 'catalog.create', 'catalog.update',
       'employees.read', 'analytics.view', 'audit.read',

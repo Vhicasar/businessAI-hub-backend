@@ -170,7 +170,7 @@ export const ordersService = {
     const variantIds = dto.items.map((i) => i.variantId);
     const variants = await prisma.productVariant.findMany({
       where: { id: { in: variantIds }, deletedAt: null, isActive: true },
-      include: { product: { select: { name: true, taxRate: true, status: true } } },
+      include: { product: { select: { name: true, taxRate: true, status: true, sellable: true, manufacturingType: true } } },
     });
     const variantMap = new Map(variants.map((v) => [v.id, v]));
     for (const item of dto.items) {
@@ -178,6 +178,9 @@ export const ordersService = {
       if (!v) throw new NotFoundError(`Variant ${item.variantId}`);
       if (v.product.status !== 'ACTIVE') {
         throw new ValidationError(`"${v.product.name}" is not an active product`);
+      }
+      if (!v.product.sellable || v.product.manufacturingType === 'RAW_MATERIAL') {
+        throw new ValidationError(`"${v.product.name}" is not sellable. Raw materials cannot be added to sales orders.`);
       }
     }
     const org = await prisma.organization.findUniqueOrThrow({

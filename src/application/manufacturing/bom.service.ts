@@ -119,9 +119,12 @@ export const bomService = {
   async create(dto: z.infer<typeof createBomSchema>) {
     const product = await prisma.product.findFirst({
       where: { id: dto.productId, deletedAt: null },
-      select: { id: true, name: true },
+      select: { id: true, name: true, manufacturingType: true },
     });
     if (!product) throw new NotFoundError('Product');
+    if (product.manufacturingType === 'RAW_MATERIAL') {
+      throw new ValidationError('A raw material cannot be the finished output of a recipe.');
+    }
 
     await assertComponentsExist(dto.items, dto.productId);
 
