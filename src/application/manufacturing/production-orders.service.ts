@@ -49,6 +49,8 @@ export const listProductionOrdersSchema = z.object({
   productId: z.string().optional(),
   productionLineId: z.string().optional(),
   search: z.string().trim().max(120).optional(),
+  createdFrom: z.coerce.date().optional(),
+  createdTo: z.coerce.date().optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });
 
@@ -111,6 +113,7 @@ export const productionOrdersService = {
         ...(dto.status ? { status: dto.status } : {}),
         ...(dto.productId ? { productId: dto.productId } : {}),
         ...(dto.productionLineId ? { productionLineId: dto.productionLineId } : {}),
+        ...(dto.createdFrom || dto.createdTo ? { createdAt: { ...(dto.createdFrom ? { gte: dto.createdFrom } : {}), ...(dto.createdTo ? { lte: dto.createdTo } : {}) } } : {}),
         ...(dto.search
           ? {
               OR: [

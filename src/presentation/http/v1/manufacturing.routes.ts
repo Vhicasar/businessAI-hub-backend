@@ -413,7 +413,7 @@ manufacturingRoutes.get('/material-requisitions/:id', requirePermission('materia
 manufacturingRoutes.post('/material-requisitions/:id/approve', requirePermission('material_request.approve'), wrap(async (req, res) => {
   res.json({ success: true, data: await materialRequisitionsService.approve(req.params.id as string) });
 }));
-manufacturingRoutes.get('/material-issues', requirePermission('material_issue.view'), validate({ query: z.object({ warehouseId: z.string().optional(), status: z.string().optional(), search: z.string().trim().optional() }) }), wrap(async (req, res) => {
+manufacturingRoutes.get('/material-issues', requirePermission('material_issue.view'), validate({ query: z.object({ warehouseId: z.string().optional(), status: z.string().optional(), search: z.string().trim().optional(), createdFrom: z.coerce.date().optional(), createdTo: z.coerce.date().optional() }) }), wrap(async (req, res) => {
   res.json({ success: true, data: await materialRequisitionsService.listIssues(req.query as never) });
 }));
 manufacturingRoutes.get('/material-issues/lookup', requirePermission('material_issue.view'), validate({ query: z.object({ code: z.string().trim().min(1) }) }), wrap(async (req, res) => {
@@ -444,7 +444,7 @@ manufacturingRoutes.post('/material-returns/:id/confirm', requirePermission('mat
   res.json({ success: true, data: await materialRequisitionsService.confirmReturn(req.params.id as string, req.body) });
 }));
 
-manufacturingRoutes.get('/finished-goods-receipts', requirePermission('finished_goods_receipt.view'), validate({ query: z.object({ warehouseId: z.string().optional(), status: z.string().optional(), productionOrderId: z.string().optional() }) }), wrap(async (req, res) => {
+manufacturingRoutes.get('/finished-goods-receipts', requirePermission('finished_goods_receipt.view'), validate({ query: z.object({ warehouseId: z.string().optional(), status: z.string().optional(), productionOrderId: z.string().optional(), search: z.string().trim().optional(), createdFrom: z.coerce.date().optional(), createdTo: z.coerce.date().optional() }) }), wrap(async (req, res) => {
   res.json({ success: true, data: await finishedGoodsReceiptsService.list(req.query as never) });
 }));
 manufacturingRoutes.get('/orders/:id/job-card', requirePermission('production.read'), wrap(async (req, res) => {
@@ -456,7 +456,7 @@ manufacturingRoutes.get('/finished-goods-receipts/:id', requirePermission('finis
 manufacturingRoutes.post('/finished-goods-receipts/:id/allocate', requirePermission('finished_goods_receipt.allocate'), validate({ body: allocateFinishedGoodsSchema }), wrap(async (req, res) => {
   res.json({ success: true, data: await finishedGoodsReceiptsService.allocate(req.params.id as string, req.body) });
 }));
-manufacturingRoutes.get('/finished-goods-tasks', requirePermission('finished_goods_receipt.view'), validate({ query: z.object({ warehouseId: z.string().optional(), status: z.string().optional() }) }), wrap(async (req, res) => {
+manufacturingRoutes.get('/finished-goods-tasks', requirePermission('finished_goods_receipt.view'), validate({ query: z.object({ warehouseId: z.string().optional(), status: z.string().optional(), search: z.string().trim().optional(), createdFrom: z.coerce.date().optional(), createdTo: z.coerce.date().optional() }) }), wrap(async (req, res) => {
   res.json({ success: true, data: await finishedGoodsReceiptsService.listTasks(req.query as never) });
 }));
 manufacturingRoutes.get('/finished-goods-tasks/lookup', requirePermission('finished_goods_receipt.view'), validate({ query: z.object({ code: z.string().trim().min(1) }) }), wrap(async (req, res) => {

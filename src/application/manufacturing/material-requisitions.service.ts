@@ -38,7 +38,7 @@ export const createMaterialReturnSchema = z.object({
 });
 export const receiveMaterialReturnSchema = z.object({ idempotencyKey: z.string().trim().min(8).max(120), items: z.array(z.object({ lineId: z.string(), quantity: z.coerce.number().min(0) })).optional() });
 
-const issueInclude = { lines: true, requisition: { select: { number: true, status: true } } } as const;
+const issueInclude = { lines: true, requisition: { select: { number: true, status: true, requiredAt: true, requestedByUserId: true } } } as const;
 
 export const materialRequisitionsService = {
   async allocate(productionOrderId: string) { return materialAllocationService.forOrder(productionOrderId); },
@@ -99,12 +99,26 @@ export const materialRequisitionsService = {
     return detailed;
   },
 
-  async listIssues(filters: { warehouseId?: string; status?: string; search?: string } = {}) {
+  async listIssues(filters: { warehouseId?: string; status?: string; search?: string; createdFrom?: Date; createdTo?: Date } = {}) {
     if (filters.warehouseId) await assertCanRead(filters.warehouseId);
+    const search = filters.search;
+    const [matchingWarehouses, matchingOrders, matchingVariants, matchingRequisitions] = search ? await Promise.all([
+      prisma.warehouse.findMany({ where: { name: { contains: search, mode: 'insensitive' } }, select: { id: true } }),
+      prisma.productionOrder.findMany({ where: { OR: [{ orderNumber: { contains: search, mode: 'insensitive' } }, { product: { name: { contains: search, mode: 'insensitive' } } }] }, select: { id: true } }),
+      prisma.productVariant.findMany({ where: { OR: [{ sku: { contains: search, mode: 'insensitive' } }, { product: { name: { contains: search, mode: 'insensitive' } } }] }, select: { id: true } }),
+      prisma.productionMaterialRequisition.findMany({ where: { number: { contains: search, mode: 'insensitive' } }, select: { id: true } }),
+    ]) : [[], [], [], []];
     const rows = await prisma.productionMaterialIssue.findMany({ where: {
       ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : await warehouseFieldFilter()),
       ...(filters.status ? { status: filters.status as any } : {}),
-      ...(filters.search ? { number: { contains: filters.search, mode: 'insensitive' } } : {}),
+      ...(filters.createdFrom || filters.createdTo ? { createdAt: { ...(filters.createdFrom ? { gte: filters.createdFrom } : {}), ...(filters.createdTo ? { lte: filters.createdTo } : {}) } } : {}),
+      ...(filters.search ? { OR: [
+        { number: { contains: filters.search, mode: 'insensitive' as const } },
+        { requisitionId: { in: matchingRequisitions.map((item) => item.id) } },
+        { productionOrderId: { in: matchingOrders.map((item) => item.id) } },
+        { warehouseId: { in: matchingWarehouses.map((item) => item.id) } },
+        { lines: { some: { variantId: { in: matchingVariants.map((item) => item.id) } } } },
+      ] } : {}),
     }, include: issueInclude, orderBy: { createdAt: 'desc' } });
     return enrichIssues(rows);
   },

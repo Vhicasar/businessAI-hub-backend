@@ -30,6 +30,14 @@ export function validateFinishedGoodsReceipt(outstanding: number, quantity: numb
   return { nextOutstanding: Math.max(0, outstanding - quantity), partial: quantity < outstanding };
 }
 
+export function deriveFinishedGoodsReceiptState(approvedQuantity: number, tasks: Array<{ allocatedQuantity: unknown; receivedQuantity: unknown }>) {
+  const allocated = tasks.reduce((sum, row) => sum + n(row.allocatedQuantity), 0);
+  const received = tasks.reduce((sum, row) => sum + n(row.receivedQuantity), 0);
+  const fullyAllocated = allocated >= approvedQuantity - 1e-6;
+  const allTasksReceived = tasks.length > 0 && tasks.every((row) => n(row.receivedQuantity) >= n(row.allocatedQuantity) - 1e-6);
+  return { allocated, received, status: fullyAllocated && allTasksReceived ? 'RECEIVED' as const : received > 0 ? 'PARTIALLY_RECEIVED' as const : allocated > 0 ? 'AWAITING_RECEIPT' as const : 'PENDING_ALLOCATION' as const };
+}
+
 export const allocateFinishedGoodsSchema = z.object({
   allocations: z.array(z.object({ warehouseId: z.string().min(1), quantity: z.coerce.number().positive() })).min(1),
 });
@@ -39,7 +47,7 @@ export const receiveFinishedGoodsSchema = z.object({
   discrepancyReason: z.string().trim().max(300).optional(),
 });
 
-const receiptInclude = { tasks: { include: { deliveries: true, discrepancies: true }, orderBy: { number: 'asc' as const } }, output: { include: { batch: true, variant: { include: { product: true } } } } } as const;
+const receiptInclude = { tasks: { include: { warehouse: { select: { id: true, name: true, code: true } }, deliveries: true, discrepancies: true }, orderBy: { number: 'asc' as const } }, output: { include: { batch: true, variant: { include: { product: true } } } } } as const;
 
 export const finishedGoodsReceiptsService = {
   async ensureForOutput(outputId: string, actorUserId: string | null) {
@@ -71,14 +79,22 @@ export const finishedGoodsReceiptsService = {
     return Promise.all(outputs.map((output) => this.ensureForOutput(output.id, actorUserId)));
   },
 
-  async list(filters: { warehouseId?: string; status?: string; productionOrderId?: string } = {}) {
+  async list(filters: { warehouseId?: string; status?: string; productionOrderId?: string; search?: string; createdFrom?: Date; createdTo?: Date } = {}) {
     if (filters.warehouseId) await assertCanRead(filters.warehouseId);
-    const taskScope = filters.warehouseId ? { warehouseId: filters.warehouseId } : await warehouseFieldFilter();
     return prisma.finishedGoodsReceipt.findMany({
       where: {
         ...(filters.status ? { status: filters.status as any } : {}),
         ...(filters.productionOrderId ? { productionOrderId: filters.productionOrderId } : {}),
-        tasks: { some: taskScope },
+        ...(filters.createdFrom || filters.createdTo ? { createdAt: { ...(filters.createdFrom ? { gte: filters.createdFrom } : {}), ...(filters.createdTo ? { lte: filters.createdTo } : {}) } } : {}),
+        ...(filters.search ? { OR: [
+          { number: { contains: filters.search, mode: 'insensitive' as const } },
+          { output: { batch: { batchNumber: { contains: filters.search, mode: 'insensitive' as const } } } },
+          { output: { variant: { sku: { contains: filters.search, mode: 'insensitive' as const } } } },
+          { output: { variant: { product: { name: { contains: filters.search, mode: 'insensitive' as const } } } } },
+        ] } : {}),
+        // Parent receipts exist before destination tasks. Do not hide them
+        // from the allocation queue merely because allocation is the next job.
+        ...(filters.warehouseId ? { tasks: { some: { warehouseId: filters.warehouseId } } } : {}),
       }, include: receiptInclude, orderBy: { createdAt: 'desc' },
     });
   },
@@ -93,8 +109,16 @@ export const finishedGoodsReceiptsService = {
     const receipt = await this.get(id);
     const settings = await manufacturingSettings.get();
     const automatic = settings.finishedGoodsReceivingMode === 'AUTOMATIC';
-    if (!automatic && receipt.tasks.some((task) => n(task.receivedQuantity) > 0)) throw new ConflictError('Allocations cannot be replaced after warehouse receiving has started.');
+    const receivingStarted = !automatic && receipt.tasks.some((task) => n(task.receivedQuantity) > 0);
     const { total } = validateFinishedGoodsAllocation(n(receipt.approvedQuantity), dto.allocations);
+    if (receivingStarted) {
+      for (const task of receipt.tasks) {
+        const submitted = dto.allocations.find((row) => row.warehouseId === task.warehouseId);
+        if (!submitted || submitted.quantity + 1e-6 < n(task.allocatedQuantity)) {
+          throw new ConflictError('Received warehouse allocations cannot be removed or reduced. Keep them and allocate only the remaining approved quantity.');
+        }
+      }
+    }
     const warehouseIds = dto.allocations.map((row) => row.warehouseId);
     const warehouses = await prisma.warehouse.findMany({ where: { id: { in: warehouseIds }, isActive: true, deletedAt: null }, select: { id: true, name: true, managerId: true } });
     if (warehouses.length !== warehouseIds.length) throw new ValidationError('Every destination must be an active warehouse in this business.');
@@ -109,8 +133,15 @@ export const finishedGoodsReceiptsService = {
         await applyMovement(tx, { organizationId: org(), warehouseId: old.warehouseId, variantId: receipt.variantId, quantityChange: -n(old.receivedQuantity), type: 'TRANSFER_OUT', referenceType: 'FINISHED_GOODS_REALLOCATION', referenceId: old.id, batchNumber: receipt.output.batch?.batchNumber, actorUserId: actor() });
         await applyMovement(tx, { organizationId: org(), warehouseId: receipt.output.warehouseId, variantId: receipt.variantId, quantityChange: n(old.receivedQuantity), type: 'TRANSFER_IN', referenceType: 'FINISHED_GOODS_REALLOCATION', referenceId: old.id, batchNumber: receipt.output.batch?.batchNumber, actorUserId: actor() });
       }
-      await tx.finishedGoodsReceiptTask.deleteMany({ where: { receiptId: id } });
+      if (!receivingStarted) await tx.finishedGoodsReceiptTask.deleteMany({ where: { receiptId: id } });
       for (const row of dto.allocations) {
+        const existingTask = receivingStarted ? receipt.tasks.find((task) => task.warehouseId === row.warehouseId) : null;
+        if (existingTask) {
+          if (Math.abs(row.quantity - n(existingTask.allocatedQuantity)) > 1e-6) {
+            await tx.finishedGoodsReceiptTask.update({ where: { id: existingTask.id }, data: { allocatedQuantity: row.quantity } });
+          }
+          continue;
+        }
         const taskNumber = await nextManufacturingDocumentNumber(tx, org(), 'FGR');
         const task = await tx.finishedGoodsReceiptTask.create({ data: {
           organizationId: org(), receiptId: id, number: taskNumber, warehouseId: row.warehouseId,
@@ -124,23 +155,32 @@ export const finishedGoodsReceiptsService = {
           await applyMovement(tx, { organizationId: org(), warehouseId: row.warehouseId, variantId: receipt.variantId, quantityChange: row.quantity, type: 'TRANSFER_IN', referenceType: 'FINISHED_GOODS_RECEIPT', referenceId: task.id, batchNumber: receipt.output.batch?.batchNumber, actorUserId: actor() });
         }
       }
-      return tx.finishedGoodsReceipt.update({ where: { id }, data: { allocatedQuantity: total, receivedQuantity: automatic ? total : 0, status: automatic ? 'RECEIVED' : 'AWAITING_RECEIPT' }, include: receiptInclude });
+      const received = automatic ? total : receipt.tasks.reduce((sum, task) => sum + n(task.receivedQuantity), 0);
+      return tx.finishedGoodsReceipt.update({ where: { id }, data: { allocatedQuantity: total, receivedQuantity: received, status: automatic ? 'RECEIVED' : received > 0 ? 'PARTIALLY_RECEIVED' : 'AWAITING_RECEIPT' }, include: receiptInclude });
     });
     if (!automatic) for (const warehouse of warehouses) void notifyWarehouse(warehouse.managerId, result.tasks.find((task) => task.warehouseId === warehouse.id)!);
     await auditService.record({ action: 'finished_goods.allocated', entityType: 'FINISHED_GOODS_RECEIPT', entityId: id, after: { total, automatic, warehouses: warehouseIds } });
     return result;
   },
 
-  async listTasks(filters: { warehouseId?: string; status?: string } = {}) {
+  async listTasks(filters: { warehouseId?: string; status?: string; search?: string; createdFrom?: Date; createdTo?: Date } = {}) {
     if (filters.warehouseId) await assertCanRead(filters.warehouseId);
     return prisma.finishedGoodsReceiptTask.findMany({ where: {
       ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : await warehouseFieldFilter()),
       ...(filters.status ? { status: filters.status as any } : {}),
-    }, include: { receipt: { include: { output: { include: { batch: true, variant: { include: { product: true } } } } } }, deliveries: true, discrepancies: true }, orderBy: { createdAt: 'desc' } });
+      ...(filters.createdFrom || filters.createdTo ? { createdAt: { ...(filters.createdFrom ? { gte: filters.createdFrom } : {}), ...(filters.createdTo ? { lte: filters.createdTo } : {}) } } : {}),
+      ...(filters.search ? { OR: [
+        { number: { contains: filters.search, mode: 'insensitive' as const } },
+        { warehouse: { name: { contains: filters.search, mode: 'insensitive' as const } } },
+        { receipt: { number: { contains: filters.search, mode: 'insensitive' as const } } },
+        { receipt: { output: { variant: { sku: { contains: filters.search, mode: 'insensitive' as const } } } } },
+        { receipt: { output: { variant: { product: { name: { contains: filters.search, mode: 'insensitive' as const } } } } } },
+      ] } : {}),
+    }, include: { warehouse: { select: { id: true, name: true, code: true } }, receipt: { include: { output: { include: { batch: true, variant: { include: { product: true } } } } } }, deliveries: true, discrepancies: true }, orderBy: { createdAt: 'desc' } });
   },
 
   async getTask(id: string) {
-    const task = await prisma.finishedGoodsReceiptTask.findFirst({ where: { id }, include: { receipt: { include: { output: { include: { batch: true, variant: { include: { product: true } } } } } }, deliveries: true, discrepancies: true } });
+    const task = await prisma.finishedGoodsReceiptTask.findFirst({ where: { id }, include: { warehouse: { select: { id: true, name: true, code: true } }, receipt: { include: { output: { include: { batch: true, variant: { include: { product: true } } } } } }, deliveries: true, discrepancies: true } });
     if (!task) throw new NotFoundError('Finished goods receiving task');
     await assertCanRead(task.warehouseId);
     return task;
@@ -151,33 +191,39 @@ export const finishedGoodsReceiptsService = {
     const token = value.match(/^vhicasar:\/\/fgr\/(.+)$/i)?.[1];
     const parent = await prisma.finishedGoodsReceipt.findFirst({ where: { OR: [{ number: { equals: value, mode: 'insensitive' } }, ...(token ? [{ scanToken: token }] : [])] }, select: { id: true } });
     const scope = await warehouseFieldFilter();
-    const tasks = await prisma.finishedGoodsReceiptTask.findMany({ where: { ...scope, OR: [{ number: { equals: value, mode: 'insensitive' } }, ...(token ? [{ scanToken: token }] : []), ...(parent ? [{ receiptId: parent.id }] : [])] }, include: { receipt: { include: { output: { include: { batch: true, variant: { include: { product: true } } } } } }, deliveries: true, discrepancies: true } });
+    const tasks = await prisma.finishedGoodsReceiptTask.findMany({ where: { ...scope, OR: [{ number: { equals: value, mode: 'insensitive' } }, ...(token ? [{ scanToken: token }] : []), ...(parent ? [{ receiptId: parent.id }] : [])] }, include: { warehouse: { select: { id: true, name: true, code: true } }, receipt: { include: { output: { include: { batch: true, variant: { include: { product: true } } } } } }, deliveries: true, discrepancies: true } });
     if (!tasks.length) throw new NotFoundError('No authorized finished-goods receiving task matches that code');
     return tasks;
   },
 
   async receive(taskId: string, dto: z.infer<typeof receiveFinishedGoodsSchema>) {
-    const task = await prisma.finishedGoodsReceiptTask.findFirst({ where: { id: taskId }, include: { receipt: { include: { output: { include: { batch: true } } } } } });
-    if (!task) throw new NotFoundError('Finished goods receiving task');
-    await assertCanManage(task.warehouseId);
-    const duplicate = await prisma.finishedGoodsReceiptDelivery.findFirst({ where: { idempotencyKey: dto.idempotencyKey } });
-    if (duplicate) return duplicate;
-    const outstanding = n(task.allocatedQuantity) - n(task.receivedQuantity);
-    validateFinishedGoodsReceipt(outstanding, dto.quantity, dto.discrepancyReason);
+    const authorizedTask = await prisma.finishedGoodsReceiptTask.findFirst({ where: { id: taskId }, select: { warehouseId: true } });
+    if (!authorizedTask) throw new NotFoundError('Finished goods receiving task');
+    await assertCanManage(authorizedTask.warehouseId);
     const delivery = await prisma.$transaction(async (tx) => {
+      // Serialize scans/posts for one task. Without this lock two devices can
+      // both validate against the same outstanding quantity and over-receive.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`finished-goods-receipt:${org()}:${taskId}`}))`;
+      const duplicate = await tx.finishedGoodsReceiptDelivery.findFirst({ where: { organizationId: org(), idempotencyKey: dto.idempotencyKey } });
+      if (duplicate) return duplicate;
+      const task = await tx.finishedGoodsReceiptTask.findFirst({ where: { id: taskId }, include: { receipt: { include: { output: { include: { batch: true } } } } } });
+      if (!task) throw new NotFoundError('Finished goods receiving task');
+      const outstanding = n(task.allocatedQuantity) - n(task.receivedQuantity);
+      validateFinishedGoodsReceipt(outstanding, dto.quantity, dto.discrepancyReason);
       await applyMovement(tx, { organizationId: task.organizationId, warehouseId: task.warehouseId, variantId: task.receipt.variantId, quantityChange: dto.quantity, type: 'FINISHED_GOODS_RECEIPT', referenceType: 'FINISHED_GOODS_RECEIPT_TASK', referenceId: task.id, reason: dto.notes, batchNumber: task.receipt.output.batch?.batchNumber, expiryDate: task.receipt.output.expiryDate, actorUserId: actor() });
       const next = n(task.receivedQuantity) + dto.quantity;
       const created = await tx.finishedGoodsReceiptDelivery.create({ data: { organizationId: task.organizationId, taskId, quantity: dto.quantity, storageLocation: dto.storageLocation, notes: dto.notes, idempotencyKey: dto.idempotencyKey, receivedByUserId: actor() } });
       if (dto.discrepancyReason && dto.quantity < outstanding) await tx.finishedGoodsReceiptDiscrepancy.create({ data: { organizationId: task.organizationId, taskId, expectedQuantity: outstanding, receivedQuantity: dto.quantity, difference: dto.quantity - outstanding, reason: dto.discrepancyReason, notes: dto.notes, reportedByUserId: actor() } });
       await tx.finishedGoodsReceiptTask.update({ where: { id: taskId }, data: { receivedQuantity: next, status: next >= n(task.allocatedQuantity) ? 'RECEIVED' : 'PARTIALLY_RECEIVED' } });
       const allTasks = await tx.finishedGoodsReceiptTask.findMany({ where: { receiptId: task.receiptId }, select: { allocatedQuantity: true, receivedQuantity: true } });
-      const received = allTasks.reduce((sum, row) => sum + n(row.receivedQuantity), 0);
-      const complete = allTasks.length > 0 && allTasks.every((row) => n(row.receivedQuantity) >= n(row.allocatedQuantity));
-      await tx.finishedGoodsReceipt.update({ where: { id: task.receiptId }, data: { receivedQuantity: received, status: complete ? 'RECEIVED' : 'PARTIALLY_RECEIVED' } });
+      const parent = deriveFinishedGoodsReceiptState(n(task.receipt.approvedQuantity), allTasks);
+      await tx.finishedGoodsReceipt.update({ where: { id: task.receiptId }, data: { allocatedQuantity: parent.allocated, receivedQuantity: parent.received, status: parent.status } });
       return created;
     });
-    await auditService.record({ action: 'finished_goods.received', entityType: 'FINISHED_GOODS_RECEIPT_TASK', entityId: taskId, after: { quantity: dto.quantity, warehouseId: task.warehouseId, deliveryId: delivery.id } });
-    return delivery;
+    await auditService.record({ action: 'finished_goods.received', entityType: 'FINISHED_GOODS_RECEIPT_TASK', entityId: taskId, after: { quantity: dto.quantity, warehouseId: authorizedTask.warehouseId, deliveryId: delivery.id } });
+    // Return the authoritative updated document, not only the delivery event.
+    // Both web and mobile render task/parent state from this contract.
+    return { delivery, task: await this.getTask(taskId) };
   },
 };
 

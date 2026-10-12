@@ -18,6 +18,11 @@ export const listBatchesSchema = z.object({
   qcStatus: z.enum(['PENDING', 'PASSED', 'FAILED', 'CONDITIONAL']).optional(),
   quarantinedOnly: z.coerce.boolean().optional(),
   expiringWithinDays: z.coerce.number().int().min(1).max(3650).optional(),
+  expiryState: z.enum(['EXPIRED', 'TODAY', 'WITHIN_7', 'WITHIN_30', 'WITHIN_90', 'NO_EXPIRY', 'CUSTOM']).optional(),
+  expiryFrom: z.coerce.date().optional(),
+  expiryTo: z.coerce.date().optional(),
+  productionFrom: z.coerce.date().optional(),
+  productionTo: z.coerce.date().optional(),
   search: z.string().trim().max(120).optional(),
   limit: z.coerce.number().int().min(1).max(200).default(100),
 });
@@ -35,8 +40,12 @@ const batchSelect = {
 
 export const batchesService = {
   async list(dto: z.infer<typeof listBatchesSchema>) {
+    const startToday = new Date(); startToday.setHours(0, 0, 0, 0);
+    const endToday = new Date(startToday); endToday.setDate(endToday.getDate() + 1); endToday.setMilliseconds(-1);
+    const expiryDays = dto.expiryState?.startsWith('WITHIN_') ? Number(dto.expiryState.slice(7)) : dto.expiringWithinDays;
     const cutoff = dto.expiringWithinDays
       ? new Date(Date.now() + dto.expiringWithinDays * 86_400_000)
+      : expiryDays ? new Date(endToday.getTime() + expiryDays * 86_400_000)
       : null;
 
     const rows = await prisma.batch.findMany({
@@ -45,12 +54,19 @@ export const batchesService = {
         ...(dto.warehouseId ? { warehouseId: dto.warehouseId } : {}),
         ...(dto.qcStatus ? { qcStatus: dto.qcStatus } : {}),
         ...(dto.quarantinedOnly ? { isQuarantined: true } : {}),
-        ...(cutoff ? { expiryDate: { not: null, lte: cutoff } } : {}),
+        ...(dto.productionFrom || dto.productionTo ? { productionDate: { ...(dto.productionFrom ? { gte: dto.productionFrom } : {}), ...(dto.productionTo ? { lte: dto.productionTo } : {}) } } : {}),
+        ...(dto.expiryState === 'NO_EXPIRY' ? { expiryDate: null } : {}),
+        ...(dto.expiryState === 'EXPIRED' ? { expiryDate: { lt: startToday } } : {}),
+        ...(dto.expiryState === 'TODAY' ? { expiryDate: { gte: startToday, lte: endToday } } : {}),
+        ...(dto.expiryState === 'CUSTOM' ? { expiryDate: { not: null, ...(dto.expiryFrom ? { gte: dto.expiryFrom } : {}), ...(dto.expiryTo ? { lte: dto.expiryTo } : {}) } } : {}),
+        ...(cutoff && !['EXPIRED', 'TODAY', 'NO_EXPIRY', 'CUSTOM'].includes(dto.expiryState ?? '') ? { expiryDate: { not: null, gte: startToday, lte: cutoff } } : {}),
         ...(dto.search
           ? {
               OR: [
                 { batchNumber: { contains: dto.search, mode: 'insensitive' as const } },
                 { variant: { sku: { contains: dto.search, mode: 'insensitive' as const } } },
+                { variant: { product: { name: { contains: dto.search, mode: 'insensitive' as const } } } },
+                { warehouse: { name: { contains: dto.search, mode: 'insensitive' as const } } },
               ],
             }
           : {}),
