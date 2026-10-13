@@ -1,0 +1,323 @@
+export type CatalogItem = {
+  productId: string;
+  variantId: string;
+  name: string;
+  description?: string | null;
+  price: number;
+  currency: string;
+  available: number;
+  /** False for inactive, unpublished, internal-only or otherwise ineligible records. */
+  purchasable?: boolean;
+};
+
+export type RequestedItem = {
+  key: string;
+  phrase: string;
+  quantity: number;
+  unit?: string;
+};
+
+export type SalesLine = RequestedItem & {
+  status: 'RESOLVED' | 'AMBIGUOUS' | 'NOT_FOUND' | 'UNAVAILABLE';
+  resolved?: CatalogItem;
+  candidates?: CatalogItem[];
+};
+
+export type SalesFlowState = {
+  version: 1;
+  status: 'COLLECTING' | 'AWAITING_CLARIFICATION' | 'AWAITING_CONFIRMATION' | 'PROCESSING' | 'COMPLETED' | 'CANCELLED';
+  lines: SalesLine[];
+  lastQuestionKey?: string;
+  lastQuestionFingerprint?: string;
+  clarificationAttempts: number;
+  updatedAt: string;
+  sourceMessageId?: string;
+  orderId?: string;
+  orderNumber?: string;
+};
+
+const NUMBER_WORDS: Record<string, number> = {
+  a: 1, an: 1, one: 1, two: 2, three: 3, four: 4, five: 5,
+  six: 6, seven: 7, eight: 8, nine: 9, ten: 10, dozen: 12,
+};
+
+function quantityValue(value: string): number | null {
+  const normalized = normalizeProductText(value);
+  if (/^\d+$/.test(normalized)) return Math.max(1, Math.min(9999, Number(normalized)));
+  return NUMBER_WORDS[normalized] ?? null;
+}
+
+const UNITS = new Set([
+  'plate', 'plates', 'piece', 'pieces', 'pack', 'packs', 'packet', 'packets',
+  'bottle', 'bottles', 'bag', 'bags', 'cup', 'cups', 'tin', 'tins', 'box',
+  'boxes', 'carton', 'cartons', 'kg', 'kilogram', 'kilograms', 'litre', 'litres',
+  'liter', 'liters', 'unit', 'units', 'set', 'sets',
+]);
+
+export function normalizeProductText(value: string): string {
+  return value
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function singular(value: string): string {
+  if (value.endsWith('ies') && value.length > 4) return `${value.slice(0, -3)}y`;
+  if (value.endsWith('ses') && value.length > 4) return value.slice(0, -2);
+  if (value.endsWith('s') && !value.endsWith('ss') && value.length > 3) return value.slice(0, -1);
+  return value;
+}
+
+function comparableTokens(value: string): string[] {
+  return normalizeProductText(value).split(' ').filter(Boolean).map(singular);
+}
+
+function stripConversationWrapper(value: string): string {
+  return value
+    .replace(/^\s*(?:please\s+)?(?:i\s+(?:want|need|would like)(?:\s+to)?|can i (?:get|have)|give me|add|i'?ll take|order)\s+/i, '')
+    .replace(/^\s*another\s+/i, '')
+    .replace(/\s+(?:to|in)\s+my\s+(?:current\s+)?order\s*[.!?]*$/i, '')
+    .replace(/[.!?]+$/g, '')
+    .trim();
+}
+
+/** Parse line items before any catalogue lookup. This prevents multiple items
+ * from being mistaken for multiple candidates for one global search. */
+export function extractRequestedItems(message: string): RequestedItem[] {
+  const cleaned = stripConversationWrapper(message);
+  if (!cleaned) return [];
+  const segments = cleaned
+    .split(/\s*(?:,|;|\band\b|\bplus\b|\bthen\b)\s*/i)
+    .map(stripConversationWrapper)
+    .filter(Boolean);
+
+  return segments.map((segment, index) => {
+    const tokens = segment.split(/\s+/);
+    let quantity = 1;
+    const quantityToken = normalizeProductText(tokens[0] ?? '');
+    if (/^\d+(?:\.\d+)?$/.test(quantityToken)) {
+      quantity = Math.max(1, Math.min(9999, Math.floor(Number(quantityToken))));
+      tokens.shift();
+    } else if (NUMBER_WORDS[quantityToken]) {
+      quantity = NUMBER_WORDS[quantityToken]!;
+      tokens.shift();
+    }
+
+    let unit: string | undefined;
+    const possibleUnit = normalizeProductText(tokens[0] ?? '');
+    if (UNITS.has(possibleUnit)) {
+      unit = singular(possibleUnit);
+      tokens.shift();
+      if (normalizeProductText(tokens[0] ?? '') === 'of') tokens.shift();
+    }
+    const phrase = tokens.join(' ').trim();
+    return { key: `line-${index + 1}`, phrase, quantity, ...(unit ? { unit } : {}) };
+  }).filter((item) => item.phrase.length > 0);
+}
+
+function matchScore(phrase: string, item: CatalogItem): number {
+  const query = normalizeProductText(phrase);
+  const name = normalizeProductText(item.name);
+  if (!query || !name) return 0;
+  if (query === name) return 1;
+  const queryTokens = comparableTokens(query);
+  const nameTokens = comparableTokens(name);
+  const querySet = new Set(queryTokens);
+  const nameSet = new Set(nameTokens);
+  if (queryTokens.length > 0 && queryTokens.every((token) => nameSet.has(token))) return 0.94;
+  if (nameTokens.length > 0 && nameTokens.every((token) => querySet.has(token))) return 0.92;
+  const descriptionSet = new Set(comparableTokens(item.description ?? ''));
+  const overlap = queryTokens.filter((token) => nameSet.has(token)).length;
+  if (overlap > 0) return 0.65 + 0.25 * (overlap / Math.max(queryTokens.length, nameTokens.length));
+  const descriptionOverlap = queryTokens.filter((token) => descriptionSet.has(token)).length;
+  if (descriptionOverlap === queryTokens.length && descriptionOverlap > 0) return 0.62;
+  // Conservative typo tolerance: only a single-token request and a single
+  // close catalogue token. This fixes harmless spelling mistakes without
+  // collapsing meaningful brand/size/flavour distinctions.
+  if (queryTokens.length === 1) {
+    const close = nameTokens.some((token) => editDistance(queryTokens[0]!, token) <= (queryTokens[0]!.length >= 6 ? 2 : 1));
+    if (close) return 0.84;
+  }
+  return 0;
+}
+
+function editDistance(left: string, right: string): number {
+  const row = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= left.length; i += 1) {
+    let diagonal = row[0]!;
+    row[0] = i;
+    for (let j = 1; j <= right.length; j += 1) {
+      const previous = row[j]!;
+      row[j] = Math.min(row[j]! + 1, row[j - 1]! + 1, diagonal + (left[i - 1] === right[j - 1] ? 0 : 1));
+      diagonal = previous;
+    }
+  }
+  return row[right.length]!;
+}
+
+export function resolveRequestedItem(request: RequestedItem, catalog: CatalogItem[]): SalesLine {
+  const seen = new Set<string>();
+  const ranked = catalog
+    .filter((item) => item.purchasable !== false)
+    .map((item) => ({ item, score: matchScore(request.phrase, item) }))
+    .filter(({ score }) => score >= 0.62)
+    .sort((a, b) => b.score - a.score || a.item.name.localeCompare(b.item.name))
+    // Search joins and caches can yield the same record more than once. Keep
+    // materially different variants, but collapse duplicate representations.
+    .filter(({ item }) => {
+      const key = [item.productId, normalizeProductText(item.name), item.price, item.currency, item.available].join('|');
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  if (!ranked.length) return { ...request, status: 'NOT_FOUND' };
+
+  const exact = ranked.filter(({ score }) => score === 1);
+  if (exact.length) {
+    const availableExact = exact.filter(({ item }) => item.available > 0);
+    if (availableExact.length > 1) {
+      return { ...request, status: 'AMBIGUOUS', candidates: availableExact.slice(0, 6).map(({ item }) => item) };
+    }
+    const selected = availableExact[0]?.item ?? exact[0]!.item;
+    return selected.available < request.quantity
+      ? { ...request, status: 'UNAVAILABLE', resolved: selected }
+      : { ...request, status: 'RESOLVED', resolved: selected };
+  }
+
+  const topScore = ranked[0]!.score;
+  if (topScore < 0.72) return { ...request, status: 'NOT_FOUND' };
+  const similarlyPlausible = ranked.filter(({ item, score }) => item.available > 0 && score >= Math.max(0.72, topScore - 0.08));
+  if (similarlyPlausible.length > 1) {
+    return { ...request, status: 'AMBIGUOUS', candidates: similarlyPlausible.slice(0, 6).map(({ item }) => item) };
+  }
+  const selected = similarlyPlausible[0]?.item ?? ranked[0]!.item;
+  return selected.available < request.quantity
+    ? { ...request, status: 'UNAVAILABLE', resolved: selected }
+    : { ...request, status: 'RESOLVED', resolved: selected };
+}
+
+export function resolveRequestedItems(requests: RequestedItem[], catalog: CatalogItem[]): SalesLine[] {
+  return requests.map((request) => resolveRequestedItem(request, catalog));
+}
+
+export function beginSalesFlow(
+  requests: RequestedItem[], catalog: CatalogItem[], sourceMessageId?: string,
+): SalesFlowState {
+  const lines = resolveRequestedItems(requests, catalog);
+  return finalizeState(lines, 0, sourceMessageId);
+}
+
+function finalizeState(lines: SalesLine[], attempts: number, sourceMessageId?: string): SalesFlowState {
+  const unresolved = lines.find((line) => line.status !== 'RESOLVED');
+  return {
+    version: 1,
+    status: unresolved ? 'AWAITING_CLARIFICATION' : 'AWAITING_CONFIRMATION',
+    lines,
+    ...(unresolved ? { lastQuestionKey: unresolved.key } : {}),
+    clarificationAttempts: attempts,
+    updatedAt: new Date().toISOString(),
+    ...(sourceMessageId ? { sourceMessageId } : {}),
+  };
+}
+
+/** Merge a clarification into only the unresolved line. A complete multi-line
+ * restatement is re-resolved as a whole while retaining already-resolved lines
+ * that the customer did not replace. */
+export function advanceSalesFlow(
+  state: SalesFlowState,
+  message: string,
+  catalog: CatalogItem[],
+  sourceMessageId?: string,
+): SalesFlowState {
+  const unresolvedIndex = state.lines.findIndex((line) => line.status !== 'RESOLVED');
+  const optionNumber = Number(message.trim().match(/^(\d+)\s*[.!]?$/)?.[1] ?? 0);
+  if (unresolvedIndex >= 0 && optionNumber > 0) {
+    const previous = state.lines[unresolvedIndex]!;
+    const selected = previous.candidates?.[optionNumber - 1];
+    if (selected) {
+      const lines = [...state.lines];
+      lines[unresolvedIndex] = selected.available < previous.quantity
+        ? { ...previous, status: 'UNAVAILABLE', resolved: selected, candidates: undefined }
+        : { ...previous, phrase: selected.name, status: 'RESOLVED', resolved: selected, candidates: undefined };
+      return finalizeState(lines, state.clarificationAttempts + 1, sourceMessageId);
+    }
+  }
+  const extracted = extractRequestedItems(message);
+  if (!extracted.length) return { ...state, clarificationAttempts: state.clarificationAttempts + 1, updatedAt: new Date().toISOString() };
+
+  if (extracted.length === 1 && unresolvedIndex >= 0) {
+    const previous = state.lines[unresolvedIndex]!;
+    const answer = extracted[0]!;
+    const nextRequest: RequestedItem = {
+      ...answer,
+      key: previous.key,
+      quantity: answer.quantity === 1 && !/^\s*(?:1|one|a|an)\b/i.test(stripConversationWrapper(message))
+        ? previous.quantity
+        : answer.quantity,
+      unit: answer.unit ?? previous.unit,
+    };
+    const lines = [...state.lines];
+    lines[unresolvedIndex] = resolveRequestedItem(nextRequest, catalog);
+    return finalizeState(lines, state.clarificationAttempts + 1, sourceMessageId);
+  }
+
+  const incoming = resolveRequestedItems(extracted, catalog);
+  const incomingResolvedIds = new Set(incoming.map((line) => line.resolved?.productId).filter(Boolean));
+  const retained = state.lines.filter((line) => line.status === 'RESOLVED' && !incomingResolvedIds.has(line.resolved?.productId));
+  return finalizeState([...incoming, ...retained], state.clarificationAttempts + 1, sourceMessageId);
+}
+
+/** Apply clear edits to a fully resolved proposal without asking the customer
+ * to repeat the whole order. Returns null when the reference is not safe to
+ * interpret deterministically. */
+export function reviseConfirmedSalesFlow(
+  state: SalesFlowState,
+  message: string,
+  catalog: CatalogItem[],
+  sourceMessageId?: string,
+): SalesFlowState | null {
+  if (state.status !== 'AWAITING_CONFIRMATION') return null;
+  const singleChange = message.match(/\bmake that\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b/i);
+  if (singleChange && state.lines.length === 1) {
+    const quantity = quantityValue(singleChange[1]!);
+    if (!quantity) return null;
+    const current = state.lines[0]!;
+    return finalizeState([resolveRequestedItem({ ...current, quantity }, catalog)], state.clarificationAttempts, sourceMessageId);
+  }
+
+  const ordinalPattern = /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:of\s+)?(?:the\s+)?(first|second|third)\s+(?:item|one)\b/gi;
+  const ordinals: Record<string, number> = { first: 0, second: 1, third: 2 };
+  const lines = [...state.lines];
+  let ordinalChanged = false;
+  for (const match of message.matchAll(ordinalPattern)) {
+    const quantity = quantityValue(match[1]!);
+    const index = ordinals[match[2]!.toLowerCase()];
+    if (!quantity || index === undefined || !lines[index]) continue;
+    lines[index] = resolveRequestedItem({ ...lines[index]!, quantity }, catalog);
+    ordinalChanged = true;
+  }
+  if (ordinalChanged) return finalizeState(lines, state.clarificationAttempts, sourceMessageId);
+
+  if (/\badd\s+(?:another\s+)?/i.test(message)) {
+    const additions = resolveRequestedItems(extractRequestedItems(message), catalog);
+    if (!additions.length || additions.some((line) => line.status !== 'RESOLVED')) return null;
+    const merged = [...state.lines];
+    for (const addition of additions) {
+      const existingIndex = merged.findIndex((line) => line.resolved?.variantId === addition.resolved?.variantId);
+      if (existingIndex >= 0) {
+        const existing = merged[existingIndex]!;
+        merged[existingIndex] = resolveRequestedItem({ ...existing, quantity: existing.quantity + addition.quantity }, catalog);
+      } else merged.push(addition);
+    }
+    return finalizeState(merged, state.clarificationAttempts, sourceMessageId);
+  }
+  return null;
+}
+
+export function stateFingerprint(line: SalesLine): string {
+  return JSON.stringify({ key: line.key, phrase: normalizeProductText(line.phrase), status: line.status, candidates: line.candidates?.map((candidate) => candidate.productId) ?? [] });
+}

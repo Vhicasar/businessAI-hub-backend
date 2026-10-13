@@ -26,6 +26,15 @@ import { nonRawMaterialProductWhere } from '../catalog/product-classification';
 import { channelPolicy, isChannelEnabled } from '../settings/workspace-config';
 import { classifyCustomerIntent, isGeneralPurchaseRequest } from './customer-intent-policy';
 import {
+  advanceSalesFlow,
+  beginSalesFlow,
+  extractRequestedItems,
+  reviseConfirmedSalesFlow,
+  stateFingerprint,
+  type CatalogItem,
+  type SalesFlowState,
+} from './sales-conversation';
+import {
   WORKSPACE_DESTINATIONS,
   destinationAccess,
   relevantDestinations,
@@ -131,9 +140,9 @@ async function entityEngagement(entityType: CrmEntityType, entityId: string) {
 const variantSelect = {
   where: { deletedAt: null, isActive: true },
   orderBy: { isDefault: 'desc' as const },
-  take: 1,
+  take: 12,
   select: {
-    id: true, price: true, currency: true,
+    id: true, name: true, options: true, price: true, currency: true,
     stockLevels: { select: { quantity: true, reserved: true } },
   },
 };
@@ -150,39 +159,68 @@ function conversationMetadata(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
-function salesProposal(value: unknown): SalesProposal | null {
-  const raw = conversationMetadata(value).aiSalesProposal;
+function persistedSalesFlow(value: unknown): SalesFlowState | null {
+  const raw = conversationMetadata(value).aiSalesFlow;
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const candidate = raw as Partial<SalesProposal>;
-  if (candidate.status !== 'AWAITING_CONFIRMATION' || !Array.isArray(candidate.items) || !candidate.items.length) return null;
-  if (!candidate.items.every((item) => item && typeof item.variantId === 'string' && typeof item.name === 'string' && Number(item.quantity) > 0)) return null;
-  return candidate as SalesProposal;
+  const candidate = raw as Partial<SalesFlowState>;
+  if (candidate.version !== 1 || !Array.isArray(candidate.lines) || typeof candidate.status !== 'string') return null;
+  return candidate as SalesFlowState;
 }
 
-async function saveSalesProposal(conversationId: string, metadata: unknown, proposal: SalesProposal | null) {
+async function saveSalesFlow(conversationId: string, metadata: unknown, flow: SalesFlowState) {
   const current = conversationMetadata(metadata);
-  const next = { ...current };
-  if (proposal) next.aiSalesProposal = proposal;
-  else delete next.aiSalesProposal;
-  await prisma.conversation.update({ where: { id: conversationId }, data: { metadata: next } });
-}
-
-function requestedQuantity(message: string): number {
-  const numeric = message.match(/\b(\d{1,4})\b/);
-  if (numeric) return Math.max(1, Math.min(999, Number(numeric[1])));
-  const words: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
-  const found = Object.entries(words).find(([word]) => new RegExp(`\\b${word}\\b`, 'i').test(message));
-  return found?.[1] ?? 1;
-}
-
-function productRequestTerms(message: string): string[] {
-  const ignored = new Set(['want', 'need', 'would', 'like', 'please', 'give', 'order', 'buy', 'purchase', 'place', 'make', 'start', 'some', 'with', 'have', 'can', 'get', 'me', 'the', 'and', 'for', 'plates', 'plate', 'pieces', 'piece', 'packs', 'pack', 'units', 'unit']);
-  return (message.toLowerCase().match(/[a-z0-9]+/g) ?? [])
-    .filter((term) => term.length > 1 && !ignored.has(term) && !/^\d+$/.test(term));
+  await prisma.conversation.update({
+    where: { id: conversationId },
+    data: { metadata: { ...current, aiSalesFlow: flow } },
+  });
 }
 
 function availableForVariant(variant: { stockLevels: Array<{ quantity: unknown; reserved: unknown }> }): number {
   return variant.stockLevels.reduce((sum, level) => sum + Math.max(0, Number(level.quantity) - Number(level.reserved)), 0);
+}
+
+function renderSalesFlow(flow: SalesFlowState): string {
+  const unresolved = flow.lines.find((line) => line.status !== 'RESOLVED');
+  const resolved = flow.lines.filter((line) => line.status === 'RESOLVED' && line.resolved);
+  const retained = resolved.length
+    ? ` I've kept ${resolved.map((line) => `${line.quantity} × ${line.resolved!.name}`).join(', ')} in your order.`
+    : '';
+  if (unresolved?.status === 'AMBIGUOUS') {
+    const choices = (unresolved.candidates ?? []).map((item, index) =>
+      `${index + 1}. ${item.name} — ${item.currency} ${item.price.toLocaleString()}`
+    ).join('\n');
+    const repeated = flow.clarificationAttempts > 0 && flow.lastQuestionFingerprint === stateFingerprint(unresolved);
+    return repeated
+      ? `I still need the exact match for “${unresolved.phrase}”. Please reply with the option number or full product name:\n${choices}.${retained}`
+      : `Which type of ${unresolved.phrase} would you prefer?\n${choices}${retained}`;
+  }
+  if (unresolved?.status === 'UNAVAILABLE' && unresolved.resolved) {
+    const available = unresolved.resolved.available;
+    return available > 0
+      ? `${unresolved.resolved.name} currently has only ${available} available, fewer than the ${unresolved.quantity} requested.${retained} Would you like the available quantity or should I remove it?`
+      : `${unresolved.resolved.name} is currently unavailable.${retained} Would you like to remove it or choose an alternative?`;
+  }
+  if (unresolved?.status === 'NOT_FOUND') {
+    return `I couldn't find “${unresolved.phrase}” in the current catalogue.${retained} Would you like to remove it or tell me another product name?`;
+  }
+  const currency = resolved[0]?.resolved?.currency ?? '';
+  const lines = resolved.map((line) =>
+    `- ${line.quantity} × ${line.resolved!.name} — ${line.resolved!.currency} ${line.resolved!.price.toLocaleString()} each`
+  ).join('\n');
+  const subtotal = resolved.reduce((sum, line) => sum + line.quantity * line.resolved!.price, 0);
+  return `Great! Here's your proposed order:\n\n${lines}\n\nSubtotal: ${currency} ${subtotal.toLocaleString()}\n\nWould you like me to place this order?`;
+}
+
+function catalogForSales(products: Awaited<ReturnType<typeof productContext>>): CatalogItem[] {
+  return products.flatMap((product) => product.variants.map((variant) => ({
+      productId: product.id,
+      variantId: variant.id,
+      name: variant.name ? `${product.name} — ${variant.name}` : product.name,
+      description: product.description,
+      price: Number(variant.price),
+      currency: variant.currency,
+      available: availableForVariant(variant),
+    })));
 }
 
 function isSimpleConfirmation(message: string): boolean {
@@ -470,6 +508,15 @@ async function createDraftOrderFromProposal(customerId: string, proposal: SalesP
   });
   const allowed = new Set(variants.map((variant) => variant.id));
   if (allowed.size !== proposal.items.length) throw new Error('one or more selected items are no longer available');
+  const recent = await prisma.order.findFirst({
+    where: { customerId, status: 'PENDING', createdAt: { gte: new Date(Date.now() - 10 * 60_000) } },
+    orderBy: { createdAt: 'desc' },
+    select: { id: true, number: true, total: true, currency: true, items: { select: { variantId: true, quantity: true } } },
+  });
+  const sameProposal = recent
+    && recent.items.length === proposal.items.length
+    && proposal.items.every((item) => recent.items.some((line) => line.variantId === item.variantId && Number(line.quantity) === item.quantity));
+  if (sameProposal) return recent;
   return ordersService.create({
     customerId,
     source: channelToOrderSource(channelType),
@@ -810,21 +857,54 @@ export const aiService = {
     // independently of whatever JSON the language model returns.
     const intentDecision = classifyCustomerIntent(lastInbound);
 
-    // Confirmation is tied to a server-persisted proposal, never inferred from
-    // an isolated "yes" and never reconstructed from a model's memory.
-    const pendingProposal = salesProposal(conversation.metadata);
-    if (pendingProposal && isSimpleDecline(lastInbound)) {
-      await saveSalesProposal(conversationId, conversation.metadata, null);
+    const catalog = catalogForSales(products);
+    const existingFlow = persistedSalesFlow(conversation.metadata);
+
+    // Confirmation is tied to a server-persisted, per-line proposal, never
+    // inferred from an isolated "yes" or reconstructed from model prose.
+    if (existingFlow?.status === 'COMPLETED' && isSimpleConfirmation(lastInbound)) {
+      return `That order was already placed${existingFlow.orderNumber ? ` as ${existingFlow.orderNumber}` : ''}. I haven't created a duplicate.`;
+    }
+    if (existingFlow?.status === 'PROCESSING' && isSimpleConfirmation(lastInbound)) {
+      return 'That order confirmation is already being processed. I will not create a duplicate.';
+    }
+    if (existingFlow && ['AWAITING_CLARIFICATION', 'AWAITING_CONFIRMATION'].includes(existingFlow.status) && isSimpleDecline(lastInbound)) {
+      await saveSalesFlow(conversationId, conversation.metadata, {
+        ...existingFlow, status: 'CANCELLED', updatedAt: new Date().toISOString(), sourceMessageId: lastInboundMsg?.id,
+      });
       return 'No problem — I have cancelled that proposed order. Nothing was placed.';
     }
-    if (pendingProposal && isSimpleConfirmation(lastInbound)) {
+    if (existingFlow?.status === 'AWAITING_CONFIRMATION' && isSimpleConfirmation(lastInbound)) {
       try {
+        const processingFlow: SalesFlowState = {
+          ...existingFlow, status: 'PROCESSING', updatedAt: new Date().toISOString(), sourceMessageId: lastInboundMsg?.id,
+        };
+        const claim = await prisma.conversation.updateMany({
+          where: { id: conversationId, updatedAt: conversation.updatedAt },
+          data: { metadata: { ...conversationMetadata(conversation.metadata), aiSalesFlow: processingFlow } },
+        });
+        if (claim.count !== 1) return 'That confirmation is already being processed. I will not create a duplicate.';
+        const pendingProposal: SalesProposal = {
+          status: 'AWAITING_CONFIRMATION',
+          items: existingFlow.lines.map((line) => ({
+            variantId: line.resolved!.variantId,
+            name: line.resolved!.name,
+            quantity: line.quantity,
+            unitPrice: line.resolved!.price,
+            currency: line.resolved!.currency,
+          })),
+          proposedAt: existingFlow.updatedAt,
+          sourceMessageId: existingFlow.sourceMessageId,
+        };
         const order = await createDraftOrderFromProposal(
           conversation.customer.id,
           pendingProposal,
           conversation.channelAccount.channelType,
         );
-        await saveSalesProposal(conversationId, conversation.metadata, null);
+        await saveSalesFlow(conversationId, conversation.metadata, {
+          ...existingFlow, status: 'COMPLETED', orderId: order.id, orderNumber: order.number,
+          updatedAt: new Date().toISOString(), sourceMessageId: lastInboundMsg?.id,
+        });
         let paymentText = '';
         try {
           paymentText = await paymentRequestForOrder(conversation.organizationId, conversation.customer.id, order);
@@ -834,9 +914,19 @@ export const aiService = {
         }
         return `✅ Order ${order.number} created — ${order.currency} ${Number(order.total).toLocaleString()} total.${paymentText}`;
       } catch (error) {
-        await saveSalesProposal(conversationId, conversation.metadata, null);
+        await saveSalesFlow(conversationId, conversation.metadata, {
+          ...existingFlow, status: 'AWAITING_CONFIRMATION', updatedAt: new Date().toISOString(),
+        }).catch(() => undefined);
         logger.warn({ err: error, conversationId }, 'Confirmed chat order failed revalidation');
-        return `I couldn't place that order because ${(error as Error).message}. Nothing was charged. Please choose the items again.`;
+        return `I couldn't place that order because ${(error as Error).message}. Nothing was charged. Your selections are still saved; tell me what you want to change.`;
+      }
+    }
+
+    if (existingFlow?.status === 'AWAITING_CONFIRMATION') {
+      const revised = reviseConfirmedSalesFlow(existingFlow, lastInbound, catalog, lastInboundMsg?.id);
+      if (revised) {
+        await saveSalesFlow(conversationId, conversation.metadata, revised);
+        return renderSalesFlow(revised);
       }
     }
 
@@ -855,49 +945,28 @@ export const aiService = {
       return `Absolutely. Here are some available items: ${choices.join('; ')}. Which would you like, and how many?`;
     }
 
-    // For a specific purchase request, resolve the item against live catalogue
-    // records and persist the proposal before asking for confirmation. Multiple
-    // plausible records are shown as choices; the server never silently picks.
-    if (intentDecision.primary === 'PURCHASE' && !hasDeicticProductReference(lastInbound)) {
-      const terms = productRequestTerms(lastInbound);
-      const matches = products.filter((product) => {
-        const searchable = `${product.name} ${product.description ?? ''}`.toLowerCase();
-        return terms.length > 0 && terms.some((term) => searchable.includes(term));
-      });
-      if (matches.length === 0) {
-        const alternatives = products.slice(0, 5).map((product) => product.name);
-        return alternatives.length
-          ? `I couldn't find that exact item. Available alternatives include ${alternatives.join(', ')}. Which one would you like?`
-          : 'I could not find an available catalogue item matching that request. Nothing has been ordered.';
-      }
-      if (matches.length > 1) {
-        const alternatives = matches.slice(0, 6).map((product) => {
-          const variant = product.variants[0]!;
-          return `${product.name} (${variant.currency} ${Number(variant.price).toLocaleString()})`;
-        });
-        return `I found a few possible matches: ${alternatives.join('; ')}. Which exact item do you want?`;
-      }
-      const product = matches[0]!;
-      const variant = product.variants[0]!;
-      const quantity = requestedQuantity(lastInbound);
-      const available = availableForVariant(variant);
-      if (available < quantity) {
-        const otherAvailable = products
-          .filter((candidate) => candidate.id !== product.id && availableForVariant(candidate.variants[0]!) > 0)
-          .slice(0, 4)
-          .map((candidate) => candidate.name);
-        return available > 0
-          ? `${product.name} currently has ${available} available, fewer than the ${quantity} requested. Would you like ${available}${otherAvailable.length ? `, or one of these alternatives: ${otherAvailable.join(', ')}` : ''}?`
-          : `${product.name} is currently unavailable.${otherAvailable.length ? ` Available alternatives include ${otherAvailable.join(', ')}.` : ''}`;
-      }
-      const total = Number(variant.price) * quantity;
-      await saveSalesProposal(conversationId, conversation.metadata, {
-        status: 'AWAITING_CONFIRMATION',
-        items: [{ variantId: variant.id, name: product.name, quantity, unitPrice: Number(variant.price), currency: variant.currency }],
-        proposedAt: new Date().toISOString(),
-        sourceMessageId: lastInboundMsg?.id,
-      });
-      return `${quantity} × ${product.name} is ${variant.currency} ${total.toLocaleString()}. Please confirm if you want me to place this order.`;
+    // Resolve every requested line independently. When answering a recorded
+    // clarification, update only that line and retain the resolved remainder.
+    const continuingClarification = existingFlow?.status === 'AWAITING_CLARIFICATION';
+    if ((intentDecision.primary === 'PURCHASE' || continuingClarification) && !hasDeicticProductReference(lastInbound)) {
+      const requests = extractRequestedItems(lastInbound);
+      if (!requests.length) return 'Please tell me each item and quantity you want, for example “2 shirts and 1 hat”.';
+      const flow = continuingClarification
+        ? advanceSalesFlow(existingFlow, lastInbound, catalog, lastInboundMsg?.id)
+        : beginSalesFlow(requests, catalog, lastInboundMsg?.id);
+      const unresolved = flow.lines.find((line) => line.status !== 'RESOLVED');
+      if (unresolved) flow.lastQuestionFingerprint = stateFingerprint(unresolved);
+      await saveSalesFlow(conversationId, conversation.metadata, flow);
+      logger.info({
+        conversationId,
+        messageId: lastInboundMsg?.id,
+        decision: 'SALES_FLOW_ADVANCED',
+        status: flow.status,
+        resolvedCount: flow.lines.filter((line) => line.status === 'RESOLVED').length,
+        unresolvedCount: flow.lines.filter((line) => line.status !== 'RESOLVED').length,
+        clarificationAttempts: flow.clarificationAttempts,
+      }, 'AI sales conversation state updated');
+      return renderSalesFlow(flow);
     }
     const referencedProducts = await messageContextResolver.conversationProducts(conversation.organizationId, conversationId);
     const referencedProductsCtx = referencedProducts.map((product) =>
