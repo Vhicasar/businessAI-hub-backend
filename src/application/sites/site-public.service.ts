@@ -1,6 +1,7 @@
 import { prismaUnscoped } from '../../infrastructure/database/prisma';
 import { DEFAULT_THEME_V2, normalizeSections, siteThemeSchema, type SiteSection, type SiteThemeV2 } from './site-schema';
 import { domainConfigService } from './domain-config.service';
+import { nonRawMaterialProductWhere } from '../catalog/product-classification';
 import { decrypt } from '../../shared/crypto';
 import { filesService } from '../files/files.service';
 
@@ -52,7 +53,7 @@ async function dataContext(organizationId: string) {
     prismaUnscoped.organization.findUnique({ where: { id: organizationId }, select: { name: true, website: true, email: true, phone: true, addressLine1: true, addressLine2: true, city: true, state: true, postalCode: true, country: true, businessType: true, logoFileId: true } }),
     prismaUnscoped.businessProfile.findUnique({ where: { organizationId }, select: { tagline: true, description: true, openingHours: true, supportEmail: true, salesEmail: true, alternativePhone: true, whatsappNumber: true, socialLinks: true } }),
     prismaUnscoped.product.findMany({
-      where: { organizationId, status: 'ACTIVE', sellable: true, manufacturingType: { not: 'RAW_MATERIAL' }, deletedAt: null }, orderBy: [{ isFeatured: 'desc' }, { createdAt: 'desc' }], take: 48,
+      where: { organizationId, status: 'ACTIVE', sellable: true, deletedAt: null, ...nonRawMaterialProductWhere }, orderBy: [{ isFeatured: 'desc' }, { createdAt: 'desc' }], take: 48,
       select: { id: true, name: true, slug: true, description: true, isFeatured: true, variants: { where: { isActive: true, deletedAt: null }, orderBy: { isDefault: 'desc' }, take: 1, select: { id: true, price: true, compareAtPrice: true, currency: true } }, images: { orderBy: { position: 'asc' }, take: 12, select: { file: { select: { id: true, key: true, isPublic: true } }, altText: true } } },
     }),
     prismaUnscoped.property.findMany({

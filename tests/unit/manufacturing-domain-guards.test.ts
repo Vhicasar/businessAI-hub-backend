@@ -4,6 +4,7 @@ import { recordOutputSchema } from '../../src/application/manufacturing/producti
 import { canCompleteProduction, canRecordProduction, canStartProduction } from '../../src/application/manufacturing/production-guards';
 import { createProductSchema, listProductsSchema } from '../../src/application/catalog/catalog.dto';
 import { listStockSchema } from '../../src/application/inventory/inventory.service';
+import { nonRawMaterialProductWhere, productKindWhere } from '../../src/application/catalog/product-classification';
 
 const validOrder = {
   warehouseId: 'raw-store',
@@ -73,5 +74,12 @@ describe('raw-material classification contracts', () => {
     expect(listProductsSchema.parse({ itemKind: 'RAW_MATERIAL' }).itemKind).toBe('RAW_MATERIAL');
     expect(listStockSchema.parse({}).itemKind).toBe('PRODUCT');
     expect(listStockSchema.parse({ itemKind: 'RAW_MATERIAL' }).itemKind).toBe('RAW_MATERIAL');
+  });
+
+  it('keeps ordinary NULL-classified products in product and inventory queries', () => {
+    expect(productKindWhere('PRODUCT')).toEqual(nonRawMaterialProductWhere);
+    expect(nonRawMaterialProductWhere.OR).toContainEqual({ manufacturingType: null });
+    expect(productKindWhere('RAW_MATERIAL')).toEqual({ manufacturingType: 'RAW_MATERIAL' });
+    expect(productKindWhere('ALL')).toEqual({});
   });
 });

@@ -22,6 +22,7 @@ import { messageContextResolver } from '../inbox/message-context-resolver.servic
 import { requestContext } from '../../shared/context';
 import { isOwnerMembership, permissionsForRole } from '../roles/role-permissions';
 import { modulesFor } from '../modules/business-modules';
+import { nonRawMaterialProductWhere } from '../catalog/product-classification';
 import { channelPolicy, isChannelEnabled } from '../settings/workspace-config';
 import {
   WORKSPACE_DESTINATIONS,
@@ -140,7 +141,7 @@ async function productContext(query: string) {
     deletedAt: null,
     status: 'ACTIVE' as const,
     sellable: true,
-    manufacturingType: { not: 'RAW_MATERIAL' as const },
+    AND: [nonRawMaterialProductWhere],
   };
   const select = {
     id: true,
@@ -369,7 +370,7 @@ async function createDraftOrder(customerId: string, items: { name?: string; quan
         deletedAt: null,
         status: 'ACTIVE',
         sellable: true,
-        manufacturingType: { not: 'RAW_MATERIAL' },
+        ...nonRawMaterialProductWhere,
         name: { contains: name, mode: 'insensitive' },
       },
       select: { variants: variantSelect },

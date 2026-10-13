@@ -1,6 +1,7 @@
 import type { ChannelType, Prisma } from '@prisma/client';
 import { prismaUnscoped } from '../../infrastructure/database/prisma';
 import { logger } from '../../shared/logger';
+import { nonRawMaterialProductWhere } from '../catalog/product-classification';
 import type { NormalizedInbound, NormalizedMessageType, ReferencedContent } from './channel-adapter';
 import { sharedContentResolver } from './shared-content-resolver.service';
 
@@ -76,7 +77,7 @@ const productSelect = {
 
 async function liveProduct(organizationId: string, id: string, confidence: number, matchMethod: ProductMatchMethod): Promise<ResolvedProductContext | null> {
   const product = await prismaUnscoped.product.findFirst({
-    where: { id, organizationId, deletedAt: null, status: 'ACTIVE', sellable: true, manufacturingType: { not: 'RAW_MATERIAL' } },
+    where: { id, organizationId, deletedAt: null, status: 'ACTIVE', sellable: true, ...nonRawMaterialProductWhere },
     select: productSelect,
   });
   if (!product) return null;

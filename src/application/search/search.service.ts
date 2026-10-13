@@ -1,4 +1,5 @@
 import { prisma } from '../../infrastructure/database/prisma';
+import { nonRawMaterialProductWhere } from '../catalog/product-classification';
 import { callerHasPermission } from '../roles/role-permissions';
 
 /**
@@ -100,7 +101,7 @@ const SEARCHERS: Searcher[] = [
     type: 'product', perms: ['catalog.read'],
     async run(q, take) {
       const rows = await prisma.product.findMany({
-        where: { deletedAt: null, manufacturingType: { not: 'RAW_MATERIAL' }, sellable: true, OR: [{ name: ci(q) }, { variants: { some: { sku: ci(q) } } }] },
+        where: { deletedAt: null, subscriptionDraftAt: null, sellable: true, AND: [nonRawMaterialProductWhere, { OR: [{ name: ci(q) }, { variants: { some: { sku: ci(q) } } }] }] },
         select: { id: true, name: true, status: true }, take, orderBy: { updatedAt: 'desc' },
       });
       return rows.map((r) => ({ type: 'product' as const, id: r.id, title: r.name, subtitle: r.status }));

@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { ConflictError, NotFoundError, ValidationError } from '../../shared/errors';
 import { prisma } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
+import { productKindWhere } from '../catalog/product-classification';
 
 const currentOrgId = (): string => {
   const id = requestContext.get()?.organizationId;
@@ -188,11 +189,9 @@ export const inventoryService = {
         variant: {
           deletedAt: null,
           product: {
-            ...(dto.itemKind === 'RAW_MATERIAL'
-              ? { manufacturingType: 'RAW_MATERIAL' as const }
-              : dto.itemKind === 'PRODUCT'
-                ? { NOT: { manufacturingType: 'RAW_MATERIAL' as const } }
-                : {}),
+            deletedAt: null,
+            subscriptionDraftAt: null,
+            ...productKindWhere(dto.itemKind),
             ...(dto.search ? { name: { contains: dto.search, mode: 'insensitive' as const } } : {}),
           },
           ...(dto.search

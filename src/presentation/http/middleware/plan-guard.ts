@@ -107,7 +107,9 @@ export function enforceLimit(kind: CountableLimit): RequestHandler {
           });
         }
         if (used >= limit) {
-          if (kind === 'contacts' || kind === 'products') {
+          // Draft overflow is a recovery mechanism for a failed subscription,
+          // not a way to silently bypass a healthy plan's normal quota.
+          if ((kind === 'contacts' || kind === 'products') && ent.accessRestriction) {
             req.subscriptionDraftReason = `Saved as a subscription draft because the ${ent.planName} limit of ${limit} ${LABEL[kind]} has been reached.`;
             next();
             return;

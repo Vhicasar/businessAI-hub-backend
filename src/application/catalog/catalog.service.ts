@@ -6,6 +6,7 @@ import { filesService } from '../files/files.service';
 import { exchangeRates } from '../../shared/exchange-rates';
 import { resolveEntitlements } from '../billing/entitlements';
 import { reconcileSubscriptionDrafts } from '../billing/subscription-drafts.service';
+import { productKindWhere } from './product-classification';
 
 /** Nested creates bypass the tenant extension's data injection. */
 function orgId(): string {
@@ -183,22 +184,18 @@ export const catalogService = {
         deletedAt: null,
         subscriptionDraftAt: dto.subscriptionState === 'draft' ? { not: null } : null,
         ...(dto.status ? { status: dto.status } : {}),
-        ...(dto.itemKind === 'RAW_MATERIAL'
-          ? { manufacturingType: 'RAW_MATERIAL' as const }
-          : dto.itemKind === 'PRODUCT'
-            ? { NOT: { manufacturingType: 'RAW_MATERIAL' as const } }
-            : {}),
         ...(dto.categoryId ? { categoryId: dto.categoryId } : {}),
         ...(dto.brandId ? { brandId: dto.brandId } : {}),
-        ...(dto.search
-          ? {
+        AND: [
+          productKindWhere(dto.itemKind),
+          ...(dto.search ? [{
               OR: [
                 { name: { contains: dto.search, mode: 'insensitive' as const } },
                 { variants: { some: { sku: { contains: dto.search, mode: 'insensitive' as const } } } },
                 { variants: { some: { barcode: { contains: dto.search, mode: 'insensitive' as const } } } },
               ],
-            }
-          : {}),
+            }] : []),
+        ],
       },
       select: productSelect,
       orderBy: PRODUCT_SORTS[dto.sort ?? 'newest'],
@@ -209,7 +206,9 @@ export const catalogService = {
     const items = await withImages(await inPreferredCurrency(
       (hasMore ? rows.slice(0, dto.limit) : rows).map(withStockTotals),
     ));
-    const subscriptionDraftCount = await prisma.product.count({ where: { deletedAt: null, subscriptionDraftAt: { not: null } } });
+    const subscriptionDraftCount = await prisma.product.count({
+      where: { deletedAt: null, subscriptionDraftAt: { not: null }, ...productKindWhere(dto.itemKind) },
+    });
     return {
       items,
       nextCursor: hasMore ? items[items.length - 1]?.id ?? null : null,
@@ -238,9 +237,10 @@ export const catalogService = {
     const slug = await uniqueSlug('product', dto.name);
     const hasDefault = dto.variants.some((v) => v.isDefault);
 
-    // Only touch inventory if some variant ships with opening stock.
-    const needsStock = dto.variants.some((v) => Number(v.initialStock ?? 0) > 0);
-    const warehouse = needsStock ? await inventoryService.ensureDefaultWarehouse() : null;
+    // Every variant gets an inventory row, even at zero. Otherwise a newly
+    // created product exists in Catalog but is invisible in Inventory until a
+    // later adjustment, which makes the successful create look like data loss.
+    const warehouse = await inventoryService.ensureDefaultWarehouse();
     const org = orgId();
 
     type CreatedProduct = {
@@ -301,17 +301,15 @@ export const catalogService = {
         select: productSelect,
       })) as unknown as CreatedProduct;
 
-      if (warehouse) {
-        for (const dv of dto.variants) {
+      for (const dv of dto.variants) {
           const qty = Number(dv.initialStock ?? 0);
-          if (qty <= 0) continue;
           // Variants share the SKU we just created — match on it to get the id.
           const variant = created.variants.find((v) => v.sku === dv.sku);
           if (!variant) continue;
           await tx.stockLevel.create({
             data: { organizationId: org, warehouseId: warehouse.id, variantId: variant.id, quantity: qty },
           });
-          await tx.stockMovement.create({
+          if (qty > 0) await tx.stockMovement.create({
             data: {
               organizationId: org,
               warehouseId: warehouse.id,
@@ -322,7 +320,6 @@ export const catalogService = {
               referenceType: 'ADJUSTMENT',
             },
           });
-        }
       }
       return created;
     });
@@ -377,7 +374,7 @@ export const catalogService = {
     if (dup) throw new ConflictError(`SKU "${dto.sku}" is already in use`);
 
     const qty = Number(dto.initialStock ?? 0);
-    const warehouse = qty > 0 ? await inventoryService.ensureDefaultWarehouse() : null;
+    const warehouse = await inventoryService.ensureDefaultWarehouse();
     const org = orgId();
 
     return prisma.$transaction(async (tx) => {
@@ -398,11 +395,10 @@ export const catalogService = {
           imageFileId: dto.imageFileId ?? null,
         },
       });
-      if (warehouse && qty > 0) {
-        await tx.stockLevel.create({
-          data: { organizationId: org, warehouseId: warehouse.id, variantId: variant.id, quantity: qty },
-        });
-        await tx.stockMovement.create({
+      await tx.stockLevel.create({
+        data: { organizationId: org, warehouseId: warehouse.id, variantId: variant.id, quantity: qty },
+      });
+      if (qty > 0) await tx.stockMovement.create({
           data: {
             organizationId: org,
             warehouseId: warehouse.id,
@@ -413,7 +409,6 @@ export const catalogService = {
             referenceType: 'ADJUSTMENT',
           },
         });
-      }
       return variant;
     });
   },
