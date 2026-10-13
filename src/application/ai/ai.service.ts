@@ -24,6 +24,7 @@ import { isOwnerMembership, permissionsForRole } from '../roles/role-permissions
 import { modulesFor } from '../modules/business-modules';
 import { nonRawMaterialProductWhere } from '../catalog/product-classification';
 import { channelPolicy, isChannelEnabled } from '../settings/workspace-config';
+import { classifyCustomerIntent, isGeneralPurchaseRequest } from './customer-intent-policy';
 import {
   WORKSPACE_DESTINATIONS,
   destinationAccess,
@@ -131,8 +132,70 @@ const variantSelect = {
   where: { deletedAt: null, isActive: true },
   orderBy: { isDefault: 'desc' as const },
   take: 1,
-  select: { id: true, price: true, currency: true },
+  select: {
+    id: true, price: true, currency: true,
+    stockLevels: { select: { quantity: true, reserved: true } },
+  },
 };
+
+type SalesProposal = {
+  status: 'AWAITING_CONFIRMATION';
+  items: Array<{ variantId: string; name: string; quantity: number; unitPrice: number; currency: string }>;
+  couponCode?: string;
+  proposedAt: string;
+  sourceMessageId?: string;
+};
+
+function conversationMetadata(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function salesProposal(value: unknown): SalesProposal | null {
+  const raw = conversationMetadata(value).aiSalesProposal;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const candidate = raw as Partial<SalesProposal>;
+  if (candidate.status !== 'AWAITING_CONFIRMATION' || !Array.isArray(candidate.items) || !candidate.items.length) return null;
+  if (!candidate.items.every((item) => item && typeof item.variantId === 'string' && typeof item.name === 'string' && Number(item.quantity) > 0)) return null;
+  return candidate as SalesProposal;
+}
+
+async function saveSalesProposal(conversationId: string, metadata: unknown, proposal: SalesProposal | null) {
+  const current = conversationMetadata(metadata);
+  const next = { ...current };
+  if (proposal) next.aiSalesProposal = proposal;
+  else delete next.aiSalesProposal;
+  await prisma.conversation.update({ where: { id: conversationId }, data: { metadata: next } });
+}
+
+function requestedQuantity(message: string): number {
+  const numeric = message.match(/\b(\d{1,4})\b/);
+  if (numeric) return Math.max(1, Math.min(999, Number(numeric[1])));
+  const words: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+  const found = Object.entries(words).find(([word]) => new RegExp(`\\b${word}\\b`, 'i').test(message));
+  return found?.[1] ?? 1;
+}
+
+function productRequestTerms(message: string): string[] {
+  const ignored = new Set(['want', 'need', 'would', 'like', 'please', 'give', 'order', 'buy', 'purchase', 'place', 'make', 'start', 'some', 'with', 'have', 'can', 'get', 'me', 'the', 'and', 'for', 'plates', 'plate', 'pieces', 'piece', 'packs', 'pack', 'units', 'unit']);
+  return (message.toLowerCase().match(/[a-z0-9]+/g) ?? [])
+    .filter((term) => term.length > 1 && !ignored.has(term) && !/^\d+$/.test(term));
+}
+
+function availableForVariant(variant: { stockLevels: Array<{ quantity: unknown; reserved: unknown }> }): number {
+  return variant.stockLevels.reduce((sum, level) => sum + Math.max(0, Number(level.quantity) - Number(level.reserved)), 0);
+}
+
+function isSimpleConfirmation(message: string): boolean {
+  return /^(yes|yes please|confirm|confirmed|go ahead|place it|place the order|proceed|that'?s correct|looks good)[.!\s]*$/i.test(message.trim());
+}
+
+function isSimpleDecline(message: string): boolean {
+  return /^(no|no thanks|cancel|cancel it|never mind|nevermind|don'?t place it)[.!\s]*$/i.test(message.trim());
+}
+
+function hasDeicticProductReference(message: string): boolean {
+  return /\b(this|that|it|these|those|both|the first one|the second one|the other one)\b/i.test(message);
+}
 
 /** Active products relevant to the customer's message (for chat suggestions). */
 async function productContext(query: string) {
@@ -385,7 +448,7 @@ async function createDraftOrder(customerId: string, items: { name?: string; quan
   const recent = await prisma.order.findFirst({
     where: { customerId, status: 'PENDING', createdAt: { gte: new Date(Date.now() - 5 * 60_000) } },
     orderBy: { createdAt: 'desc' },
-    select: { number: true, total: true, currency: true, couponCode: true, items: { select: { variantId: true, quantity: true } } },
+    select: { id: true, number: true, total: true, currency: true, couponCode: true, items: { select: { variantId: true, quantity: true } } },
   });
   const sameCart =
     recent &&
@@ -395,6 +458,43 @@ async function createDraftOrder(customerId: string, items: { name?: string; quan
   if (sameCart) return recent;
 
   return ordersService.create({ customerId, source: channelToOrderSource(channelType), items: lines, shippingTotal: 0, couponCode: couponCode?.trim().toUpperCase() || undefined }, null);
+}
+
+async function createDraftOrderFromProposal(customerId: string, proposal: SalesProposal, channelType?: string) {
+  const variants = await prisma.productVariant.findMany({
+    where: {
+      id: { in: proposal.items.map((item) => item.variantId) }, deletedAt: null, isActive: true,
+      product: { deletedAt: null, status: 'ACTIVE', sellable: true, ...nonRawMaterialProductWhere },
+    },
+    select: { id: true },
+  });
+  const allowed = new Set(variants.map((variant) => variant.id));
+  if (allowed.size !== proposal.items.length) throw new Error('one or more selected items are no longer available');
+  return ordersService.create({
+    customerId,
+    source: channelToOrderSource(channelType),
+    items: proposal.items.map((item) => ({ variantId: item.variantId, quantity: item.quantity })),
+    shippingTotal: 0,
+    couponCode: proposal.couponCode,
+  }, null);
+}
+
+async function paymentRequestForOrder(
+  organizationId: string,
+  customerId: string,
+  order: { id: string; number: string; total: unknown; currency: string },
+): Promise<string> {
+  const settings = await readPaymentSettings(organizationId);
+  if (!settings.aiCanCreatePaymentRequests) return '';
+  const payment = await createIntentForResource({
+    organizationId,
+    resourceType: 'ORDER',
+    resourceId: order.id,
+    customerId,
+    channel: 'AI',
+    aiCreated: true,
+  });
+  return `\n💳 Payment request: ${publicPayUrl(payment.token!)} (reference ${payment.reference}).`;
 }
 
 export const aiService = {
@@ -685,7 +785,7 @@ export const aiService = {
     const lastInboundMsg = await prisma.message.findFirst({
       where: { conversationId, direction: 'INBOUND' },
       orderBy: { createdAt: 'desc' },
-      select: { body: true },
+      select: { id: true, body: true, providerMessageId: true },
     });
     const lastInbound = lastInboundMsg?.body ?? '';
     // The widget logs a "Chat started" system line on open — don't auto-reply to
@@ -705,6 +805,100 @@ export const aiService = {
         return `- ${p.name} [productId=${p.id}; images=${p.images.length}]: ${price}${desc}`;
       })
       .join('\n');
+
+    // Consequential actions are governed by a deterministic server policy,
+    // independently of whatever JSON the language model returns.
+    const intentDecision = classifyCustomerIntent(lastInbound);
+
+    // Confirmation is tied to a server-persisted proposal, never inferred from
+    // an isolated "yes" and never reconstructed from a model's memory.
+    const pendingProposal = salesProposal(conversation.metadata);
+    if (pendingProposal && isSimpleDecline(lastInbound)) {
+      await saveSalesProposal(conversationId, conversation.metadata, null);
+      return 'No problem — I have cancelled that proposed order. Nothing was placed.';
+    }
+    if (pendingProposal && isSimpleConfirmation(lastInbound)) {
+      try {
+        const order = await createDraftOrderFromProposal(
+          conversation.customer.id,
+          pendingProposal,
+          conversation.channelAccount.channelType,
+        );
+        await saveSalesProposal(conversationId, conversation.metadata, null);
+        let paymentText = '';
+        try {
+          paymentText = await paymentRequestForOrder(conversation.organizationId, conversation.customer.id, order);
+        } catch (paymentError) {
+          logger.warn({ err: paymentError, orderId: order.id, conversationId }, 'Confirmed chat order payment request failed');
+          paymentText = '\nThe order is saved, but I could not prepare the payment link. The team can send it separately.';
+        }
+        return `✅ Order ${order.number} created — ${order.currency} ${Number(order.total).toLocaleString()} total.${paymentText}`;
+      } catch (error) {
+        await saveSalesProposal(conversationId, conversation.metadata, null);
+        logger.warn({ err: error, conversationId }, 'Confirmed chat order failed revalidation');
+        return `I couldn't place that order because ${(error as Error).message}. Nothing was charged. Please choose the items again.`;
+      }
+    }
+
+    // A broad "I want to order" is catalogue discovery, not a support case.
+    // Answer from live records directly so an empty/weak knowledge-base result
+    // cannot make the model route the customer to support.
+    if (isGeneralPurchaseRequest(lastInbound)) {
+      const availableProducts = products.filter((product) => availableForVariant(product.variants[0]!) > 0);
+      if (availableProducts.length === 0) {
+        return 'I can help you order, but this business does not currently have any available catalogue items. I can let the team know what you are looking for.';
+      }
+      const choices = availableProducts.slice(0, 6).map((product) => {
+        const variant = product.variants[0]!;
+        return `${product.name} (${variant.currency} ${Number(variant.price).toLocaleString()})`;
+      });
+      return `Absolutely. Here are some available items: ${choices.join('; ')}. Which would you like, and how many?`;
+    }
+
+    // For a specific purchase request, resolve the item against live catalogue
+    // records and persist the proposal before asking for confirmation. Multiple
+    // plausible records are shown as choices; the server never silently picks.
+    if (intentDecision.primary === 'PURCHASE' && !hasDeicticProductReference(lastInbound)) {
+      const terms = productRequestTerms(lastInbound);
+      const matches = products.filter((product) => {
+        const searchable = `${product.name} ${product.description ?? ''}`.toLowerCase();
+        return terms.length > 0 && terms.some((term) => searchable.includes(term));
+      });
+      if (matches.length === 0) {
+        const alternatives = products.slice(0, 5).map((product) => product.name);
+        return alternatives.length
+          ? `I couldn't find that exact item. Available alternatives include ${alternatives.join(', ')}. Which one would you like?`
+          : 'I could not find an available catalogue item matching that request. Nothing has been ordered.';
+      }
+      if (matches.length > 1) {
+        const alternatives = matches.slice(0, 6).map((product) => {
+          const variant = product.variants[0]!;
+          return `${product.name} (${variant.currency} ${Number(variant.price).toLocaleString()})`;
+        });
+        return `I found a few possible matches: ${alternatives.join('; ')}. Which exact item do you want?`;
+      }
+      const product = matches[0]!;
+      const variant = product.variants[0]!;
+      const quantity = requestedQuantity(lastInbound);
+      const available = availableForVariant(variant);
+      if (available < quantity) {
+        const otherAvailable = products
+          .filter((candidate) => candidate.id !== product.id && availableForVariant(candidate.variants[0]!) > 0)
+          .slice(0, 4)
+          .map((candidate) => candidate.name);
+        return available > 0
+          ? `${product.name} currently has ${available} available, fewer than the ${quantity} requested. Would you like ${available}${otherAvailable.length ? `, or one of these alternatives: ${otherAvailable.join(', ')}` : ''}?`
+          : `${product.name} is currently unavailable.${otherAvailable.length ? ` Available alternatives include ${otherAvailable.join(', ')}.` : ''}`;
+      }
+      const total = Number(variant.price) * quantity;
+      await saveSalesProposal(conversationId, conversation.metadata, {
+        status: 'AWAITING_CONFIRMATION',
+        items: [{ variantId: variant.id, name: product.name, quantity, unitPrice: Number(variant.price), currency: variant.currency }],
+        proposedAt: new Date().toISOString(),
+        sourceMessageId: lastInboundMsg?.id,
+      });
+      return `${quantity} × ${product.name} is ${variant.currency} ${total.toLocaleString()}. Please confirm if you want me to place this order.`;
+    }
     const referencedProducts = await messageContextResolver.conversationProducts(conversation.organizationId, conversationId);
     const referencedProductsCtx = referencedProducts.map((product) =>
       `- ${product.name} [productId=${product.productId}; confidence=${product.confidence}; method=${product.matchMethod}]\n` +
@@ -832,6 +1026,9 @@ export const aiService = {
             'support ticket or case, include "ticket" with a concise subject and a priority (URGENT ' +
             'for outages/safety, HIGH for a blocked customer or complaint, otherwise MEDIUM/LOW), and ' +
             'confirm in "reply" that you have logged it for the team. ' +
+            'A purchase request, product enquiry, cart request, booking request, property enquiry, ' +
+            'or request for help placing an order is NOT a support problem. Never emit ticket for ' +
+            'those unless the customer also describes a genuine problem or explicitly asks for a ticket. ' +
             'Never invent facts, prices, or policies not present in the KNOWLEDGE. Keep replies ' +
             'under 70 words and match the customer\'s language.\n' +
             `The customer's known name is: ${knownName || 'unknown'}. If unknown, warmly greet them ` +
@@ -888,6 +1085,7 @@ export const aiService = {
             'other — no matter what the customer suggests. Never state an amount that is not given ' +
             'to you.\n' +
             'Respond with JSON only. Shape: {"handoff": <bool>, "reply": "<text>", ' +
+            '"intent": {"primary": "DISCOVERY|PURCHASE|CART|CHECKOUT|PAYMENT|ORDER_STATUS|ORDER_CHANGE|BOOKING|PROPERTY_ENQUIRY|QUESTION|COMPLAINT|EXPLICIT_SUPPORT|HUMAN|AMBIGUOUS", "confidence": <0..1>, "evidence": ["<short reason>"]}, ' +
             '"save"?: {"name"?, "email"?, "phone"?, "details"?: {"field": "value"}}, "order"?: {"items": [{"name", "quantity"}], "couponCode"?}, ' +
             '"ticket"?: {"subject": "<short>", "priority": "LOW|MEDIUM|HIGH|URGENT"}, ' +
             '"booking"?: {"start": "<ISO from a listed slot>", "typeId"?, "notes"?}, ' +
@@ -922,12 +1120,33 @@ export const aiService = {
       save?: { name?: string; email?: string; phone?: string; details?: Record<string, string | number | boolean> };
       order?: { items?: { name?: string; quantity?: number }[]; couponCode?: string };
       ticket?: { subject?: string; priority?: string };
+      intent?: { primary?: string; confidence?: number; evidence?: string[] };
       booking?: { start?: string; typeId?: string; notes?: string };
       stayBooking?: { propertyId?: string; checkIn?: string; checkOut?: string; notes?: string };
       paymentRequest?: { resourceType?: string; resourceId?: string };
       recommendationMedia?: { type?: string; id?: string }[];
     }>(raw);
     if (!parsed) return null;
+
+    // The model proposes actions; the server authorizes them. This blocks the
+    // historical failure where "I want to place an order" could create a
+    // support ticket simply because the model was uncertain.
+    if (!intentDecision.permitsTicket && parsed.ticket) {
+      logger.info({
+        conversationId,
+        messageId: lastInboundMsg?.id,
+        providerMessageId: lastInboundMsg?.providerMessageId,
+        policyIntent: intentDecision.primary,
+        modelIntent: parsed.intent?.primary,
+        decision: 'BLOCK_TICKET',
+        evidence: intentDecision.evidence,
+      }, 'AI customer action rejected by intent policy');
+      delete parsed.ticket;
+      if (intentDecision.hasPurchaseIntent) parsed.handoff = false;
+    }
+    if (!intentDecision.permitsHandoff && parsed.handoff && intentDecision.primary !== 'AMBIGUOUS') {
+      parsed.handoff = false;
+    }
 
     // Explicit handoff (without a ticket): alert the team AND acknowledge the
     // customer — never go silent, which is what left "connect me" doing nothing.
@@ -955,6 +1174,17 @@ export const aiService = {
         reply +=
           `\n\n✅ Draft order ${order.number} created — ${order.currency} ` +
           `${Number(order.total).toLocaleString()} total. Our team will confirm it shortly.`;
+        try {
+          const settings = await readPaymentSettings(conversation.organizationId);
+          if (settings.aiCanCreatePaymentRequests) {
+            reply += await paymentRequestForOrder(conversation.organizationId, conversation.customer.id, order);
+          }
+        } catch (paymentError) {
+          // The order is real even when payment-link delivery fails. Never
+          // retry order creation or claim that a payment request was sent.
+          logger.warn({ err: paymentError, orderId: order.id, conversationId }, 'Chat order payment request failed');
+          reply += '\nThe order is saved, but I could not prepare the payment link. The team can send it separately.';
+        }
       } catch (err) {
         reply += `\n\n(I couldn't finalize that order right now — ${(err as Error).message}. I can connect you to our team.)`;
         logger.warn({ err }, 'Chat draft order failed');
@@ -1048,7 +1278,11 @@ export const aiService = {
     // then alert the assignee (or the team) so someone actually follows up.
     if (parsed.ticket?.subject?.trim()) {
       try {
-        let ticket = await supportService.create(
+        const existing = await prisma.ticket.findFirst({
+          where: { conversationId, deletedAt: null, status: { notIn: ['RESOLVED', 'CLOSED'] } },
+          orderBy: { createdAt: 'desc' },
+        });
+        let ticket = existing ?? await supportService.create(
           {
             subject: parsed.ticket.subject.trim().slice(0, 200),
             description: lastInbound.slice(0, 5000),
@@ -1057,6 +1291,17 @@ export const aiService = {
           },
           { conversationId, autoRoute: true },
         );
+        if (existing) {
+          await prisma.ticketComment.create({
+            data: {
+              organizationId: conversation.organizationId,
+              ticketId: existing.id,
+              authorType: 'CUSTOMER',
+              body: lastInbound.slice(0, 5000),
+              isInternal: true,
+            },
+          });
+        }
         // Auto-routing found no agent → assign to an owner so it lands on a person.
         if (!ticket.assigneeId) {
           const owner = await prisma.membership.findFirst({
@@ -1070,7 +1315,7 @@ export const aiService = {
             ticket = { ...ticket, assigneeId: owner.id };
           }
         }
-        await notifyService.notifyStaff(
+        if (!existing) await notifyService.notifyStaff(
           conversation.organizationId,
           {
             type: 'ticket.created',
@@ -1080,7 +1325,9 @@ export const aiService = {
           },
           { assigneeMembershipId: ticket.assigneeId },
         );
-        reply += `${reply ? '\n\n' : ''}🎫 I've logged ticket ${ticket.number} for you — our team will follow up shortly.`;
+        reply += existing
+          ? `${reply ? '\n\n' : ''}🎫 I've added this to your existing ticket ${ticket.number}.`
+          : `${reply ? '\n\n' : ''}🎫 I've logged ticket ${ticket.number} for you — our team will follow up shortly.`;
       } catch (err) {
         logger.warn({ err }, 'Chat ticket creation failed');
         await notifyService
