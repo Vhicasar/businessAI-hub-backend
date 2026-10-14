@@ -912,12 +912,54 @@ export const aiService = {
     const lastInboundMsg = await prisma.message.findFirst({
       where: { conversationId, direction: 'INBOUND' },
       orderBy: { createdAt: 'desc' },
-      select: { id: true, body: true, providerMessageId: true },
+      select: { id: true, body: true, providerMessageId: true, contextSnapshot: true },
     });
     const lastInbound = lastInboundMsg?.body ?? '';
     // The widget logs a "Chat started" system line on open — don't auto-reply to
     // it; the bot greets when the visitor actually says something.
     if (!lastInbound.trim() || /^chat started/i.test(lastInbound.trim())) return null;
+
+    // Social replies to a post/reel/story: when the customer refers to shared
+    // media ("is this still available?") the resolver attaches the post's
+    // caption + any matched catalogue item (with live stock) to the message
+    // context, which the model reads below. But if the reference could NOT be
+    // confidently mapped to a catalogue item, the assistant may not truly know
+    // what "this" is — so quietly alert the business to step in or fix the
+    // mapping. The customer is told nothing; the bot still replies as best it
+    // can from the caption. Fire-and-forget so it never blocks the reply.
+    const inboundContext =
+      lastInboundMsg?.contextSnapshot &&
+      typeof lastInboundMsg.contextSnapshot === 'object' &&
+      !Array.isArray(lastInboundMsg.contextSnapshot)
+        ? (lastInboundMsg.contextSnapshot as Record<string, unknown>)
+        : null;
+    const sharedReferences = Array.isArray(inboundContext?.references)
+      ? (inboundContext!.references as Array<{
+          type?: string; provider?: string; caption?: string; title?: string; text?: string; permalink?: string; url?: string;
+        }>)
+      : [];
+    if (sharedReferences.length > 0 && inboundContext?.needsClarification === true) {
+      const ref = sharedReferences[0]!;
+      const descriptor = String(ref.caption ?? ref.title ?? ref.text ?? '').slice(0, 140);
+      void notifyService
+        .notifyStaff(conversation.organizationId, {
+          type: 'inbox.unrecognized_reference',
+          title: "Customer asked about a shared post the assistant couldn't identify",
+          body:
+            `${conversation.customer.firstName || 'A customer'} replied to a ` +
+            `${ref.provider || 'social'} ${(ref.type || 'post').replace(/_/g, ' ')}` +
+            `${descriptor ? ` (“${descriptor}”)` : ''} asking: “${lastInbound.slice(0, 160)}”. ` +
+            'The assistant could not match it to a catalogue item — please take a look.',
+          data: {
+            conversationId,
+            messageId: lastInboundMsg?.id ?? '',
+            permalink: ref.permalink ?? ref.url ?? '',
+            provider: ref.provider ?? '',
+            referenceType: ref.type ?? '',
+          },
+        })
+        .catch((err) => logger.warn({ err, conversationId }, 'Unrecognized-reference staff notice failed'));
+    }
 
     const hits = await knowledgeService.search(conversation.organizationId, lastInbound, 4);
     const knowledge = hits.map((h, i) => `[${i + 1}] ${h.content}`).join('\n\n');
@@ -1029,10 +1071,12 @@ export const aiService = {
       }
     }
 
-    // A broad "I want to order" is catalogue discovery, not a support case.
-    // Answer from live records directly so an empty/weak knowledge-base result
-    // cannot make the model route the customer to support.
-    if (isGeneralPurchaseRequest(lastInbound)) {
+    // Catalogue discovery: purchase intent with no concrete item yet. Live
+    // records are listed directly so a weak knowledge-base result can't reroute
+    // the customer to support — and so a non-specific "I want to order" never
+    // becomes a dead-end catalogue lookup. productContext already falls back to
+    // top active products when the message names nothing in particular.
+    const discoveryReply = (): string => {
       const availableProducts = products.filter((product) => availableForVariant(product.variants[0]!) > 0);
       if (availableProducts.length === 0) {
         return 'I can help you order, but this business does not currently have any available catalogue items. I can let the team know what you are looking for.';
@@ -1041,7 +1085,11 @@ export const aiService = {
         const variant = product.variants[0]!;
         return `${product.name} (${variant.currency} ${Number(variant.price).toLocaleString()})`;
       });
-      return `Absolutely. Here are some available items: ${choices.join('; ')}. Which would you like, and how many?`;
+      return `Absolutely — I can set that up for you. Here are some of our available items: ${choices.join('; ')}. Which would you like, and how many?`;
+    };
+
+    if (isGeneralPurchaseRequest(lastInbound)) {
+      return discoveryReply();
     }
 
     // Resolve every requested line independently. When answering a recorded
@@ -1087,16 +1135,45 @@ export const aiService = {
         }
       }
 
-      const requests = semantic && semantic.confidence >= 0.65 && semantic.items.length
-        ? semantic.items.map((item, index) => normalizeInterpretedRequestedItem(item, `line-${index + 1}`))
+      // The semantic interpreter is the authority on whether this turn actually
+      // names products. When it ran successfully and found none, the customer is
+      // expressing purchase intent in general terms ("I want to place a new
+      // order") — guide them to the catalogue instead of fabricating a product
+      // lookup from arbitrary words. The deterministic keyword parser is a
+      // last-resort used ONLY when the model was unavailable (threw), or when
+      // completing a clarification the model can't see structured state for.
+      const modelRan = semantic !== null;
+      const modelHasItems = Boolean(semantic && semantic.confidence >= 0.65 && semantic.items.length);
+      if (modelRan && !modelHasItems && !continuingClarification) {
+        return discoveryReply();
+      }
+
+      const requests = modelHasItems
+        ? semantic!.items.map((item, index) => normalizeInterpretedRequestedItem(item, `line-${index + 1}`))
         : extractRequestedItems(lastInbound);
-      if (!requests.length) return 'Please tell me each item and quantity you want, for example “2 shirts and 1 hat”.';
-      const interpretedMessage = semantic && semantic.confidence >= 0.65 && semantic.items.length
+      if (!requests.length) {
+        return continuingClarification
+          ? `Sorry, I didn't catch which item you meant. ${discoveryReply()}`
+          : discoveryReply();
+      }
+      const interpretedMessage = modelHasItems
         ? requests.map((item) => `${item.quantity} ${item.unit ? `${item.unit} ` : ''}${item.phrase}`).join(' and ')
         : lastInbound;
       const flow = continuingClarification
         ? advanceSalesFlow(existingFlow, interpretedMessage, catalog, lastInboundMsg?.id)
         : beginSalesFlow(requests, catalog, lastInboundMsg?.id);
+
+      // Safety net for the keyword fallback: if nothing resolved and every line
+      // is a dead NOT_FOUND, the text almost certainly wasn't a real product
+      // request (e.g. "I want to place a new order"). Offer the catalogue rather
+      // than telling the customer their own words aren't in it. A NOT_FOUND on
+      // items the model actually extracted is genuine — renderSalesFlow handles
+      // those (asks for the right name).
+      if (!modelHasItems && !continuingClarification &&
+          flow.lines.length > 0 && flow.lines.every((line) => line.status === 'NOT_FOUND')) {
+        return discoveryReply();
+      }
+
       const unresolved = flow.lines.find((line) => line.status !== 'RESOLVED');
       if (unresolved) flow.lastQuestionFingerprint = stateFingerprint(unresolved);
       await saveSalesFlow(conversationId, conversation.metadata, flow);
@@ -1108,7 +1185,7 @@ export const aiService = {
         resolvedCount: flow.lines.filter((line) => line.status === 'RESOLVED').length,
         unresolvedCount: flow.lines.filter((line) => line.status !== 'RESOLVED').length,
         clarificationAttempts: flow.clarificationAttempts,
-        interpretation: semantic ? 'MODEL_STRUCTURED' : 'SAFE_FALLBACK',
+        interpretation: modelHasItems ? 'MODEL_STRUCTURED' : 'SAFE_FALLBACK',
         plannedActions: semantic?.actions,
         interpretationConfidence: semantic?.confidence,
       }, 'AI sales conversation state updated');
@@ -1343,10 +1420,27 @@ export const aiService = {
     }>(raw);
     if (!parsed) return null;
 
-    // The model proposes actions; the server authorizes them. This blocks the
-    // historical failure where "I want to place an order" could create a
-    // support ticket simply because the model was uncertain.
-    if (!intentDecision.permitsTicket && parsed.ticket) {
+    // The model proposes actions; the server authorizes them. The authorization
+    // is a hybrid: the model understands nuance (a complaint phrased in words no
+    // keyword list anticipates), while the policy guarantees a sales/booking
+    // enquiry is never turned into a support ticket.
+    //
+    // A ticket (or handoff) is authorized when EITHER the deterministic policy
+    // saw a complaint / explicit request, OR the model classified a genuine
+    // support intent AND the policy is not positively protecting a sales/booking
+    // intent. This fixes the failure where a real complaint the keyword list
+    // didn't anticipate ("you sent the wrong size", "I've been waiting a week")
+    // had its ticket silently dropped, while still blocking the reverse failure
+    // where "I want to place an order" became a ticket.
+    const modelIntent = (parsed.intent?.primary ?? '').toUpperCase();
+    const MODEL_SUPPORT_INTENTS = new Set(['COMPLAINT', 'EXPLICIT_SUPPORT', 'HUMAN', 'ORDER_STATUS', 'ORDER_CHANGE']);
+    const POLICY_SALES_INTENTS = new Set(['PURCHASE', 'PRODUCT_DISCOVERY', 'CART_OR_CHECKOUT', 'SERVICE_BOOKING', 'PROPERTY_ENQUIRY']);
+    const policyProtectsSales = POLICY_SALES_INTENTS.has(intentDecision.primary);
+    const modelWantsSupport = MODEL_SUPPORT_INTENTS.has(modelIntent);
+    const ticketAuthorized = intentDecision.permitsTicket || (modelWantsSupport && !policyProtectsSales);
+    const handoffAuthorized = intentDecision.permitsHandoff || (modelWantsSupport && !policyProtectsSales);
+
+    if (!ticketAuthorized && parsed.ticket) {
       logger.info({
         conversationId,
         messageId: lastInboundMsg?.id,
@@ -1359,7 +1453,7 @@ export const aiService = {
       delete parsed.ticket;
       if (intentDecision.hasPurchaseIntent) parsed.handoff = false;
     }
-    if (!intentDecision.permitsHandoff && parsed.handoff && intentDecision.primary !== 'AMBIGUOUS') {
+    if (!handoffAuthorized && parsed.handoff && intentDecision.primary !== 'AMBIGUOUS') {
       parsed.handoff = false;
     }
 

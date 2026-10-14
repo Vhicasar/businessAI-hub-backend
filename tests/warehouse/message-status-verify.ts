@@ -206,7 +206,10 @@ async function main() {
     check('Instagram does not', !capabilitiesFor('INSTAGRAM').templates);
     check('Instagram takes no documents', !capabilitiesFor('INSTAGRAM').document);
     check('but Messenger does', capabilitiesFor('FACEBOOK_MESSENGER').document);
-    check('SMS is text only', !capabilitiesFor('SMS').image && capabilitiesFor('SMS').text);
+    // SMS carries pictures as MMS but never documents — the assertion here
+    // used to read "text only", which stopped being true when MMS was added.
+    check('SMS carries text and pictures', capabilitiesFor('SMS').text && capabilitiesFor('SMS').image);
+    check('but not documents', !capabilitiesFor('SMS').document);
     check('a channel that cannot send says so', !capabilitiesFor('VOICE').outbound);
 
     check('a document is refused on Instagram', !supportsContentType('INSTAGRAM', 'DOCUMENT'));
