@@ -115,6 +115,12 @@ export function extractRequestedItems(message: string): RequestedItem[] {
   return segments.map((segment, index) => {
     const tokens = segment.split(/\s+/);
     let quantity = 1;
+    // Natural speech sometimes includes a redundant article before the real
+    // quantity ("a 5 plates of rice"). Do not let that article turn the
+    // remaining quantity/unit text into the catalogue phrase.
+    if (/^(?:a|an)$/i.test(tokens[0] ?? '') && /^\d+(?:\.\d+)?$/.test(tokens[1] ?? '')) {
+      tokens.shift();
+    }
     const quantityToken = normalizeProductText(tokens[0] ?? '');
     if (/^\d+(?:\.\d+)?$/.test(quantityToken)) {
       quantity = Math.max(1, Math.min(9999, Math.floor(Number(quantityToken))));
@@ -134,6 +140,40 @@ export function extractRequestedItems(message: string): RequestedItem[] {
     const phrase = tokens.join(' ').trim();
     return { key: `line-${index + 1}`, phrase, quantity, ...(unit ? { unit } : {}) };
   }).filter((item) => item.phrase.length > 0);
+}
+
+/**
+ * AI providers occasionally repeat the quantity/unit inside `phrase` even
+ * though those values already have dedicated structured fields (for example
+ * `{ phrase: "5 plates of rice", quantity: 5 }`). Product lookup must receive
+ * only "rice". Only accept the deterministic parser's cleanup when its
+ * embedded quantity agrees with the structured quantity; this keeps genuine
+ * numeric product names such as "7 Up" intact.
+ */
+export function normalizeInterpretedRequestedItem(
+  item: Omit<RequestedItem, 'key'>,
+  key: string,
+): RequestedItem {
+  const firstToken = normalizeProductText(item.phrase).split(' ')[0] ?? '';
+  const hasLeadingQuantity = quantityValue(firstToken) !== null;
+  if (!hasLeadingQuantity) return { key, ...item };
+
+  const parsed = extractRequestedItems(item.phrase);
+  if (parsed.length !== 1 || parsed[0]!.quantity !== item.quantity) return { key, ...item };
+  return {
+    key,
+    phrase: parsed[0]!.phrase,
+    quantity: item.quantity,
+    ...(item.unit || parsed[0]!.unit ? { unit: item.unit ?? parsed[0]!.unit } : {}),
+  };
+}
+
+/** Product-focused search phrases for authoritative catalogue retrieval. */
+export function catalogueQueryPhrases(message: string): string[] {
+  const phrases = extractRequestedItems(message)
+    .map((item) => normalizeProductText(item.phrase))
+    .filter(Boolean);
+  return [...new Set(phrases)].slice(0, 20);
 }
 
 function matchScore(phrase: string, item: CatalogItem): number {

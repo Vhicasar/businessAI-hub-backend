@@ -28,7 +28,9 @@ import { classifyCustomerIntent, isGeneralPurchaseRequest } from './customer-int
 import {
   advanceSalesFlow,
   beginSalesFlow,
+  catalogueQueryPhrases,
   extractRequestedItems,
+  normalizeInterpretedRequestedItem,
   normalizeProductText,
   normalizeSalesLines,
   reviseConfirmedSalesFlow,
@@ -301,7 +303,7 @@ function hasDeicticProductReference(message: string): boolean {
 
 /** Active products relevant to the customer's message (for chat suggestions). */
 async function productContext(query: string) {
-  const terms = (query.toLowerCase().match(/[a-z0-9]{3,}/g) ?? []).slice(0, 10);
+  const terms = catalogueQueryPhrases(query);
   const base = {
     deletedAt: null,
     status: 'ACTIVE' as const,
@@ -315,21 +317,27 @@ async function productContext(query: string) {
     variants: variantSelect,
     images: { orderBy: { position: 'asc' as const }, take: 3, select: { fileId: true } },
   };
-  let products = await prisma.product.findMany({
-    where: terms.length ? {
-      ...base,
-      OR: terms.flatMap((t) => [
-        { name: { contains: t, mode: 'insensitive' as const } },
-        { description: { contains: t, mode: 'insensitive' as const } },
-      ]),
-    } : base,
-    take: 8,
-    orderBy: { createdAt: 'desc' },
-    select,
-  });
+  // Resolve each requested line independently. A single global OR query with
+  // `take` allowed common description matches to crowd a valid second product
+  // out of the candidate set (for example rice + milk).
+  const batches = terms.length
+    ? await Promise.all(terms.map((term) => prisma.product.findMany({
+        where: {
+          ...base,
+          OR: [
+            { name: { contains: term, mode: 'insensitive' as const } },
+            { description: { contains: term, mode: 'insensitive' as const } },
+          ],
+        },
+        take: 12,
+        orderBy: { createdAt: 'desc' },
+        select,
+      })))
+    : [await prisma.product.findMany({ where: base, take: 12, orderBy: { createdAt: 'desc' }, select })];
+  let products = [...new Map(batches.flat().map((product) => [product.id, product])).values()];
   // No name match → offer a few active products as general suggestions.
   if (products.length === 0) {
-    products = await prisma.product.findMany({ where: base, take: 6, orderBy: { createdAt: 'desc' }, select });
+    products = await prisma.product.findMany({ where: base, take: 12, orderBy: { createdAt: 'desc' }, select });
   }
   return products.filter((p) => p.variants.length > 0);
 }
@@ -1080,11 +1088,11 @@ export const aiService = {
       }
 
       const requests = semantic && semantic.confidence >= 0.65 && semantic.items.length
-        ? semantic.items.map((item, index) => ({ key: `line-${index + 1}`, ...item }))
+        ? semantic.items.map((item, index) => normalizeInterpretedRequestedItem(item, `line-${index + 1}`))
         : extractRequestedItems(lastInbound);
       if (!requests.length) return 'Please tell me each item and quantity you want, for example “2 shirts and 1 hat”.';
       const interpretedMessage = semantic && semantic.confidence >= 0.65 && semantic.items.length
-        ? semantic.items.map((item) => `${item.quantity} ${item.unit ? `${item.unit} ` : ''}${item.phrase}`).join(' and ')
+        ? requests.map((item) => `${item.quantity} ${item.unit ? `${item.unit} ` : ''}${item.phrase}`).join(' and ')
         : lastInbound;
       const flow = continuingClarification
         ? advanceSalesFlow(existingFlow, interpretedMessage, catalog, lastInboundMsg?.id)

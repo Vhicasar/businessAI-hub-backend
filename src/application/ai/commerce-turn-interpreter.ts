@@ -42,7 +42,9 @@ export async function interpretCommerceTurn(input: {
         'Interpret the latest customer turn for a commerce workflow. Separate profile information ' +
         '(such as a person introducing themselves) from products they want. Resolve pronouns only ' +
         'when the supplied conversation/state supports them. Return requested product phrases in ' +
-        'the customer’s words with quantities. Do not invent catalogue ids, prices, stock, names, ' +
+        'the customer’s words with quantities. The phrase field must contain only the product phrase: ' +
+        'put leading quantities and units such as “5 plates of” exclusively in quantity/unit, never in phrase. ' +
+        'Do not invent catalogue ids, prices, stock, names, ' +
         'or actions. A purchase must be proposed for confirmation, never executed here. Choose the ' +
         'smallest useful action plan. Return JSON only: ' +
         '{"profile"?: {"name"?: string}, "items": [{"phrase": string, "quantity": integer, "unit"?: string}], ' +

@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import {
   advanceSalesFlow,
   beginSalesFlow,
+  catalogueQueryPhrases,
   extractRequestedItems,
   normalizeProductText,
+  normalizeInterpretedRequestedItem,
   normalizeSalesLines,
   reviseConfirmedSalesFlow,
   resolveRequestedItem,
@@ -24,6 +26,27 @@ describe('sales conversation extraction and per-item resolution', () => {
       { key: 'line-1', phrase: 'rice', quantity: 5, unit: 'plate' },
       { key: 'line-2', phrase: 'milk', quantity: 1 },
     ]);
+  });
+
+  it('builds independent catalogue queries without quantity or unit noise', () => {
+    expect(catalogueQueryPhrases('I want a 5 plates of rice and 1 milk')).toEqual(['rice', 'milk']);
+  });
+
+  it('canonicalizes a production AI item that repeats quantity and unit in its phrase', () => {
+    const request = normalizeInterpretedRequestedItem(
+      { phrase: '5 plates of rice', quantity: 5 },
+      'line-1',
+    );
+    expect(request).toEqual({ key: 'line-1', phrase: 'rice', quantity: 5, unit: 'plate' });
+    const flow = beginSalesFlow(request ? [request] : [], [catalog[0]!]);
+    expect(flow.lines[0]).toMatchObject({ status: 'RESOLVED', quantity: 5, resolved: { productId: 'chinese' } });
+  });
+
+  it('does not strip a legitimate numeric product name when it disagrees with quantity', () => {
+    expect(normalizeInterpretedRequestedItem(
+      { phrase: '7 Up', quantity: 2 },
+      'line-1',
+    )).toEqual({ key: 'line-1', phrase: '7 Up', quantity: 2 });
   });
 
   it('supports several products and natural-language quantities', () => {
