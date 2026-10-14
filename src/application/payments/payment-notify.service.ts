@@ -35,9 +35,9 @@ export async function notifyPaymentReceived(intentId: string): Promise<void> {
   const receiptUrl = `${publicPayUrl(intent.token)}/receipt`;
   const what = intent.description ? ` for ${intent.description}` : '';
 
-  const text =
-    `Payment confirmed — ${amount}${what}.\n` +
-    `Receipt ${receiptNumber}: ${receiptUrl}\n— ${businessName}`;
+  const text = settings.autoReceipts
+    ? `Payment confirmed — ${amount}${what}.\nReceipt ${receiptNumber}: ${receiptUrl}\n— ${businessName}`
+    : `Payment confirmed — ${amount}${what}.\n— ${businessName}`;
 
   // The messaging layer is tenant-scoped and this runs from a webhook with no
   // request context, so a context is established for the send.
@@ -57,7 +57,9 @@ export async function notifyPaymentReceived(intentId: string): Promise<void> {
           for (const channel of enabled) {
             await messagingService
               .sendToCustomer(intent.customerId!, channel, text, {
-                subject: `Receipt ${receiptNumber} — ${businessName}`,
+                subject: settings.autoReceipts
+                  ? `Receipt ${receiptNumber} — ${businessName}`
+                  : `Payment confirmed — ${businessName}`,
               })
               .catch((err) =>
                 logger.warn(
@@ -86,7 +88,11 @@ export async function notifyPaymentReceived(intentId: string): Promise<void> {
         title: 'Payment successful',
         body: `${amount} to ${businessName}`,
         deeplink: `vhicasar://payments/${intent.reference}`,
-        data: { paymentIntentId: intent.id, reference: intent.reference, receiptNumber },
+        data: {
+          paymentIntentId: intent.id,
+          reference: intent.reference,
+          ...(settings.autoReceipts ? { receiptNumber } : {}),
+        },
       }).catch((err) =>
         logger.warn({ err: (err as Error).message, intentId }, 'payment push failed')
       );

@@ -36,6 +36,13 @@ export type SalesFlowState = {
   orderNumber?: string;
 };
 
+export type ContextualSalesResolution = {
+  handled: boolean;
+  flow?: SalesFlowState;
+  response?: string;
+  needsPreviousOrder?: boolean;
+};
+
 const NUMBER_WORDS: Record<string, number> = {
   a: 1, an: 1, one: 1, two: 2, three: 3, four: 4, five: 5,
   six: 6, seven: 7, eight: 8, nine: 9, ten: 10, dozen: 12,
@@ -85,10 +92,20 @@ function stripConversationWrapper(value: string): string {
     .trim();
 }
 
+/** Remove customer-profile clauses before product segmentation. This is a
+ * resilience fallback when semantic interpretation is unavailable; profile
+ * data must never become a catalogue query. */
+function stripProfileClauses(value: string): string {
+  return value
+    .replace(/^\s*(?:my name is|i am|i'm|this is)\s+[\p{L}][\p{L}'-]*(?:\s+[\p{L}][\p{L}'-]*)?\s*(?:,|;|\band\b)?\s*/iu, '')
+    .replace(/^\s*(?:you can call me|call me)\s+[\p{L}][\p{L}'-]*\s*(?:,|;|\band\b)?\s*/iu, '')
+    .trim();
+}
+
 /** Parse line items before any catalogue lookup. This prevents multiple items
  * from being mistaken for multiple candidates for one global search. */
 export function extractRequestedItems(message: string): RequestedItem[] {
-  const cleaned = stripConversationWrapper(message);
+  const cleaned = stripConversationWrapper(stripProfileClauses(message));
   if (!cleaned) return [];
   const segments = cleaned
     .split(/\s*(?:,|;|\band\b|\bplus\b|\bthen\b)\s*/i)
@@ -204,6 +221,38 @@ export function resolveRequestedItems(requests: RequestedItem[], catalog: Catalo
   return requests.map((request) => resolveRequestedItem(request, catalog));
 }
 
+/**
+ * One purchasable variant is one cart line. Context merges and model retries
+ * can re-introduce an already-resolved item; retaining both makes final
+ * validation compare duplicate proposal rows with one database variant. Keep
+ * the latest intended representation and the greatest stated quantity rather
+ * than silently doubling the customer's order.
+ */
+export function normalizeSalesLines(lines: SalesLine[]): SalesLine[] {
+  const output: SalesLine[] = [];
+  const resolvedByVariant = new Map<string, number>();
+  for (const line of lines) {
+    const variantId = line.status === 'RESOLVED' ? line.resolved?.variantId : undefined;
+    if (!variantId) {
+      output.push(line);
+      continue;
+    }
+    const existingIndex = resolvedByVariant.get(variantId);
+    if (existingIndex === undefined) {
+      resolvedByVariant.set(variantId, output.length);
+      output.push(line);
+      continue;
+    }
+    const existing = output[existingIndex]!;
+    output[existingIndex] = {
+      ...line,
+      key: existing.key,
+      quantity: Math.max(existing.quantity, line.quantity),
+    };
+  }
+  return output;
+}
+
 export function beginSalesFlow(
   requests: RequestedItem[], catalog: CatalogItem[], sourceMessageId?: string,
 ): SalesFlowState {
@@ -212,6 +261,7 @@ export function beginSalesFlow(
 }
 
 function finalizeState(lines: SalesLine[], attempts: number, sourceMessageId?: string): SalesFlowState {
+  lines = normalizeSalesLines(lines);
   const unresolved = lines.find((line) => line.status !== 'RESOLVED');
   return {
     version: 1,
@@ -316,6 +366,62 @@ export function reviseConfirmedSalesFlow(
     return finalizeState(merged, state.clarificationAttempts, sourceMessageId);
   }
   return null;
+}
+
+/** Resolve action/reference language before entity extraction or catalogue
+ * search. This is the shared channel-independent boundary that prevents words
+ * such as "place another one" from becoming a product-name query. */
+export function resolveContextualSalesReference(
+  state: SalesFlowState | null,
+  message: string,
+  catalog: CatalogItem[],
+  sourceMessageId?: string,
+): ContextualSalesResolution {
+  const value = normalizeProductText(message);
+  const previousOrder = /\b(same|repeat|reorder)\b.*\b(order|purchase)\b|\bwhat i (bought|ordered)\b|\border\b.*\b(last time|yesterday|again)\b/.test(value);
+  if (previousOrder) return { handled: true, needsPreviousOrder: true };
+
+  const option = value.match(/\b(first|second|third)\s+(?:one|option|item)\b/);
+  if (option && state?.status === 'AWAITING_CLARIFICATION') {
+    const number = { first: 1, second: 2, third: 3 }[option[1] as 'first' | 'second' | 'third'];
+    return { handled: true, flow: advanceSalesFlow(state, String(number), catalog, sourceMessageId) };
+  }
+
+  const quantityChange = value.match(/\bmake (?:that|it)\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b/);
+  if (quantityChange && state?.status === 'AWAITING_CONFIRMATION') {
+    if (state.lines.length !== 1) {
+      return { handled: true, response: `Which item should be changed to ${quantityChange[1]}? ${state.lines.map((line) => line.resolved?.name).filter(Boolean).join(', ')}.` };
+    }
+    const revised = reviseConfirmedSalesFlow(state, `make that ${quantityChange[1]}`, catalog, sourceMessageId);
+    return revised ? { handled: true, flow: revised } : { handled: true, response: 'I could not safely apply that quantity. Which item and quantity do you mean?' };
+  }
+
+  const contextualRepeat = /\b(another|same thing|same one|that one|it)\b/.test(value)
+    && /\b(place|order|want|give|get|add|take|have)\b/.test(value);
+  if (!contextualRepeat) return { handled: false };
+  if (!state || state.status === 'CANCELLED') {
+    return { handled: true, response: "Of course! Would you like to reorder something you've bought before, or choose a new product?" };
+  }
+  if (state.status === 'COMPLETED') {
+    const requests = state.lines.map((line, index) => ({
+      key: `line-${index + 1}`, phrase: line.resolved?.name ?? line.phrase, quantity: line.quantity, unit: line.unit,
+    }));
+    return { handled: true, flow: beginSalesFlow(requests, catalog, sourceMessageId) };
+  }
+  if (state.status === 'AWAITING_CLARIFICATION') {
+    return { handled: true, response: `Which option do you mean for ${state.lines.find((line) => line.status !== 'RESOLVED')?.phrase ?? 'that item'}? Please reply with its number or full name.` };
+  }
+  if (state.status === 'AWAITING_CONFIRMATION') {
+    if (state.lines.length !== 1) {
+      return { handled: true, response: `Which item do you want another of: ${state.lines.map((line) => line.resolved?.name).filter(Boolean).join(', ')}?` };
+    }
+    const line = state.lines[0]!;
+    const amountMatch = value.match(/\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+more\b/);
+    const extra = amountMatch ? quantityValue(amountMatch[1]!) ?? 1 : 1;
+    const next = resolveRequestedItem({ ...line, quantity: line.quantity + extra }, catalog);
+    return { handled: true, flow: finalizeState([next], state.clarificationAttempts, sourceMessageId) };
+  }
+  return { handled: true, response: 'That purchase is currently being processed. I will not create a duplicate.' };
 }
 
 export function stateFingerprint(line: SalesLine): string {

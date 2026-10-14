@@ -4,8 +4,10 @@ import {
   beginSalesFlow,
   extractRequestedItems,
   normalizeProductText,
+  normalizeSalesLines,
   reviseConfirmedSalesFlow,
   resolveRequestedItem,
+  resolveContextualSalesReference,
   type CatalogItem,
 } from '../../src/application/ai/sales-conversation';
 
@@ -169,5 +171,78 @@ describe('sales conversation extraction and per-item resolution', () => {
     const initial = beginSalesFlow(extractRequestedItems('2 Chinese Rice and 1 Milk'), catalog);
     const revised = reviseConfirmedSalesFlow(initial, 'Add another 2 milk to my order', catalog)!;
     expect(revised.lines.find((line) => line.resolved?.productId === 'milk')?.quantity).toBe(3);
+  });
+
+  describe('contextual action resolution before catalogue search', () => {
+    it('interprets "place another one" from the active single-line proposal', () => {
+      const initial = beginSalesFlow(extractRequestedItems('1 Chinese Rice'), catalog);
+      const result = resolveContextualSalesReference(initial, 'I want to place another one', catalog, 'next');
+      expect(result.handled).toBe(true);
+      expect(result.flow?.lines[0]?.resolved?.productId).toBe('chinese');
+      expect(result.flow?.lines[0]?.quantity).toBe(2);
+    });
+
+    it('does not send "place another one" to product matching without context', () => {
+      const result = resolveContextualSalesReference(null, 'I want to place another one', catalog);
+      expect(result.handled).toBe(true);
+      expect(result.flow).toBeUndefined();
+      expect(result.response).toMatch(/reorder something.*choose a new product/i);
+    });
+
+    it('asks which item when "another one" could refer to several lines', () => {
+      const initial = beginSalesFlow(extractRequestedItems('1 Chinese Rice and 1 Milk'), catalog);
+      const result = resolveContextualSalesReference(initial, 'Add another one', catalog);
+      expect(result.response).toMatch(/which item/i);
+    });
+
+    it('updates "make it five" without interpreting five as a product', () => {
+      const initial = beginSalesFlow(extractRequestedItems('1 Chinese Rice'), catalog);
+      const result = resolveContextualSalesReference(initial, 'Make it five instead', catalog);
+      expect(result.flow?.lines[0]?.quantity).toBe(5);
+    });
+
+    it('selects the second option from the recorded clarification', () => {
+      const initial = beginSalesFlow(extractRequestedItems('1 rice'), catalog);
+      const result = resolveContextualSalesReference(initial, "I'll take the second one", catalog);
+      expect(result.flow?.lines[0]?.resolved?.productId).toBe('jollof');
+    });
+
+    it('marks explicit previous-order language for authorized history retrieval', () => {
+      const result = resolveContextualSalesReference(null, 'Give me the same order as last time', catalog);
+      expect(result.needsPreviousOrder).toBe(true);
+    });
+  });
+
+  describe('profile information is not treated as a product', () => {
+    it('separates an introduction from a purchase in the regression conversation', () => {
+      const requests = extractRequestedItems('I am Victor, i want 4 milk');
+      expect(requests).toEqual([{ key: 'line-1', phrase: 'milk', quantity: 4 }]);
+      const flow = beginSalesFlow(requests, catalog);
+      expect(flow.status).toBe('AWAITING_CONFIRMATION');
+      expect(flow.lines).toHaveLength(1);
+      expect(flow.lines[0]).toMatchObject({ quantity: 4, status: 'RESOLVED', resolved: { productId: 'milk' } });
+    });
+
+    it.each([
+      ['My name is Ada and I need 2 milk', 2],
+      ["I'm Chidi; give me three milk", 3],
+      ['You can call me Ayo, I would like 1 milk', 1],
+    ])('handles naturally varied introduction: %s', (message, quantity) => {
+      expect(extractRequestedItems(message)).toEqual([{ key: 'line-1', phrase: 'milk', quantity }]);
+    });
+  });
+
+  it('collapses duplicate persisted variants without doubling the confirmed quantity', () => {
+    const line = resolveRequestedItem({ key: 'line-1', phrase: 'milk', quantity: 4 }, catalog);
+    const duplicate = { ...line, key: 'line-2' };
+    const normalized = normalizeSalesLines([line, duplicate]);
+    expect(normalized).toHaveLength(1);
+    expect(normalized[0]).toMatchObject({ quantity: 4, resolved: { productId: 'milk' } });
+  });
+
+  it('keeps the greatest explicitly stated quantity when repairing duplicate variants', () => {
+    const lower = resolveRequestedItem({ key: 'line-1', phrase: 'milk', quantity: 2 }, catalog);
+    const corrected = resolveRequestedItem({ key: 'line-2', phrase: 'milk', quantity: 4 }, catalog);
+    expect(normalizeSalesLines([lower, corrected])[0]?.quantity).toBe(4);
   });
 });

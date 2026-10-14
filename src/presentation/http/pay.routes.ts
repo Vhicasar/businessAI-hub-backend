@@ -8,6 +8,10 @@ import {
 } from '../../application/payments/payment-public.service';
 import { validate } from './middleware/validate';
 import { NotFoundError } from '../../shared/errors';
+import { prismaUnscoped } from '../../infrastructure/database/prisma';
+import { requestContext } from '../../shared/context';
+import { buildInvoiceDocument } from '../../application/invoices/invoice-document.service';
+import { randomUUID } from 'node:crypto';
 
 /**
  * Public payment-link API for the /pay/<token> page. No auth — possession of
@@ -94,5 +98,25 @@ payRoutes.get(
       if (!(error instanceof NotFoundError)) throw error;
       res.json({ success: true, data: await paymentLinksService.receipt(token) });
     }
+  }),
+);
+
+/** Token-authorized invoice PDF. The token is tied to the invoice and tenant. */
+payRoutes.get(
+  '/:token/invoice',
+  wrap(async (req, res) => {
+    const intent = await prismaUnscoped.paymentIntent.findUnique({
+      where: { token: req.params.token as string },
+      select: { invoiceId: true, organizationId: true },
+    });
+    if (!intent?.invoiceId) throw new NotFoundError('Invoice');
+    const doc = await requestContext.run(
+      { requestId: randomUUID(), organizationId: intent.organizationId },
+      () => buildInvoiceDocument(intent.invoiceId!),
+    );
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${doc.filename}"`);
+    res.setHeader('Content-Length', String(doc.pdf.length));
+    res.end(doc.pdf);
   }),
 );

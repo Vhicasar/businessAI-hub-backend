@@ -304,12 +304,39 @@
       var el = document.createElement('div');
       // INBOUND = visitor's own message (they are the "customer" side)
       el.className = 'bhw-m ' + (m.direction === 'INBOUND' ? 'in' : 'out');
-      el.textContent = m.body || '';
+      appendSafeLinks(el, m.body || '');
       msgsEl.appendChild(el);
       lastSeen = m.createdAt;
       if (!open && m.direction !== 'INBOUND') setUnread(unread + 1);
     });
     if (messages.length) msgsEl.scrollTop = msgsEl.scrollHeight;
+  }
+
+  // Render only text plus http(s) anchors. No AI-produced HTML is trusted.
+  function appendSafeLinks(parent, text) {
+    var re = /(\[[^\]\n]+\]\(https?:\/\/[^\s)]+\)|https?:\/\/[^\s]+)/g;
+    var cursor = 0, match;
+    while ((match = re.exec(text)) !== null) {
+      if (match.index > cursor) parent.appendChild(document.createTextNode(text.slice(cursor, match.index)));
+      var raw = match[0];
+      var md = raw.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
+      var href = md ? md[2] : raw;
+      try {
+        var parsed = new URL(href);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('unsafe');
+        var link = document.createElement('a');
+        link.className = 'bhw-link';
+        link.href = parsed.toString();
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.textContent = md ? md[1] : raw;
+        parent.appendChild(link);
+      } catch (_) {
+        parent.appendChild(document.createTextNode(raw));
+      }
+      cursor = match.index + raw.length;
+    }
+    if (cursor < text.length) parent.appendChild(document.createTextNode(text.slice(cursor)));
   }
 
   function showGreeting() {

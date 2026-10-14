@@ -25,6 +25,7 @@ import { markChannelConnected, markChannelError, markOutboundMessageSent } from 
 import { workflowService } from '../crm/workflow.service';
 import { messageContextResolver, type ResolvedMessageContext } from './message-context-resolver.service';
 import { filesService } from '../files/files.service';
+import { formatOutboundTextForChannel } from './outbound-text-format';
 
 export const listConversationsSchema = z.object({
   status: z.enum(['OPEN', 'PENDING', 'RESOLVED', 'SNOOZED', 'SPAM']).optional(),
@@ -680,9 +681,10 @@ export const inboxService = {
 
     const safeMediaUrls = (mediaUrls ?? []).filter((url) => /^https?:\/\//i.test(url)).slice(0, 3);
     const needsLinkFallback = ['WEB_CHAT', 'EMAIL'].includes(conversation.channelAccount.channelType);
+    const channelText = formatOutboundTextForChannel(text, conversation.channelAccount.channelType);
     const deliveredText = safeMediaUrls.length && needsLinkFallback
-      ? `${text}\n\nSample images:\n${safeMediaUrls.join('\n')}`
-      : text;
+      ? `${channelText}\n\nSample images:\n${safeMediaUrls.join('\n')}`
+      : channelText;
     const message = await prisma.message.create({
       data: {
         organizationId: conversation.organizationId,
@@ -1006,8 +1008,26 @@ export const inboxService = {
 
     const { createIntentForResource } = await import('../payments/payment-request.service');
     const { publicPayUrl } = await import('../payments/payment-intent.service');
+    const { createAiInvoicePaymentRequest, createAiOrderPaymentRequest, formatAiPaymentRequest } =
+      await import('../payments/ai-payment-request.service');
 
-    const intent = await createIntentForResource({
+    const documented = input.resourceId && input.resourceType === 'ORDER'
+      ? await createAiOrderPaymentRequest({
+          organizationId: conversation.organizationId,
+          customerId: conversation.customerId,
+          orderId: input.resourceId,
+          enforceAiSetting: false,
+        })
+      : input.resourceId && input.resourceType === 'INVOICE'
+        ? await createAiInvoicePaymentRequest({
+            organizationId: conversation.organizationId,
+            customerId: conversation.customerId,
+            invoiceId: input.resourceId,
+            enforceAiSetting: false,
+          })
+        : null;
+
+    const intent = documented ? null : await createIntentForResource({
       organizationId: conversation.organizationId,
       resourceType: input.resourceType,
       resourceId: input.resourceId,
@@ -1018,11 +1038,13 @@ export const inboxService = {
       createdById: membershipId,
     });
 
-    const payUrl = publicPayUrl(intent.token!);
-    const amount = `${intent.currency} ${Number(intent.amount).toLocaleString()}`;
-    const text =
-      `Payment request${intent.description ? ` — ${intent.description}` : ''}\n` +
-      `${amount}\n${payUrl}\nReference ${intent.reference}`;
+    const payUrl = documented?.payUrl ?? publicPayUrl(intent!.token!);
+    const amountValue = documented?.amount ?? Number(intent!.amount);
+    const currency = documented?.currency ?? intent!.currency;
+    const text = documented
+      ? formatAiPaymentRequest(documented).trim()
+      : `Payment request${intent!.description ? ` — ${intent!.description}` : ''}\n` +
+        `${currency} ${amountValue.toLocaleString()}\n${payUrl}\nReference ${intent!.reference}`;
 
     // Best-effort: the request exists whether or not the channel accepts the
     // message, and an agent can always copy the link out of the response.
@@ -1038,13 +1060,16 @@ export const inboxService = {
     }
 
     return {
-      reference: intent.reference,
-      amount: Number(intent.amount),
-      currency: intent.currency,
-      description: intent.description,
-      status: intent.status,
-      expiresAt: intent.expiresAt,
+      reference: documented?.reference ?? intent!.reference,
+      amount: amountValue,
+      currency,
+      description: intent?.description ?? `Invoice ${documented?.invoiceNumber}`,
+      status: intent?.status ?? 'AWAITING_PAYMENT',
+      expiresAt: intent?.expiresAt ?? null,
       payUrl,
+      invoiceId: documented?.invoiceId ?? null,
+      invoiceNumber: documented?.invoiceNumber ?? null,
+      invoiceUrl: documented?.invoiceUrl ?? null,
       delivered,
     };
   },
