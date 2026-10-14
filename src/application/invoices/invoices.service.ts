@@ -10,8 +10,18 @@ import { paymentLinksService } from '../payments/payment-links.service';
 import { logger } from '../../shared/logger';
 import { env } from '../../shared/config/env';
 import { exchangeRates } from '../../shared/exchange-rates';
+import { settingsService } from '../settings/settings.service';
 
 const payUrl = (token: string) => `${env.WEB_APP_URL.replace(/\/+$/, '')}/pay/${token}`;
+
+const BUILTIN_INVOICE_DEFAULTS: Record<string, { dueInDays: number; notes?: string }> = {
+  classic: { dueInDays: 14 },
+  minimal: { dueInDays: 14 },
+  modern: { dueInDays: 7 },
+  corporate: { dueInDays: 30, notes: 'Please reference the invoice number with your payment.' },
+  elegant: { dueInDays: 14 },
+  sunset: { dueInDays: 7 },
+};
 
 /** Mirror an invoice event onto the CRM timeline (invoice + its customer). */
 async function recordInvoiceActivity(
@@ -316,11 +326,14 @@ export const invoicesService = {
     return result;
   },
 
-  async createFromOrder(orderId: string, dueInDays = 14) {
-    const order = await prisma.order.findFirst({
-      where: { id: orderId },
-      include: { items: true, invoices: { where: { deletedAt: null, status: { not: 'VOID' } } } },
-    });
+  async createFromOrder(orderId: string, dueInDays?: number) {
+    const [order, invoiceSettings] = await Promise.all([
+      prisma.order.findFirst({
+        where: { id: orderId },
+        include: { items: true, invoices: { where: { deletedAt: null, status: { not: 'VOID' } } } },
+      }),
+      settingsService.getInvoiceSettings(),
+    ]);
     if (!order) throw new NotFoundError('Order');
     if (order.status === 'CANCELLED') throw new ConflictError('Order is cancelled');
     if (order.invoices.length > 0) {
@@ -330,6 +343,10 @@ export const invoicesService = {
     }
 
     const alreadyPaid = order.paymentStatus === 'PAID';
+    const customTemplate = invoiceSettings.customTemplates.find((item) => item.id === invoiceSettings.defaultTemplateId);
+    const builtInDefaults = BUILTIN_INVOICE_DEFAULTS[invoiceSettings.defaultTemplateId] ?? BUILTIN_INVOICE_DEFAULTS.classic!;
+    const configuredDueInDays = dueInDays ?? customTemplate?.defaultDueInDays ?? builtInDefaults.dueInDays;
+    const configuredNotes = customTemplate?.defaultNotes ?? builtInDefaults.notes ?? null;
 
     const inv = await prisma.$transaction(async (tx) => {
       const invoice = await tx.invoice.create({
@@ -346,7 +363,8 @@ export const invoicesService = {
           total: order.total,
           amountPaid: alreadyPaid ? order.total : 0,
           issuedAt: new Date(),
-          dueAt: new Date(Date.now() + dueInDays * 24 * 60 * 60 * 1000),
+          dueAt: new Date(Date.now() + configuredDueInDays * 24 * 60 * 60 * 1000),
+          notes: configuredNotes,
           paidAt: alreadyPaid ? new Date() : null,
           items: {
             create: order.items.map((i) => ({

@@ -1,4 +1,5 @@
 import PDFDocument from 'pdfkit';
+import QRCode from 'qrcode';
 import { prisma } from '../../infrastructure/database/prisma';
 import { NotFoundError } from '../../shared/errors';
 import { settingsService } from '../settings/settings.service';
@@ -30,6 +31,22 @@ interface BusinessDetails {
   taxId?: string;
   footer?: string;
 }
+
+interface InvoiceTemplateStyle {
+  accent: string;
+  headerStyle: 'plain' | 'band';
+  font: 'sans' | 'serif';
+  defaultFooter?: string;
+}
+
+const BUILTIN_TEMPLATES: Record<string, InvoiceTemplateStyle> = {
+  classic: { accent: '#5b3df5', headerStyle: 'plain', font: 'sans', defaultFooter: 'Thank you for your business.' },
+  minimal: { accent: '#111827', headerStyle: 'plain', font: 'sans', defaultFooter: 'Payment due within terms. Thank you.' },
+  modern: { accent: '#0d9488', headerStyle: 'band', font: 'sans', defaultFooter: 'We appreciate your prompt payment.' },
+  corporate: { accent: '#1e3a8a', headerStyle: 'band', font: 'serif', defaultFooter: 'Registered business. All amounts in the stated currency.' },
+  elegant: { accent: '#b91c1c', headerStyle: 'plain', font: 'serif', defaultFooter: 'It was a pleasure working with you.' },
+  sunset: { accent: '#ea580c', headerStyle: 'band', font: 'sans', defaultFooter: 'Thanks for shopping with us!' },
+};
 
 const money = (currency: string, value: number): string =>
   `${currency} ${amount(value)}`;
@@ -67,13 +84,19 @@ async function loadInvoice(invoiceId: string) {
   return invoice;
 }
 
-async function businessDetails(): Promise<BusinessDetails> {
+async function invoicePresentation(): Promise<{ business: BusinessDetails; template: InvoiceTemplateStyle }> {
   try {
     const settings = await settingsService.getInvoiceSettings();
-    return (settings?.business ?? {}) as BusinessDetails;
+    const custom = settings.customTemplates.find((item) => item.id === settings.defaultTemplateId);
+    const template = custom
+      ? { accent: custom.accent.startsWith('#') ? custom.accent : `#${custom.accent}`, headerStyle: custom.headerStyle, font: custom.font, defaultFooter: custom.defaultFooter }
+      : BUILTIN_TEMPLATES[settings.defaultTemplateId] ?? BUILTIN_TEMPLATES.classic!;
+    const business = { ...(settings?.business ?? {}) } as BusinessDetails;
+    if (!business.footer && template.defaultFooter) business.footer = template.defaultFooter;
+    return { business, template };
   } catch {
     // A missing settings row must not stop an invoice going out.
-    return {};
+    return { business: {}, template: BUILTIN_TEMPLATES.classic! };
   }
 }
 
@@ -83,7 +106,7 @@ export async function buildInvoiceDocument(
   opts: { payUrl?: string | null } = {},
 ): Promise<InvoiceDocument> {
   const invoice = await loadInvoice(invoiceId);
-  const business = await businessDetails();
+  const { business, template } = await invoicePresentation();
 
   const currency = invoice.currency;
   const total = Number(invoice.total);
@@ -102,9 +125,9 @@ export async function buildInvoiceDocument(
   return {
     number: invoice.number,
     subject: `Invoice ${invoice.number} from ${businessName} — ${money(currency, total)}`,
-    html: renderHtml({ invoice, business, rows, currency, total, paid, outstanding, customerName, businessName, payUrl: opts.payUrl ?? null }),
-    text: renderText({ invoice, business, rows, currency, total, paid, outstanding, customerName, businessName, payUrl: opts.payUrl ?? null }),
-    pdf: await renderPdf({ invoice, business, rows, currency, total, paid, outstanding, customerName, businessName }),
+    html: renderHtml({ invoice, business, template, rows, currency, total, paid, outstanding, customerName, businessName, payUrl: opts.payUrl ?? null }),
+    text: renderText({ invoice, business, template, rows, currency, total, paid, outstanding, customerName, businessName, payUrl: opts.payUrl ?? null }),
+    pdf: await renderPdf({ invoice, business, template, rows, currency, total, paid, outstanding, customerName, businessName, payUrl: opts.payUrl ?? null }),
     // Spaces and slashes in an invoice number would make an awkward filename.
     filename: `Invoice-${invoice.number.replace(/[^\w.-]+/g, '-')}.pdf`,
   };
@@ -113,6 +136,7 @@ export async function buildInvoiceDocument(
 type RenderInput = {
   invoice: Awaited<ReturnType<typeof loadInvoice>>;
   business: BusinessDetails;
+  template: InvoiceTemplateStyle;
   rows: { description: string; quantity: number; unitPrice: number; total: number }[];
   currency: string;
   total: number;
@@ -124,7 +148,7 @@ type RenderInput = {
 };
 
 function renderHtml(input: RenderInput): string {
-  const { invoice, business, rows, currency, total, paid, outstanding, customerName, businessName, payUrl } = input;
+  const { invoice, business, template, rows, currency, total, paid, outstanding, customerName, businessName, payUrl } = input;
 
   const itemRows = rows
     .map(
@@ -184,7 +208,7 @@ function renderHtml(input: RenderInput): string {
       </tfoot>
     </table>
 
-    ${payUrl ? `<p style="margin:24px 0"><a href="${escapeHtml(payUrl)}" style="background:#F97316;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;display:inline-block">Pay this invoice</a></p>` : ''}
+    ${payUrl ? `<p style="margin:24px 0"><a href="${escapeHtml(payUrl)}" style="background:${template.accent};color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;display:inline-block">Pay this invoice</a></p>` : ''}
     ${invoice.notes ? `<p style="margin-top:20px;color:#555;white-space:pre-line">${escapeHtml(invoice.notes)}</p>` : ''}
     ${business.footer ? `<p style="margin-top:24px;color:#777;font-size:12px;white-space:pre-line">${escapeHtml(business.footer)}</p>` : ''}
   </div>`;
@@ -224,8 +248,11 @@ function renderText(input: RenderInput): string {
  * fixed layout, and shipping Chromium to render it would dominate both the
  * image size and the time to send.
  */
-function renderPdf(input: RenderInput): Promise<Buffer> {
-  const { invoice, business, rows, currency, total, paid, outstanding, customerName, businessName } = input;
+async function renderPdf(input: RenderInput): Promise<Buffer> {
+  const { invoice, business, template, rows, currency, total, paid, outstanding, customerName, businessName, payUrl } = input;
+  const qr = payUrl && outstanding > 0.005
+    ? await QRCode.toBuffer(payUrl, { type: 'png', margin: 1, width: 180 })
+    : null;
 
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: 'A4', margin: 50 });
@@ -273,11 +300,17 @@ function renderPdf(input: RenderInput): Promise<Buffer> {
     const line = (y: number) => doc.moveTo(LEFT, y).lineTo(RIGHT, y).strokeColor('#dddddd').stroke();
 
     // ---------------------------------------------------------------- header
-    doc.font('Helvetica-Bold').fontSize(18).fillColor('#111')
+    const regularFont = template.font === 'serif' ? 'Times-Roman' : 'Helvetica';
+    const boldFont = template.font === 'serif' ? 'Times-Bold' : 'Helvetica-Bold';
+    if (template.headerStyle === 'band') {
+      doc.rect(0, 0, 595.28, 132).fill(template.accent);
+    }
+    const headerColor = template.headerStyle === 'band' ? '#ffffff' : '#111111';
+    doc.font(boldFont).fontSize(18).fillColor(headerColor)
       .text(businessName, LEFT, 50, { width: 300, lineBreak: false });
 
     let leftY = 74;
-    doc.font('Helvetica').fontSize(9).fillColor('#555');
+    doc.font(regularFont).fontSize(9).fillColor(template.headerStyle === 'band' ? '#eeeeee' : '#555555');
     for (const detail of [
       business.addressLines,
       business.email,
@@ -289,9 +322,9 @@ function renderPdf(input: RenderInput): Promise<Buffer> {
       leftY = doc.y;
     }
 
-    doc.font('Helvetica-Bold').fontSize(22).fillColor('#111');
+    doc.font(boldFont).fontSize(22).fillColor(headerColor);
     cell('INVOICE', RIGHT, 50, 200);
-    doc.font('Helvetica').fontSize(10).fillColor('#555');
+    doc.font(regularFont).fontSize(10).fillColor(template.headerStyle === 'band' ? '#eeeeee' : '#555555');
     cell(invoice.number, RIGHT, 78, 200);
     cell(`Issued: ${day(invoice.issuedAt ?? invoice.createdAt)}`, RIGHT, 92, 200);
     cell(`Due: ${day(invoice.dueAt)}`, RIGHT, 106, 200);
@@ -301,23 +334,23 @@ function renderPdf(input: RenderInput): Promise<Buffer> {
     y += 14;
 
     // --------------------------------------------------------------- bill to
-    doc.font('Helvetica').fontSize(9).fillColor('#555').text('BILL TO', LEFT, y);
+    doc.font(regularFont).fontSize(9).fillColor('#555').text('BILL TO', LEFT, y);
     y += 13;
-    doc.font('Helvetica-Bold').fontSize(11).fillColor('#111').text(customerName, LEFT, y, { width: 300 });
+    doc.font(boldFont).fontSize(11).fillColor('#111').text(customerName, LEFT, y, { width: 300 });
     y += 15;
     if (invoice.customer.email) {
-      doc.font('Helvetica').fontSize(9).fillColor('#555').text(invoice.customer.email, LEFT, y, { width: 300 });
+      doc.font(regularFont).fontSize(9).fillColor('#555').text(invoice.customer.email, LEFT, y, { width: 300 });
       y += 13;
     }
 
     // The currency is stated once here instead of on every row — repeating it
     // is what made the columns overflow.
-    doc.font('Helvetica').fontSize(9).fillColor('#555');
+    doc.font(regularFont).fontSize(9).fillColor('#555');
     cell(`All amounts in ${currency}`, RIGHT, y - 13, 200);
     y += 14;
 
     // --------------------------------------------------------------- columns
-    doc.font('Helvetica-Bold').fontSize(9).fillColor('#111');
+    doc.font(boldFont).fontSize(9).fillColor(template.accent);
     doc.text('DESCRIPTION', COL.descX, y, { width: COL.descW, lineBreak: false });
     cell('QTY', COL.qtyRight, y, 60);
     cell('UNIT', COL.unitRight, y, cellW);
@@ -327,7 +360,7 @@ function renderPdf(input: RenderInput): Promise<Buffer> {
     y += 8;
 
     // ----------------------------------------------------------------- items
-    doc.font('Helvetica').fontSize(10).fillColor('#111');
+    doc.font(regularFont).fontSize(10).fillColor('#111');
     if (rows.length === 0) {
       doc.fillColor('#777').text('No line items', COL.descX, y, { width: COL.descW });
       y += 18;
@@ -353,7 +386,7 @@ function renderPdf(input: RenderInput): Promise<Buffer> {
     // ---------------------------------------------------------------- totals
     const totalLine = (label: string, value: string, bold = false) => {
       if (y > 740) { doc.addPage(); y = 50; }
-      doc.font(bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(bold ? 12 : 10).fillColor('#111');
+      doc.font(bold ? boldFont : regularFont).fontSize(bold ? 12 : 10).fillColor(bold ? template.accent : '#111');
       cell(label, COL.unitRight, y, 160);
       cell(value, COL.amountRight, y);
       y += bold ? 20 : 16;
@@ -367,14 +400,25 @@ function renderPdf(input: RenderInput): Promise<Buffer> {
       totalLine('Amount due', amount(outstanding), true);
     }
 
+    if (qr && payUrl) {
+      y += 8;
+      if (y > 650) { doc.addPage(); y = 50; }
+      doc.image(qr, LEFT, y, { width: 104, height: 104 });
+      doc.font(boldFont).fontSize(11).fillColor(template.accent).text('SCAN TO PAY', LEFT + 122, y + 16);
+      doc.font(regularFont).fontSize(9).fillColor('#555')
+        .text(`Scan this code to pay ${money(currency, outstanding)} securely.`, LEFT + 122, y + 38, { width: 300 });
+      doc.font(regularFont).fontSize(7).fillColor('#777').text(payUrl, LEFT + 122, y + 66, { width: 340 });
+      y += 116;
+    }
+
     if (invoice.notes) {
       y += 10;
       if (y > 740) { doc.addPage(); y = 50; }
-      doc.font('Helvetica').fontSize(9).fillColor('#555')
+      doc.font(regularFont).fontSize(9).fillColor('#555')
         .text(invoice.notes, LEFT, y, { width: RIGHT - LEFT });
     }
     if (business.footer) {
-      doc.font('Helvetica').fontSize(8).fillColor('#777')
+      doc.font(regularFont).fontSize(8).fillColor('#777')
         .text(business.footer, LEFT, 782, { width: RIGHT - LEFT, align: 'center', lineBreak: false });
     }
 

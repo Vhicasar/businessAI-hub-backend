@@ -5,6 +5,8 @@ import { paymentLinksService } from '../../application/payments/payment-links.se
 import {
   publicPaymentView,
   publicReceipt,
+  initiatePublicPayment,
+  verifyPublicPayment,
 } from '../../application/payments/payment-public.service';
 import { validate } from './middleware/validate';
 import { NotFoundError } from '../../shared/errors';
@@ -12,6 +14,7 @@ import { prismaUnscoped } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { buildInvoiceDocument } from '../../application/invoices/invoice-document.service';
 import { randomUUID } from 'node:crypto';
+import { publicPayUrl } from '../../application/payments/payment-intent.service';
 
 /**
  * Public payment-link API for the /pay/<token> page. No auth — possession of
@@ -63,7 +66,13 @@ payRoutes.post(
   '/:token/initiate',
   validate({ body: z.object({ email: z.string().trim().email(), amount: z.coerce.number().positive().optional() }) }),
   wrap(async (req, res) => {
-    res.json({ success: true, data: await paymentLinksService.initiate(req.params.token as string, req.body) });
+    const token = req.params.token as string;
+    try {
+      res.json({ success: true, data: await initiatePublicPayment(token, req.body) });
+    } catch (error) {
+      if (!(error instanceof NotFoundError)) throw error;
+      res.json({ success: true, data: await paymentLinksService.initiate(token, req.body) });
+    }
   }),
 );
 
@@ -72,10 +81,14 @@ payRoutes.get(
   '/:token/verify',
   validate({ query: z.object({ reference: z.string().min(1) }) }),
   wrap(async (req, res) => {
-    res.json({
-      success: true,
-      data: await paymentLinksService.verify(req.params.token as string, String(req.query.reference)),
-    });
+    const token = req.params.token as string;
+    const reference = String(req.query.reference);
+    try {
+      res.json({ success: true, data: await verifyPublicPayment(token, reference) });
+    } catch (error) {
+      if (!(error instanceof NotFoundError)) throw error;
+      res.json({ success: true, data: await paymentLinksService.verify(token, reference) });
+    }
   }),
 );
 
@@ -112,7 +125,7 @@ payRoutes.get(
     if (!intent?.invoiceId) throw new NotFoundError('Invoice');
     const doc = await requestContext.run(
       { requestId: randomUUID(), organizationId: intent.organizationId },
-      () => buildInvoiceDocument(intent.invoiceId!),
+      () => buildInvoiceDocument(intent.invoiceId!, { payUrl: publicPayUrl(req.params.token as string) }),
     );
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `inline; filename="${doc.filename}"`);
