@@ -47,6 +47,40 @@ ordersRoutes.get(
   })
 );
 
+/**
+ * The receipt for this order, rendered the way the business configured it.
+ *
+ * The same document the customer's receipt link serves and the receipt email
+ * carries — built on the server from the order and its payments. The order
+ * screen used to assemble its own in the browser, which is how the business
+ * could be looking at a complete receipt while the customer's link showed
+ * nothing at all.
+ */
+ordersRoutes.get(
+  '/:id/receipt',
+  requirePermission('orders.read'),
+  wrap(async (req, res) => {
+    const { orderReceipt } = await import('../../../application/payments/order-receipt.service');
+    res.json({ success: true, data: await orderReceipt(req.params.id as string) });
+  }),
+);
+
+/**
+ * Send the receipt again, or for the first time after a failure.
+ *
+ * A mail server being down for ten minutes should not cost a customer their
+ * receipt for ever, and a business that connected its mailbox *after* the
+ * payment landed needs a way to put that right.
+ */
+ordersRoutes.post(
+  '/:id/receipt/resend',
+  requirePermission('orders.fulfill'),
+  wrap(async (req, res) => {
+    const { resendOrderReceipt } = await import('../../../application/payments/order-receipt.service');
+    res.json({ success: true, data: await resendOrderReceipt(req.params.id as string) });
+  }),
+);
+
 ordersRoutes.post(
   '/:id/transition',
   requirePermission('orders.update', 'orders.fulfill'),

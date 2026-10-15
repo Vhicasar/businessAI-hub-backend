@@ -126,8 +126,24 @@ paymentsConfigRoutes.put(
 paymentsConfigRoutes.get(
   '/settings',
   requirePermission('payments.read', 'payments.manage_settings'),
-  wrap(async (_req, res) => {
-    res.json({ success: true, data: await paymentSettingsService.get() });
+  wrap(async (req, res) => {
+    /*
+     * The settings, and whether they can actually do what they say.
+     *
+     * "Issue a receipt automatically" was a switch with nothing behind it: a
+     * business with no mailbox connected turned it on, the page looked
+     * satisfied, and no customer ever received a receipt. `receiptEmail` is
+     * the honest answer to "will that happen?", and the page says so next to
+     * the switch rather than implying it.
+     */
+    const { receiptEmailReadiness } = await import(
+      '../../../application/payments/receipt-email.service'
+    );
+    const [settings, receiptEmail] = await Promise.all([
+      paymentSettingsService.get(),
+      receiptEmailReadiness(req.auth!.organizationId!),
+    ]);
+    res.json({ success: true, data: { ...settings, receiptEmail } });
   })
 );
 

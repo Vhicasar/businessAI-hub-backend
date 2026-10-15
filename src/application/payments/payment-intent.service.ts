@@ -90,6 +90,15 @@ export interface CreateIntentInput {
   expiryMinutes?: number | null;
   metadata?: Prisma.InputJsonValue;
   /**
+   * Use this access token instead of minting one.
+   *
+   * For the pairing with a PaymentLink: the link's token is what gets printed,
+   * messaged and encoded in a QR code, so the intent takes it over rather than
+   * having a second URL for the same payment. Same reason the backfill script
+   * carries the token across.
+   */
+  token?: string;
+  /**
    * Reuse an open intent for the same resource instead of minting a second.
    * On by default: two live intents for one bill is how a customer ends up
    * paying twice.
@@ -189,7 +198,7 @@ export const paymentIntentService = {
           data: {
             organizationId: input.organizationId,
             reference: makeReference(),
-            token: makeToken(),
+            token: input.token ?? makeToken(),
             resourceType: input.resourceType,
             resourceId: input.resourceId ?? null,
             customerId: input.customerId ?? null,

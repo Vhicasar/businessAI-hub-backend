@@ -246,14 +246,34 @@ export async function settlePaymentIntent(
   }
 
   // 8. Receipt, if the business wants them.
+  //
+  // Two separate things: filing it in the customer's document vault, and
+  // emailing it. The email used to go through the chat-channel layer, where a
+  // business with no connected mailbox produced a silent failure nobody read —
+  // the setting said receipts were being issued and none ever arrived. It now
+  // records what actually happened, and the pay page shows that instead of a
+  // promise.
   if (settings.autoReceipts) {
     await step('receipt', intentId, async () => {
       const { issueReceipt } = await import('./payment-receipt.service');
       await issueReceipt(intent.id);
     });
+    if (settings.notifyEmail) {
+      await step('receipt-email', intentId, async () => {
+        const { sendReceiptEmail } = await import('./receipt-email.service');
+        await sendReceiptEmail(intent.id);
+      });
+    }
   }
 
-  // 9. Confirmation, on the channels the business has switched on.
+  // 9. Carry the checkout details back to the customer's profile, where they
+  //    fill a gap. Never overwrites what the profile already knows.
+  await step('customer-sync', intentId, async () => {
+    const { syncCustomerFromCheckout } = await import('./checkout-customer.service');
+    await syncCustomerFromCheckout(intent.id);
+  });
+
+  // 10. Confirmation, on the channels the business has switched on.
   await step('notify', intentId, async () => {
     const { notifyPaymentReceived } = await import('./payment-notify.service');
     await notifyPaymentReceived(intent.id);

@@ -104,6 +104,26 @@ const ALLOWED: Record<string, string> = {
     'settings.manage_org.',
   'settings.routes.ts GET /organization': 'the workspace every member renders from',
   'settings.routes.ts GET /workspace-config': 'the feature flags the UI itself gates on',
+  'addresses.routes.ts GET /suggest':
+    'address search. Every member who fills in a form with an address in it ' +
+    'needs it, and it returns places — not this business’s data. The address ' +
+    'book half is scoped to the caller’s own tenant by the query itself, and ' +
+    'the route is rate limited per user.',
+  'addresses.routes.ts GET /resolve': 'turning a chosen suggestion into a point — as above',
+  'addresses.routes.ts GET /reverse': 'turning a map pin into an address — as above',
+  'addresses.routes.ts GET /map-config':
+    'the browser token for drawing a map. Public by design and restricted by ' +
+    'origin at the provider; the server key it is paired with never leaves ' +
+    'the backend.',
+  'settings.routes.ts GET /fulfilment/services':
+    'which delivery services this business may choose between, and whether ' +
+    'this workspace can geocode. The same facts the checkout page acts on, ' +
+    'and no secret among them — connection status is a boolean, never a key. ' +
+    'Connecting one needs settings.manage_org.',
+  'settings.routes.ts GET /fulfilment':
+    'whether this business collects or delivers, and at what rates — the same ' +
+    'offer every customer is shown at checkout, and which the order screens ' +
+    'read to label a fulfilment. Changing it needs settings.manage_org.',
   'billing.routes.ts GET /plans': 'the public plan catalogue',
   'users.routes.ts PATCH /me': 'the caller editing their own profile',
   'users.routes.ts POST /accept': 'accepting an invitation, where the token is the credential',
@@ -194,7 +214,12 @@ console.log('\n=== 4. THE WEB HIDES AND BLOCKS THE SAME THINGS ===');
   const PUBLIC = [
     'login', 'register', '2fa', 'forgot-password', 'reset-password/:token',
     'invite/:token', '/auth', '/auth/verify-email', '/subscribe', '/docs/api',
-    '/pay/:token', '/', 'settings', 'profile', '*', 'website', 'designs', 'designs/:id',
+    // The whole /pay/<token> family: the unguessable token is the credential,
+    // and a customer with a payment link has no login to check. Listed one by
+    // one rather than by prefix, so a new page under /pay has to be a
+    // decision somebody wrote down.
+    '/pay/:token', '/pay/:token/invoice', '/pay/:token/receipt',
+    '/', 'settings', 'profile', '*', 'website', 'designs', 'designs/:id',
   ];
   const gaps = reallyOpen.filter((e) => !PUBLIC.some((p) => e.startsWith(`${p} `)));
   check('no feature route is reachable without a permission', gaps.length === 0, gaps.join('; '));

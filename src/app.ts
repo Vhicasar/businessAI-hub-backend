@@ -37,6 +37,7 @@ import { deliveryRoutes } from './presentation/http/v1/delivery.routes';
 import { ordersRoutes } from './presentation/http/v1/orders.routes';
 import { invoicesRoutes } from './presentation/http/v1/invoices.routes';
 import { settingsRoutes } from './presentation/http/v1/settings.routes';
+import { addressesRoutes } from './presentation/http/v1/addresses.routes';
 import { searchRoutes } from './presentation/http/v1/search.routes';
 import { realestateRoutes } from './presentation/http/v1/realestate.routes';
 import { marketingRoutes } from './presentation/http/v1/marketing.routes';
@@ -193,6 +194,7 @@ export function createApp(): Express {
   v1.use('/orders', ordersRoutes);
   v1.use('/invoices', invoicesRoutes);
   v1.use('/settings', settingsRoutes);
+  v1.use('/addresses', addressesRoutes); // address search, geocoding and map config
   v1.use('/realestate', realestateRoutes);
   v1.use('/appointments', appointmentsRoutes);
   v1.use('/marketing', marketingRoutes);

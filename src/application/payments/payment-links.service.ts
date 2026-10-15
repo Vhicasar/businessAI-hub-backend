@@ -10,6 +10,8 @@ import { logger } from '../../shared/logger';
 import { NotFoundError, ValidationError } from '../../shared/errors';
 import { getActivePaymentProvider, type PaymentProvider } from '../../infrastructure/payments';
 import { notifyService } from '../notifications/notify.service';
+import { paymentIntentService } from './payment-intent.service';
+import type { PaymentIntentResource } from '@prisma/client';
 import { orderNotifyService } from '../notifications/order-notify.service';
 import { messagingService } from '../messaging/messaging.service';
 import { resolveOrgProvider } from './org-account.service';
@@ -132,6 +134,90 @@ function shape<T extends { token: string; amount: unknown; amountPaid: unknown }
   };
 }
 
+/** The resource vocabularies differ slightly; this is the same map the backfill uses. */
+const INTENT_RESOURCE: Record<string, PaymentIntentResource> = {
+  ORDER: 'ORDER',
+  INVOICE: 'INVOICE',
+  PROPERTY_PURCHASE: 'PROPERTY',
+  PROPERTY_RESERVATION: 'PROPERTY_RESERVATION',
+  BOOKING: 'BOOKING',
+  QUOTATION: 'QUOTATION',
+  SUBSCRIPTION: 'SUBSCRIPTION',
+  DEPOSIT: 'DEPOSIT',
+  CUSTOM: 'CUSTOM',
+};
+
+async function paired(link: {
+  organizationId: string;
+  resourceType: string;
+  resourceId: string | null;
+  customerId: string | null;
+  token: string;
+  amount: unknown;
+  currency: string;
+  description: string | null;
+  allowPartial: boolean;
+  expiresAt: Date | null;
+  createdById: string | null;
+}): Promise<void> {
+  const resourceType = INTENT_RESOURCE[link.resourceType] ?? 'CUSTOM';
+  await paymentIntentService.create({
+    organizationId: link.organizationId,
+    resourceType,
+    resourceId: link.resourceId,
+    customerId: link.customerId,
+    orderId: resourceType === 'ORDER' ? link.resourceId : null,
+    invoiceId: resourceType === 'INVOICE' ? link.resourceId : null,
+    amount: Number(link.amount),
+    currency: link.currency,
+    description: link.description,
+    allowPartial: link.allowPartial,
+    channel: 'LINK',
+    createdById: link.createdById,
+    token: link.token,
+    ...(link.expiresAt
+      ? { expiryMinutes: Math.max(1, Math.round((link.expiresAt.getTime() - Date.now()) / 60_000)) }
+      : {}),
+  });
+}
+
+/**
+ * The live status of a link, which lives on the intent that settles it.
+ *
+ * Without this a business would see PENDING on a link whose payment landed
+ * half an hour ago, because the link row stopped being the thing that moves.
+ */
+async function overlayIntents<T extends { token: string; amount: unknown; amountPaid: unknown; status: string; paidAt: Date | null }>(
+  links: T[],
+): Promise<T[]> {
+  if (links.length === 0) return links;
+  const intents = await prismaUnscoped.paymentIntent.findMany({
+    where: { token: { in: links.map((l) => l.token) } },
+    select: { token: true, status: true, amountPaid: true, paidAt: true },
+  });
+  const byToken = new Map(intents.map((i) => [i.token as string, i]));
+  const STATUS: Record<string, string> = {
+    CREATED: 'PENDING',
+    AWAITING_PAYMENT: 'PENDING',
+    PROCESSING: 'PENDING',
+    PARTIALLY_PAID: 'PARTIALLY_PAID',
+    PAID: 'PAID',
+    OVERPAID: 'PAID',
+    CANCELLED: 'CANCELLED',
+    EXPIRED: 'EXPIRED',
+  };
+  return links.map((link) => {
+    const intent = byToken.get(link.token);
+    if (!intent) return link;
+    return {
+      ...link,
+      status: STATUS[intent.status] ?? link.status,
+      amountPaid: intent.amountPaid,
+      paidAt: intent.paidAt ?? link.paidAt,
+    };
+  });
+}
+
 export const paymentLinksService = {
   // ---------------------------------------------------------------- authed
 
@@ -147,6 +233,7 @@ export const paymentLinksService = {
     });
     const currency = (dto.currency ?? derived.currency ?? org.currency).toUpperCase();
 
+    const token = genToken();
     const link = await prisma.paymentLink.create({
       data: {
         // The tenant extension injects this at runtime; set it explicitly so the
@@ -155,7 +242,7 @@ export const paymentLinksService = {
         resourceType: dto.resourceType,
         resourceId: dto.resourceId ?? null,
         customerId: dto.customerId ?? derived.customerId ?? null,
-        token: genToken(),
+        token,
         amount: round2(amount),
         currency,
         description: dto.description ?? derived.description ?? null,
@@ -164,6 +251,25 @@ export const paymentLinksService = {
         createdById: createdById ?? null,
       },
     });
+
+    /*
+     * Finish the cut-over for new links.
+     *
+     * Existing links were folded into Payment Intents by
+     * scripts/migrate-payment-links-to-intents.ts, which carries the token
+     * across so printed URLs keep working. Creation had not been cut over, so
+     * every *new* link was still a legacy row — and a legacy row has no order
+     * behind it as far as the pay page is concerned, which means no checkout,
+     * no fulfilment choice and no delivery fee.
+     *
+     * The intent takes the same token and becomes the record that settles.
+     * The link row stays as the thing the business lists, shares and cancels,
+     * and reads its live status back off the intent.
+     */
+    await paired(link).catch((err) =>
+      logger.warn({ err: (err as Error).message, token }, 'payment intent for link not created'),
+    );
+
     return shape(link);
   },
 
@@ -178,7 +284,7 @@ export const paymentLinksService = {
       orderBy: { createdAt: 'desc' },
       take: 100,
     });
-    return links.map(shape);
+    return (await overlayIntents(links)).map(shape);
   },
 
   async get(id: string) {
@@ -195,6 +301,14 @@ export const paymentLinksService = {
       where: { id },
       data: { status: 'CANCELLED' },
     });
+    // Cancel the payment itself too, or the link says cancelled while the
+    // page it points at keeps taking money.
+    await prismaUnscoped.paymentIntent
+      .updateMany({
+        where: { token: link.token, status: { in: ['CREATED', 'AWAITING_PAYMENT', 'PROCESSING'] } },
+        data: { status: 'CANCELLED' },
+      })
+      .catch(() => undefined);
     return shape(updated);
   },
 

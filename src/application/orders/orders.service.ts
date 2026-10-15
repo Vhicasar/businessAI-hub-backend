@@ -59,9 +59,27 @@ const detailSelect = {
   cancelReason: true,
   deliveredAt: true,
   updatedAt: true,
+  requiresDelivery: true,
+  /*
+   * What the customer said at checkout, for this order.
+   *
+   * Kept beside the customer relation rather than instead of it. The profile
+   * is who they are; these are the name, number and address they gave for this
+   * purchase — which is what the person packing the box needs, and which the
+   * order screen previously could not show because the API never sent it.
+   */
+  fulfillmentMethod: true,
+  contactName: true,
+  contactPhone: true,
+  contactEmail: true,
+  deliverySnapshot: true,
+  deliveryQuote: true,
   warehouse: { select: { id: true, name: true, code: true } },
   shippingAddress: {
-    select: { id: true, addressLine1: true, city: true, state: true, country: true },
+    select: {
+      id: true, addressLine1: true, addressLine2: true, city: true, state: true,
+      country: true, postalCode: true, latitude: true, longitude: true,
+    },
   },
   items: {
     select: {

@@ -60,6 +60,7 @@ const productSelect = {
   expiryTracked: true,
   shelfLifeDays: true,
   expiryAlertDays: true,
+  weightGrams: true,
   manufacturingType: true,
   purchaseEnabled: true,
   sellable: true,
@@ -89,6 +90,7 @@ const productSelect = {
       isDefault: true,
       isActive: true,
       imageFileId: true,
+      weightGrams: true,
       stockLevels: { select: { quantity: true, reserved: true } },
     },
   },
@@ -277,6 +279,8 @@ export const catalogService = {
           expiryTracked: dto.expiryTracked ?? false,
           shelfLifeDays: dto.shelfLifeDays ?? null,
           ...(dto.expiryAlertDays !== undefined ? { expiryAlertDays: dto.expiryAlertDays } : {}),
+        ...(dto.weightGrams !== undefined ? { weightGrams: dto.weightGrams } : {}),
+          ...(dto.weightGrams !== undefined ? { weightGrams: dto.weightGrams } : {}),
           customFields: dto.customFields ?? undefined,
           subscriptionDraftAt: subscriptionDraftReason ? new Date() : null,
           subscriptionDraftReason: subscriptionDraftReason ?? null,
@@ -295,6 +299,7 @@ export const catalogService = {
               isDefault: hasDefault ? Boolean(v.isDefault) : i === 0,
               isActive: v.isActive ?? true,
               imageFileId: v.imageFileId ?? null,
+              weightGrams: v.weightGrams ?? null,
             })),
           },
         },
@@ -342,6 +347,7 @@ export const catalogService = {
         ...(dto.expiryTracked !== undefined ? { expiryTracked: dto.expiryTracked } : {}),
         ...(dto.shelfLifeDays !== undefined ? { shelfLifeDays: dto.shelfLifeDays } : {}),
         ...(dto.expiryAlertDays !== undefined ? { expiryAlertDays: dto.expiryAlertDays } : {}),
+        ...(dto.weightGrams !== undefined ? { weightGrams: dto.weightGrams } : {}),
         ...(dto.categoryId !== undefined ? { categoryId: dto.categoryId } : {}),
         ...(dto.brandId !== undefined ? { brandId: dto.brandId } : {}),
         ...(dto.status !== undefined ? { status: dto.status } : {}),
@@ -393,6 +399,7 @@ export const catalogService = {
           isDefault: dto.isDefault ?? false,
           isActive: dto.isActive ?? true,
           imageFileId: dto.imageFileId ?? null,
+          weightGrams: dto.weightGrams ?? null,
         },
       });
       await tx.stockLevel.create({
@@ -437,6 +444,7 @@ export const catalogService = {
         ...(dto.isDefault !== undefined ? { isDefault: dto.isDefault } : {}),
         ...(dto.isActive !== undefined ? { isActive: dto.isActive } : {}),
         ...(dto.imageFileId !== undefined ? { imageFileId: dto.imageFileId } : {}),
+        ...(dto.weightGrams !== undefined ? { weightGrams: dto.weightGrams } : {}),
       },
     });
     // Swapped the variant photo → delete the file it replaced so orphans don't pile up.

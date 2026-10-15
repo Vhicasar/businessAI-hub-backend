@@ -3,10 +3,10 @@ import { NotFoundError, ValidationError } from '../../shared/errors';
 import { paymentIntentService, publicPayUrl } from './payment-intent.service';
 import { paymentMethodsService } from './payment-methods.service';
 import { readPaymentSettings } from './payment-settings.service';
-import { receiptNumberFor } from './payment-receipt.service';
 import { resolveOrgProvider } from './org-account.service';
 import { verifyWithProvider } from './payment-verification.service';
 import { settlePaymentIntent } from './payment-settlement.service';
+import { Prisma } from '@prisma/client';
 
 /**
  * What a customer sees when they open a payment — on the hosted page, in the
@@ -129,6 +129,21 @@ export async function initiatePublicPayment(
   const view = await publicPaymentView(token);
   if (!view.payable) throw new ValidationError(view.unavailableReason ?? 'This payment is not payable');
 
+  // An order that still needs a delivery quote must not be paid for at the
+  // pre-delivery price. The check lives in checkout and is asked here, at the
+  // one moment it can still prevent the wrong amount being charged.
+  // Imported here rather than at the top: checkout reads the public view, so a
+  // static import both ways would be a cycle resolved differently depending on
+  // which module happened to load first.
+  const { blockingCheckoutIssue } = await import('./checkout.service');
+  const blocked = await blockingCheckoutIssue(token);
+  if (blocked) throw new ValidationError(blocked);
+
+  // The address the customer typed in to receive their receipt. It was
+  // previously handed to the gateway and forgotten, which is why receipts had
+  // nowhere to go.
+  await rememberCheckoutEmail(intent, input.email);
+
   const methods = await paymentMethodsService.resolve({
     organizationId: intent.organizationId,
     currency: intent.currency,
@@ -145,26 +160,40 @@ export async function initiatePublicPayment(
     : view.outstanding;
   if (!(amount > 0)) throw new ValidationError('Nothing remains to be paid');
   const method = gatewayMethod.method;
+
+  // One gateway session per amount.
+  //
+  // Gateways reject a second initialisation of the same reference, so a
+  // customer who changes their delivery address after opening checkout would
+  // otherwise be stuck paying the first amount for ever. Each attempt after
+  // the first gets a suffixed reference; the canonical one still identifies
+  // the payment everywhere a human reads it.
+  const gatewayReference = await nextGatewayReference(intent.id, amount);
+
   const initialized = await provider.initializeTransaction({
     email: input.email,
     amount: Math.round(amount * 100),
-    reference: intent.reference,
+    reference: gatewayReference,
     currency: intent.currency,
-    callbackUrl: `${publicPayUrl(token)}?reference=${encodeURIComponent(intent.reference)}`,
+    callbackUrl: `${publicPayUrl(token)}?reference=${encodeURIComponent(gatewayReference)}`,
     metadata: { kind: 'payment_intent', paymentIntentId: intent.id, organizationId: intent.organizationId },
   });
   await prismaUnscoped.paymentIntent.update({
     where: { id: intent.id },
     data: { status: 'PROCESSING', provider: provider.name, method },
   });
-  return { authorizationUrl: initialized.authorizationUrl, reference: intent.reference };
+  return { authorizationUrl: initialized.authorizationUrl, reference: gatewayReference };
 }
 
 /** Verify a browser return without trusting callback query data. */
 export async function verifyPublicPayment(token: string, reference: string): Promise<PublicPaymentView> {
   const intent = await prismaUnscoped.paymentIntent.findUnique({ where: { token } });
   if (!intent) throw new NotFoundError('Payment');
-  if (reference !== intent.reference || !intent.provider) throw new ValidationError('Invalid payment reference');
+  // Either the canonical reference or the session actually opened for this
+  // attempt. Anything else is somebody else's transaction.
+  const gateway = (intent.metadata as Record<string, any> | null)?.gateway;
+  const acceptable = new Set([intent.reference, gateway?.reference].filter(Boolean) as string[]);
+  if (!acceptable.has(reference) || !intent.provider) throw new ValidationError('Invalid payment reference');
   const verified = await verifyWithProvider({
     organizationId: intent.organizationId,
     provider: intent.provider,
@@ -187,38 +216,82 @@ export async function verifyPublicPayment(token: string, reference: string): Pro
   return publicPaymentView(token);
 }
 
-/** The receipt behind a settled payment. */
+/**
+ * Keep the address the customer gave at checkout.
+ *
+ * On the order when there is one, so the business sees who to contact about
+ * it, and on the intent either way, so a payment raised against a bare invoice
+ * still has somewhere to send the receipt.
+ */
+async function rememberCheckoutEmail(
+  intent: { id: string; orderId: string | null; invoiceId: string | null; metadata: unknown },
+  email: string,
+): Promise<void> {
+  const clean = email.trim().toLowerCase();
+  if (!clean) return;
+  const metadata = { ...((intent.metadata as Record<string, unknown>) ?? {}), checkoutEmail: clean };
+  await prismaUnscoped.paymentIntent.update({
+    where: { id: intent.id },
+    data: { metadata: metadata as Prisma.InputJsonValue },
+  });
+
+  let orderId = intent.orderId;
+  if (!orderId && intent.invoiceId) {
+    const invoice = await prismaUnscoped.invoice.findUnique({
+      where: { id: intent.invoiceId },
+      select: { orderId: true },
+    });
+    orderId = invoice?.orderId ?? null;
+  }
+  if (!orderId) return;
+  // Only fills a gap. An address typed into the fulfilment step is the one the
+  // customer chose for this order; the pay box is a fallback, not an override.
+  await prismaUnscoped.order.updateMany({
+    where: { id: orderId, contactEmail: null },
+    data: { contactEmail: clean },
+  });
+}
+
+/** The reference this attempt's gateway session is opened under. */
+async function nextGatewayReference(intentId: string, amount: number): Promise<string> {
+  const intent = await prismaUnscoped.paymentIntent.findUniqueOrThrow({ where: { id: intentId } });
+  const metadata = ((intent.metadata as Record<string, any>) ?? {});
+  const previous = metadata.gateway as { reference: string; amount: number } | undefined;
+
+  // Re-opening checkout for the same amount reuses the session already paid
+  // for, so a customer who went back and returned does not end up with two.
+  if (previous && Math.abs(Number(previous.amount) - amount) < 0.005) return previous.reference;
+
+  const attempt = Number(metadata.gatewayAttempt ?? 0) + 1;
+  const reference = attempt === 1 ? intent.reference : `${intent.reference}-A${attempt}`;
+  await prismaUnscoped.paymentIntent.update({
+    where: { id: intentId },
+    data: {
+      metadata: {
+        ...metadata,
+        gatewayAttempt: attempt,
+        gateway: { reference, amount, at: new Date().toISOString() },
+      } as Prisma.InputJsonValue,
+    },
+  });
+  return reference;
+}
+
+/**
+ * The receipt behind a settled payment.
+ *
+ * Returns both the data and the rendered document. The data is for anything
+ * that wants to lay it out itself; the HTML is the business's own configured
+ * receipt, and is what the public page shows and the email carries, so the
+ * three cannot drift apart.
+ */
 export async function publicReceipt(token: string) {
   const intent = await prismaUnscoped.paymentIntent.findUnique({ where: { token } });
   if (!intent) throw new NotFoundError('Payment');
-  if (intent.status !== 'PAID' && intent.status !== 'OVERPAID') {
+  if (intent.status !== 'PAID' && intent.status !== 'OVERPAID' && intent.status !== 'PARTIALLY_PAID') {
     throw new NotFoundError('Receipt');
   }
-  const org = await prismaUnscoped.organization.findUnique({
-    where: { id: intent.organizationId },
-    select: { name: true },
-  });
-  const transactions = await prismaUnscoped.paymentTransaction.findMany({
-    where: { paymentIntentId: intent.id, status: 'SUCCESS' },
-    orderBy: { createdAt: 'asc' },
-    select: { amount: true, currency: true, method: true, paidAt: true, providerRef: true },
-  });
-
-  return {
-    receiptNumber: receiptNumberFor(intent.reference),
-    reference: intent.reference,
-    businessName: org?.name ?? 'Vhicasar Hub AI',
-    description: intent.description,
-    amount: Number(intent.amount),
-    amountPaid: Number(intent.amountPaid),
-    currency: intent.currency,
-    paidAt: intent.paidAt,
-    payments: transactions.map((t) => ({
-      amount: Number(t.amount),
-      currency: t.currency,
-      method: t.method,
-      paidAt: t.paidAt,
-      reference: t.providerRef,
-    })),
-  };
+  const { buildReceiptForIntent, renderReceiptHtml } = await import('./receipt-document.service');
+  const receipt = await buildReceiptForIntent(intent.id);
+  return { ...receipt, html: await renderReceiptHtml(receipt) };
 }

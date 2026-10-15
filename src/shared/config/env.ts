@@ -142,6 +142,37 @@ const envSchema = z
     CALENDLY_OAUTH_CLIENT_SECRET: z.string().optional().or(z.literal('')),
     /** Where providers send the user back. Must match the app registration. */
     OAUTH_REDIRECT_BASE_URL: z.string().optional().or(z.literal('')),
+    /**
+     * Geocoding and road distance for delivery pricing.
+     *
+     * Optional on purpose. Without it a business can still charge a flat or
+     * weight-based delivery fee; only the per-kilometre component needs a real
+     * route, and the pricing service says so plainly rather than inventing a
+     * distance. 'google' uses the Geocoding and Distance Matrix APIs, both of
+     * which must be enabled on the key's project and are billed by Google.
+     */
+    MAPS_PROVIDER: z.enum(['none', 'google', 'mapbox', 'geoapify', 'graphhopper']).default('none'),
+    MAPS_API_KEY: z.string().optional().or(z.literal('')),
+    /** Browser token for map tiles. Public by design; restrict it by origin. */
+    MAPS_PUBLIC_TOKEN: z.string().optional().or(z.literal('')),
+    /** Bias address search to these ISO country codes, comma-separated. */
+    MAPS_COUNTRY_CODES: z.string().optional().or(z.literal('')),
+    /** Stop making billable requests after this many in a calendar month. */
+    MAPS_MONTHLY_LIMIT: z.coerce.number().int().min(0).default(0),
+    /**
+     * Self-hosted OpenStreetMap services.
+     *
+     * The reason any of this works without an account: a deployment that runs
+     * its own Photon and OSRM has address autocomplete and road distances at
+     * no per-request cost and without sending customer addresses to a vendor.
+     * Point these at your own instances — the projects' public endpoints have
+     * usage policies that forbid production autocomplete.
+     */
+    MAPS_PHOTON_URL: z.string().optional().or(z.literal('')),
+    MAPS_NOMINATIM_URL: z.string().optional().or(z.literal('')),
+    MAPS_OSRM_URL: z.string().optional().or(z.literal('')),
+    /** Nominatim's usage policy requires a contact address on every request. */
+    MAPS_CONTACT_EMAIL: z.string().optional().or(z.literal('')),
     STRIPE_PUBLIC_KEY: z.string().optional().or(z.literal('')),
     /** Stripe webhook signing secret (whsec_…), for signature verification. */
     STRIPE_WEBHOOK_SECRET: z.string().optional().or(z.literal('')),
@@ -266,6 +297,29 @@ export const env = {
       .filter(Boolean),
     /** Pull active provider + keys from the admin (needs the service key). */
     adminSync: raw.ADMIN_PAYMENT_SYNC && Boolean(raw.SERVICE_API_KEY),
+  },
+  maps: {
+    provider: raw.MAPS_API_KEY ? raw.MAPS_PROVIDER : ('none' as const),
+    apiKey: raw.MAPS_API_KEY || '',
+    publicToken: raw.MAPS_PUBLIC_TOKEN || '',
+    countryCodes: raw.MAPS_COUNTRY_CODES || '',
+    monthlyLimit: raw.MAPS_MONTHLY_LIMIT,
+    photonUrl: raw.MAPS_PHOTON_URL || '',
+    nominatimUrl: raw.MAPS_NOMINATIM_URL || '',
+    osrmUrl: raw.MAPS_OSRM_URL || '',
+    contactEmail: raw.MAPS_CONTACT_EMAIL || '',
+    /**
+     * Whether this deployment has anything of its own.
+     *
+     * Only ever the fallback: the admin's providers take precedence, and the
+     * registry is the thing that knows what is actually usable.
+     */
+    configured: Boolean(
+      (raw.MAPS_PROVIDER !== 'none' && raw.MAPS_API_KEY) ||
+        raw.MAPS_PHOTON_URL ||
+        raw.MAPS_NOMINATIM_URL ||
+        raw.MAPS_OSRM_URL,
+    ),
   },
   oauth: {
     /** Providers send the user here; the path is added per provider. */

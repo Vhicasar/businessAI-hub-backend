@@ -21,6 +21,40 @@ export interface ChannelEmail {
   attachments?: { filename: string; content: Buffer; contentType: string }[];
 }
 
+/**
+ * Whether this channel could send right now.
+ *
+ * The same checks `sendEmailViaChannel` makes, asked ahead of time. Without
+ * it, "a mailbox is connected" was taken to mean "mail will go out", and a
+ * channel connected for *reading* — no outgoing server configured — looked
+ * identical to one that could send.
+ */
+export async function channelCanSendEmail(
+  channelAccountId: string,
+): Promise<{ ok: boolean; reason: string | null }> {
+  const account = await prisma.channelAccount.findFirst({
+    where: { id: channelAccountId, deletedAt: null, isActive: true, status: 'CONNECTED' },
+    select: { channelType: true, name: true, credentialsEnc: true },
+  });
+  if (!account) return { ok: false, reason: 'That email channel is no longer connected' };
+  if (account.channelType !== 'EMAIL') return { ok: false, reason: `${account.name} is not an email channel` };
+  let credentials: Record<string, string> = {};
+  try {
+    credentials = account.credentialsEnc
+      ? (JSON.parse(decrypt(account.credentialsEnc)) as Record<string, string>)
+      : {};
+  } catch {
+    return { ok: false, reason: `${account.name}’s saved credentials could not be read. Reconnect it.` };
+  }
+  if (!credentials.smtpHost) {
+    return { ok: false, reason: `${account.name} has no outgoing mail server configured, so it cannot send.` };
+  }
+  if (!(credentials.fromAddress || credentials.smtpUser || credentials.imapUser)) {
+    return { ok: false, reason: `${account.name} has no sending address configured.` };
+  }
+  return { ok: true, reason: null };
+}
+
 export async function sendEmailViaChannel(
   channelAccountId: string,
   email: ChannelEmail,

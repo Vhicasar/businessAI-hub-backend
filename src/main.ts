@@ -12,6 +12,8 @@ import { startAiConfigSync } from './application/ai/ai-sync';
 import { installAiMetering } from './application/ai/ai-usage.service';
 import { startPaymentConfigSync } from './application/billing/payment-config-sync';
 import { startOAuthConfigSync } from './application/integrations/oauth-config-sync';
+import { startMapsConfigSync } from './application/maps/maps-config-sync';
+import { startDeliveryConfigSync } from './application/delivery/delivery-config-sync';
 import { startEmailRetrySweep } from './application/auth/email-retry.service';
 import { startWorkspaceConfigSync } from './application/settings/workspace-config-sync';
 import { startAppointmentReminderSweep } from './application/appointments/appointments.service';
@@ -43,6 +45,8 @@ async function bootstrap(): Promise<void> {
   await startPaymentConfigSync(); // resolve the active payment gateway before serving checkouts
   await startWorkspaceConfigSync(); // pull admin-managed feature flags / comms / storage config
   await startOAuthConfigSync(); // pull the admin-managed Google/Calendly OAuth apps
+  await startMapsConfigSync(); // resolve address search and routing before serving checkouts
+  await startDeliveryConfigSync(); // which delivery services businesses may be offered
 
   const app = createApp();
   const httpServer = createServer(app);

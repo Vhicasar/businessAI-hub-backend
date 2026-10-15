@@ -29,6 +29,13 @@ export const variantSchema = z.object({
   isActive: z.boolean().optional(),
   /** Per-variant photo — an already-uploaded File id (see /files). */
   imageFileId: z.string().min(1).nullable().optional(),
+  /**
+   * What one of these weighs, in grams.
+   *
+   * Null is "not known", and delivery pricing treats it as a question to ask
+   * rather than as nothing — a variant with no weight is not weightless.
+   */
+  weightGrams: z.coerce.number().int().min(0).max(100_000_000).nullable().optional(),
   // Opening stock booked into the default warehouse on create (products/variants only).
   initialStock: z.coerce.number().min(0).max(1_000_000).optional(),
 });
@@ -71,6 +78,13 @@ export const createProductSchema = z.object({
   shelfLifeDays: z.coerce.number().int().min(1).max(36500).nullable().optional(),
   /** How far ahead of expiry to warn. */
   expiryAlertDays: z.coerce.number().int().min(0).max(3650).optional(),
+  /**
+   * Unit weight in grams, used when a variant does not carry its own.
+   *
+   * A business selling one size fills this in once; a business selling three
+   * sizes overrides it per variant.
+   */
+  weightGrams: z.coerce.number().int().min(0).max(100_000_000).nullable().optional(),
   /** Arbitrary extras — e.g. the source system's id when importing. */
   customFields: z.record(z.unknown()).optional(),
   variants: z.array(variantSchema).min(1),

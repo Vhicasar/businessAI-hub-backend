@@ -43,7 +43,10 @@ export async function notifyPaymentReceived(intentId: string): Promise<void> {
   // request context, so a context is established for the send.
   if (intent.customerId) {
     const channels: { on: boolean; channel: ChannelType }[] = [
-      { on: settings.notifyEmail, channel: 'EMAIL' },
+      // Email is handled by the receipt mailer when receipts are on: it sends
+      // the business's configured receipt rather than a sentence, and reports
+      // whether it got out. Sending here too would be the same payment twice.
+      { on: settings.notifyEmail && !settings.autoReceipts, channel: 'EMAIL' },
       { on: settings.notifySms, channel: 'SMS' },
       { on: settings.notifyWhatsapp, channel: 'WHATSAPP' },
       { on: settings.notifyInbox, channel: 'WEB_CHAT' },

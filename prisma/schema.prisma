@@ -469,6 +469,12 @@ enum OrderStatus {
   REFUNDED
 }
 
+/// How the customer takes delivery of an order.
+enum FulfillmentMethod {
+  PICKUP
+  DELIVERY
+}
+
 enum OrderSource {
   POS
   WEB
@@ -1863,6 +1869,13 @@ model Product {
   manufacturingType    ManufacturingType?
   /// Planning levels for the business as a whole, distinct from the
   /// per-warehouse reorder point: how much of this must exist anywhere.
+  /// What one unit weighs, in grams, when the variant does not say.
+  ///
+  /// Delivery pricing asks the variant first and falls back to here, so a
+  /// business selling one size need only fill this in once. Null means
+  /// genuinely unknown — never treat it as zero, or an order of unweighed
+  /// goods ships free.
+  weightGrams          Int?
   minStock             Decimal?           @db.Decimal(12, 3)
   maxStock             Decimal?           @db.Decimal(12, 3)
   safetyStock          Decimal?           @db.Decimal(12, 3)
@@ -2620,6 +2633,29 @@ model Order {
   /// Whether this order has to be delivered. Drives the delivery panel and the
   /// dispatch half of the status flow; a counter sale never needs either.
   requiresDelivery  Boolean       @default(false)
+  /// Pickup or delivery, as chosen at checkout. Null on orders raised before
+  /// the choice existed, or raised by staff who never asked.
+  fulfillmentMethod FulfillmentMethod?
+  /// Who to contact about *this* order.
+  ///
+  /// Separate from the customer profile on purpose. A buyer may send one order
+  /// to their office and the next to their sister, and the business fulfilling
+  /// this one needs the name and number given for this one — not whatever the
+  /// profile happens to say today.
+  contactName       String?
+  contactPhone      String?
+  contactEmail      String?
+  /// Where this order is going, frozen at the moment it was accepted.
+  ///
+  /// The `shippingAddress` relation still points at the customer's address book
+  /// for dispatch, but address-book rows are shared and editable; this snapshot
+  /// is not, so a past order's destination cannot be rewritten by a later edit.
+  deliverySnapshot  Json?
+  /// What the delivery fee was made of, and from what inputs.
+  ///
+  /// Kept so the figure on a paid invoice can be explained a year later, after
+  /// the rates that produced it have changed.
+  deliveryQuote     Json?
   couponCode        String?
   notes             String?       @db.Text
   placedById        String? // agent Membership id when created on behalf
