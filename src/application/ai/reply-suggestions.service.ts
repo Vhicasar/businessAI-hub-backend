@@ -216,12 +216,32 @@ export const replySuggestions = {
     ];
 
     const hasGoogleData = ctx.appointments.some((appointment) => appointment.dataSource === 'GOOGLE_API_MIXED');
-    const raw = await provider.complete(messages, {
-      maxTokens: 900, temperature: 0.55, jsonMode: true,
-      dataSources: hasGoogleData
-        ? ['user_provided', 'vhicasar_business', 'google_api']
-        : ['user_provided', 'vhicasar_business'],
-    });
+    let raw: string;
+    try {
+      raw = await provider.complete(messages, {
+        maxTokens: 900, temperature: 0.55, jsonMode: true,
+        dataSources: hasGoogleData
+          ? ['user_provided', 'vhicasar_business', 'google_api']
+          : ['user_provided', 'vhicasar_business'],
+      });
+    } catch (err) {
+      /*
+       * An agent pressed a button, so this one explains itself rather than
+       * going quiet. The policy message is accurate but reads like a
+       * compliance notice; what the agent needs to know is why this
+       * conversation in particular cannot be drafted for.
+       */
+      if ((err as { code?: string }).code === 'AI_GOOGLE_DATA_RESTRICTED') {
+        throw new AppError(
+          'AI_GOOGLE_DATA_RESTRICTED',
+          422,
+          'This conversation includes appointment details synced from Google Calendar, which ' +
+            'cannot be sent to the AI provider. Reply manually, or remove the Google Calendar ' +
+            'connection if you would rather the assistant drafted these.',
+        );
+      }
+      throw err;
+    }
     const parsed = extractJson<{ replies?: { tone?: string; content?: string }[] }>(raw);
 
     const drafts = (parsed?.replies ?? [])

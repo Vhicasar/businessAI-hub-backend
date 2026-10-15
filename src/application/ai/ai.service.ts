@@ -1302,7 +1302,17 @@ export const aiService = {
         ? currentName
         : '';
 
-    const raw = await provider.complete(
+    /*
+     * An appointment mirrored to Google carries Google-sourced fields, and the
+     * data policy refuses to send those to the AI provider.
+     *
+     * Auto-reply runs from an inbound webhook, so the refusal must behave like
+     * every other reason there is no draft — silence — rather than throwing
+     * out of the message pipeline.
+     */
+    let raw: string;
+    try {
+      raw = await provider.complete(
       [
         {
           role: 'system',
@@ -1404,7 +1414,17 @@ export const aiService = {
           ? ['user_provided', 'vhicasar_business', 'google_api']
           : ['user_provided', 'vhicasar_business'],
       }
-    );
+      );
+    } catch (err) {
+      if ((err as { code?: string }).code === 'AI_GOOGLE_DATA_RESTRICTED') {
+        logger.info(
+          { conversationId },
+          'auto-reply skipped: the grounding includes Google calendar data',
+        );
+        return null;
+      }
+      throw err;
+    }
 
     const parsed = extractJson<{
       handoff?: boolean;

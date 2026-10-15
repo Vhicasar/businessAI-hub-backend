@@ -1,6 +1,7 @@
 import { activityCenter } from './activity-center.service';
 import { resolveOrgAi } from '../ai/org-ai.service';
 import type { AiMessage } from '../ai/ai-provider';
+import { logger } from '../../shared/logger';
 
 export interface ConciergeAction {
   label: string;
@@ -190,7 +191,18 @@ export const concierge = {
       'claim you paid, booked, cancelled or changed anything. Keep answers under 120 words.\n\n' +
       `CUSTOMER DATA:\n${promptContext(grounding)}`;
 
-    const reply = (
+    /*
+     * A booking that has been mirrored to Google carries Google-sourced
+     * fields, and the data policy refuses to send those to the AI provider.
+     *
+     * That refusal is correct and must stay. What was wrong was the shape of
+     * it: an unhandled 422 reached the customer as an error, when the honest
+     * behaviour is the same answer this gives anyone with no AI configured —
+     * the deterministic one, drawn from their own records.
+     */
+    let reply: string;
+    try {
+      reply = (
       await provider.complete(
         [
           { role: 'system', content: system },
@@ -210,7 +222,23 @@ export const concierge = {
             : ['user_provided', 'vhicasar_business'],
         }
       )
-    ).trim();
+      ).trim();
+    } catch (err) {
+      if ((err as { code?: string }).code === 'AI_GOOGLE_DATA_RESTRICTED') {
+        logger.info(
+          { vhicasarId },
+          'concierge answered without the model: the grounding includes Google calendar data',
+        );
+        return {
+          reply:
+            'I can tell you about your balances, what you owe, your next appointment and offers ' +
+            'that are expiring. Try asking one of those.',
+          actions: [{ label: 'Open your dashboard', deeplink: 'vhicasar://notifications' }],
+          ai: false,
+        };
+      }
+      throw err;
+    }
 
     // Only ever offer actions the grounding actually contains, so a suggestion
     // can never point at a record the customer does not have.
