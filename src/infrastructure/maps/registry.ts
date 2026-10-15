@@ -251,6 +251,53 @@ export async function serve<T>(
   throw new NoProviderError(capability, reasons);
 }
 
+/**
+ * Ask one named provider, and only that one.
+ *
+ * For anything keyed on a provider's own identifier — a place id above all.
+ * Falling back to a different vendor here would resolve the wrong place while
+ * looking like it worked, which is worse than resolving nothing.
+ */
+export async function serveWith<T>(
+  provider: string,
+  capability: MapsCapability,
+  cacheKey: string | null,
+  call: (adapter: MapsAdapter, runtime: ConfiguredProvider) => Promise<T>,
+): Promise<Served<T>> {
+  const configured = chain(capability).find((p) => p.provider === provider);
+  if (!configured) {
+    throw new NoProviderError(capability, [
+      `${provider} is not available for ${capability} on this workspace`,
+    ]);
+  }
+
+  const key = cacheKey ? `${capability}:${provider}:${cacheKey}` : null;
+  if (key) {
+    const hit = cacheGet<T>(key);
+    if (hit !== null) {
+      return { value: hit, provider, attribution: configured.attribution, cached: true };
+    }
+  }
+  if (!allow(configured)) {
+    throw new NoProviderError(capability, [`${provider} is over its configured usage limit`]);
+  }
+
+  const value = await call(ADAPTERS[provider]!, configured);
+  if (key) cacheSet(key, value, configured.cacheTtlSeconds);
+  return { value, provider, attribution: configured.attribution, cached: false };
+}
+
+/**
+ * Whether this provider could resolve a place id it handed out.
+ *
+ * Asked before an autocomplete provider is used, because a provider whose
+ * suggestions carry no coordinates and that cannot resolve its own ids
+ * produces a list the customer can pick from and nothing can act on.
+ */
+export function canResolveDetails(provider: string): boolean {
+  return chain('place_details').some((p) => p.provider === provider);
+}
+
 /** For the admin screens and health checks. */
 export function configuredProviders(): { provider: string; capabilities: MapsCapability[]; hasKey: boolean }[] {
   return runtime.providers.map((p) => ({

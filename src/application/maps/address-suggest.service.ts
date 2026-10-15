@@ -4,6 +4,7 @@ import {
   resolvePlace,
   reverseGeocode,
   suggestAddresses,
+  suggestionsAreResolvable,
   type AddressSuggestion,
   type Coordinates,
 } from './maps.service';
@@ -26,6 +27,8 @@ export type SuggestionSource = 'saved' | 'provider';
 
 export interface Suggestion extends AddressSuggestion {
   source: SuggestionSource;
+  /** Whether picking it will fill the form in, or only name a place. */
+  resolvable: boolean;
   /**
    * Whether a provider has placed this on a map.
    *
@@ -91,6 +94,8 @@ async function savedAddresses(organizationId: string, query: string): Promise<Su
       coordinates: hasPoint ? { latitude: Number(row.latitude), longitude: Number(row.longitude) } : null,
       precision: hasPoint ? 'rooftop' : 'unknown',
       source: 'saved',
+      // Nothing to look up: the parts are already here.
+      resolvable: true,
       // Only if it was geocoded when it was saved. A remembered line of text
       // is a convenience, not a verification.
       verified: hasPoint,
@@ -122,15 +127,30 @@ export async function suggest(input: {
   const remote = await suggestAddresses(query, input.near);
 
   const seen = new Set(saved.map((s) => s.formatted.toLowerCase()));
-  const provider: Suggestion[] = remote.suggestions
+  /*
+   * A suggestion is only worth offering if something can turn it into an
+   * address.
+   *
+   * Google's autocomplete returns a description and an id and nothing else;
+   * the parts and the point come from a separately billed details call. Where
+   * that call is not available, picking a suggestion fills in nothing — so the
+   * list is dropped and the field falls back to typing, which at least works.
+   */
+  const detailsAvailable = suggestionsAreResolvable(remote.provider);
+  const usable = remote.suggestions.filter((s) => Boolean(s.coordinates) || detailsAvailable);
+
+  const provider: Suggestion[] = usable
     .filter((s) => !seen.has(s.formatted.toLowerCase()))
     .map((s) => ({
       ...s,
       source: 'provider' as const,
+      resolvable: Boolean(s.coordinates) || detailsAvailable,
       // A provider that returned a point has verified it; one that returned
       // only a name and an id has not, and the details lookup is what will.
       verified: Boolean(s.coordinates),
     }));
+
+  const dropped = remote.suggestions.length > 0 && usable.length === 0;
 
   return {
     suggestions: [...saved, ...provider].slice(0, 8),
@@ -139,17 +159,25 @@ export async function suggest(input: {
     providerAvailable: autocompleteAvailable(),
     // A provider failure is not an error for the whole field: the saved
     // addresses are still there and manual entry still works.
-    error: remote.error,
+    error:
+      remote.error ??
+      (dropped
+        ? `${remote.provider ?? 'The address provider'} returned matches this workspace cannot turn into a full address. Type the address instead.`
+        : null),
   };
 }
 
 /** Turn a chosen suggestion into a point and structured parts. */
-export async function resolveSuggestion(placeId: string): Promise<{
+export async function resolveSuggestion(
+  placeId: string,
+  /** The provider that issued the id — resolution is pinned to it. */
+  provider?: string | null,
+): Promise<{
   details: Awaited<ReturnType<typeof resolvePlace>>['value'];
   attribution: string;
   verified: boolean;
 }> {
-  const resolved = await resolvePlace(placeId);
+  const resolved = await resolvePlace(placeId, provider);
   return {
     details: resolved.value,
     attribution: resolved.attribution,

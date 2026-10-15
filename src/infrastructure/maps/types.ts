@@ -54,6 +54,15 @@ export type Precision = 'rooftop' | 'street' | 'locality' | 'region' | 'country'
 export interface AddressSuggestion {
   /** The provider's own handle for this place, for a later details lookup. */
   placeId: string | null;
+  /**
+   * Which provider issued that handle.
+   *
+   * A place id is only meaningful to the vendor that minted it — a Google
+   * `ChIJ…` means nothing to Mapbox, and asking Mapbox about one returns
+   * either nothing or, worse, a fuzzy text match somewhere else entirely. So
+   * the id travels with its issuer and goes back to it.
+   */
+  provider?: string;
   /** One line, as the provider formats it — what the dropdown shows. */
   formatted: string;
   /** The parts, where the provider broke them out. */

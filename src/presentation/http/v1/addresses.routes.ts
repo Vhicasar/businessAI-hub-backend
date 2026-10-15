@@ -67,9 +67,22 @@ addressesRoutes.get(
 
 addressesRoutes.get(
   '/resolve',
-  validate({ query: z.object({ placeId: z.string().trim().min(1).max(300) }) }),
+  validate({
+    query: z.object({
+      placeId: z.string().trim().min(1).max(300),
+      // The provider that issued the id. Resolution is pinned to it, because
+      // a place id means nothing to any other vendor.
+      provider: z.string().trim().max(40).optional(),
+    }),
+  }),
   wrap(async (req, res) => {
-    res.json({ success: true, data: await resolveSuggestion(String(req.query.placeId)) });
+    res.json({
+      success: true,
+      data: await resolveSuggestion(
+        String(req.query.placeId),
+        req.query.provider ? String(req.query.provider) : null,
+      ),
+    });
   }),
 );
 

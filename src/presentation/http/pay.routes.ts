@@ -164,14 +164,25 @@ payRoutes.get(
 payRoutes.get(
   '/:token/address/resolve',
   suggestLimiter,
-  validate({ query: z.object({ placeId: z.string().trim().min(1).max(300) }) }),
+  validate({
+    query: z.object({
+      placeId: z.string().trim().min(1).max(300),
+      provider: z.string().trim().max(40).optional(),
+    }),
+  }),
   wrap(async (req, res) => {
     const intent = await prismaUnscoped.paymentIntent.findUnique({
       where: { token: req.params.token as string },
       select: { id: true },
     });
     if (!intent) throw new NotFoundError('Payment');
-    res.json({ success: true, data: await resolveSuggestion(String(req.query.placeId)) });
+    res.json({
+      success: true,
+      data: await resolveSuggestion(
+        String(req.query.placeId),
+        req.query.provider ? String(req.query.provider) : null,
+      ),
+    });
   }),
 );
 

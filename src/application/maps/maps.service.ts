@@ -1,5 +1,7 @@
 import {
   serve,
+  serveWith,
+  canResolveDetails,
   capabilityAvailable,
   mapsRuntime,
   NoProviderError,
@@ -86,8 +88,15 @@ export async function suggestAddresses(
     const served = await serve('autocomplete', `${text.toLowerCase()}|${near ? `${near.latitude.toFixed(2)},${near.longitude.toFixed(2)}` : ''}`, (adapter, runtime) =>
       adapter.autocomplete!(runtime, text, near ?? undefined),
     );
+    /*
+     * Stamp every suggestion with the provider that produced it.
+     *
+     * Without it, resolving the chosen one goes through the ordinary chain and
+     * a Google place id can land on Mapbox, which either returns nothing or a
+     * fuzzy text match somewhere else. The id goes back to its issuer.
+     */
     return {
-      suggestions: served.value,
+      suggestions: served.value.map((s) => ({ ...s, provider: served.provider })),
       provider: served.provider,
       attribution: served.attribution,
       error: null,
@@ -104,15 +113,36 @@ export async function suggestAddresses(
  * an id from autocomplete and nothing else. Taking the display text and
  * guessing where it is would be making up a delivery charge.
  */
-export async function resolvePlace(placeId: string): Promise<Attributed<PlaceDetails | null>> {
+export async function resolvePlace(
+  placeId: string,
+  /** The provider that issued this id. Resolution is pinned to it. */
+  issuer?: string | null,
+): Promise<Attributed<PlaceDetails | null>> {
   try {
-    const served = await serve('place_details', placeId, (adapter, runtime) =>
-      adapter.placeDetails!(runtime, placeId),
-    );
+    const served = issuer
+      ? await serveWith(issuer, 'place_details', placeId, (adapter, runtime) =>
+          adapter.placeDetails!(runtime, placeId),
+        )
+      : await serve('place_details', placeId, (adapter, runtime) =>
+          adapter.placeDetails!(runtime, placeId),
+        );
     return { value: served.value, provider: served.provider, attribution: served.attribution };
   } catch {
     return { value: null, provider: null, attribution: '' };
   }
+}
+
+/**
+ * Whether picking a suggestion from this provider will actually produce an
+ * address.
+ *
+ * Some providers — Google above all — return a description and an id from
+ * autocomplete and nothing else; the parts and the point come from a second,
+ * separately billed details call. If that call is not available, the list is
+ * decorative: the customer picks a line and no field fills in.
+ */
+export function suggestionsAreResolvable(provider: string | null): boolean {
+  return provider ? canResolveDetails(provider) : false;
 }
 
 export async function geocodeAddress(address: string): Promise<Attributed<PlaceDetails | null>> {

@@ -5,6 +5,8 @@ import {
   capabilityAvailable,
   resetUsage,
   clearMapsCache,
+  serveWith,
+  canResolveDetails,
   NoProviderError,
   type ConfiguredProvider,
 } from '../../src/infrastructure/maps/registry';
@@ -207,5 +209,51 @@ describe('attribution', () => {
     const second = await serve('autocomplete', 'ikeja', async () => []);
     expect(first.attribution).toBe('© OpenStreetMap contributors');
     expect(second.attribution).toBe('© OpenStreetMap contributors');
+  });
+});
+
+describe('place ids go back to the provider that issued them', () => {
+  it('asks the named provider and nobody else', async () => {
+    setMapsRuntime({
+      providers: [
+        provider({ provider: 'google', capabilities: ['place_details'], priority: 90 }),
+        provider({ provider: 'mapbox', capabilities: ['place_details'], priority: 1 }),
+      ],
+      order: { place_details: ['mapbox'] },
+    });
+    const asked: string[] = [];
+    const served = await serveWith('google', 'place_details', null, async (_a, runtime) => {
+      asked.push(runtime.provider);
+      return 'ok';
+    });
+    // Both ordering and priority favour mapbox; neither may override the
+    // issuer of the id being resolved.
+    expect(asked).toEqual(['google']);
+    expect(served.provider).toBe('google');
+  });
+
+  it('refuses rather than falling back to a vendor the id means nothing to', async () => {
+    setMapsRuntime({
+      providers: [provider({ provider: 'mapbox', capabilities: ['place_details'] })],
+      order: {},
+    });
+    await expect(serveWith('google', 'place_details', null, async () => 'ok')).rejects.toThrow(
+      /google is not available for place_details/,
+    );
+  });
+
+  it('knows whether a provider can resolve its own ids', () => {
+    setMapsRuntime({
+      providers: [provider({ provider: 'google', capabilities: ['autocomplete'] })],
+      order: {},
+    });
+    // Autocomplete without details is a list nothing can act on.
+    expect(canResolveDetails('google')).toBe(false);
+
+    setMapsRuntime({
+      providers: [provider({ provider: 'google', capabilities: ['autocomplete', 'place_details'] })],
+      order: {},
+    });
+    expect(canResolveDetails('google')).toBe(true);
   });
 });
