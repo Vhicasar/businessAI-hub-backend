@@ -215,7 +215,19 @@ inboxRoutes.post(
     if (!allowance.canAddMore) {
       throw new ConflictError(allowance.blockedReason ?? 'This channel cannot be connected.');
     }
-    if (channelType === 'WHATSAPP' && env.meta.whatsappConfigId) {
+    /*
+     * Embedded Signup has two front doors and only the browser knows which one
+     * it can walk through.
+     *
+     * The JS-SDK popup is a desktop flow: on a phone the SDK hands the login
+     * to the native Facebook app, which cannot run a config_id signup, so it
+     * opens and does nothing. The redirect dialog below is the same Meta
+     * configuration driven by a full-page navigation, and it is the only one
+     * that completes on mobile — so the client asks for it by name rather than
+     * us guessing from a user agent on the server.
+     */
+    const wantsRedirect = String((req.body as { flow?: unknown } | undefined)?.flow ?? '') === 'redirect';
+    if (channelType === 'WHATSAPP' && env.meta.whatsappConfigId && !wantsRedirect) {
       const data = await whatsappEmbeddedSignupConfig({
         organizationId: req.auth!.organizationId!, userId: req.auth!.userId,
         returnTo: `${env.WEB_APP_URL}/settings/integrations?tab=channels`,
@@ -230,6 +242,12 @@ inboxRoutes.post(
       userId: req.auth!.userId,
       returnTo: `${env.WEB_APP_URL}/settings/integrations?tab=channels`,
     });
+    if (channelType === 'WHATSAPP') {
+      logger.info(
+        { event: 'WHATSAPP_SIGNUP_STARTED', flow: 'redirect', tenantId: req.auth!.organizationId },
+        'WhatsApp signup started via the redirect dialog',
+      );
+    }
     res.json({ success: true, data: { url } });
   })
 );

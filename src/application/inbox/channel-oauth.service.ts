@@ -156,6 +156,19 @@ export function authorizationUrl(input: {
   if (input.channelType === 'WHATSAPP' && env.meta.whatsappConfigId) {
     params.set('config_id', env.meta.whatsappConfigId);
     params.set('override_default_response_type', 'true');
+    /*
+     * The configuration decides the permissions, so `scope` has no say here —
+     * sending both invites Meta to disagree with itself about which won.
+     */
+    params.delete('scope');
+    /*
+     * Same onboarding the desktop popup offers.
+     *
+     * `whatsappLoginOptions` in the web app passes this featureType through the
+     * JS SDK. Without it here, a business connecting from a phone would be
+     * walked through a different signup than the same business on a laptop.
+     */
+    params.set('extras', JSON.stringify({ setup: {}, featureType: 'whatsapp_business_app_onboarding' }));
   }
 
   if (input.channelType === 'INSTAGRAM' && instagramLoginMode() === 'DIRECT_INSTAGRAM') {

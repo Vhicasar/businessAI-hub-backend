@@ -60,3 +60,58 @@ describe('WhatsApp connection attempts', () => {
     })).resolves.toEqual({ alreadyCompletedAccountId: 'channel-1' });
   });
 });
+
+/*
+ * The redirect dialog — the only Embedded Signup flow that completes on a
+ * phone, where the JS SDK defers to the native Facebook app and comes back
+ * with nothing. It is the same Meta configuration as the desktop popup, so it
+ * has to carry the same onboarding and nothing that contradicts the config.
+ */
+describe('WhatsApp Embedded Signup redirect URL', () => {
+  const withConfigId = async (configId: string | undefined) => {
+    const previous = process.env.META_WHATSAPP_CONFIG_ID;
+    if (configId === undefined) delete process.env.META_WHATSAPP_CONFIG_ID;
+    else process.env.META_WHATSAPP_CONFIG_ID = configId;
+    vi.resetModules();
+    const fresh = await import('../../src/application/inbox/channel-oauth.service');
+    const { url } = fresh.authorizationUrl({
+      channelType: 'WHATSAPP',
+      organizationId: 'org-1',
+      userId: 'user-1',
+      returnTo: '/settings',
+    });
+    if (previous === undefined) delete process.env.META_WHATSAPP_CONFIG_ID;
+    else process.env.META_WHATSAPP_CONFIG_ID = previous;
+    return new URL(url);
+  };
+
+  it('drives the configured signup and returns a code to our callback', async () => {
+    const url = await withConfigId('config-abc');
+    expect(url.origin + url.pathname).toMatch(/^https:\/\/www\.facebook\.com\/v[\d.]+\/dialog\/oauth$/);
+    expect(url.searchParams.get('config_id')).toBe('config-abc');
+    expect(url.searchParams.get('response_type')).toBe('code');
+    expect(url.searchParams.get('override_default_response_type')).toBe('true');
+    expect(url.searchParams.get('redirect_uri')).toContain('/channels/whatsapp/callback');
+    expect(url.searchParams.get('state')).toBeTruthy();
+  });
+
+  it('offers a phone the same onboarding the desktop popup offers', async () => {
+    const url = await withConfigId('config-abc');
+    expect(JSON.parse(url.searchParams.get('extras') ?? '{}')).toEqual({
+      setup: {}, featureType: 'whatsapp_business_app_onboarding',
+    });
+  });
+
+  it('lets the configuration decide the permissions, not a scope list', async () => {
+    const url = await withConfigId('config-abc');
+    expect(url.searchParams.has('scope')).toBe(false);
+  });
+
+  it('still asks for scopes where there is no Embedded Signup configuration', async () => {
+    const url = await withConfigId(undefined);
+    expect(url.searchParams.has('config_id')).toBe(false);
+    expect(url.searchParams.get('scope')).toContain('whatsapp_business_messaging');
+    // Without granular Embedded Signup targets, the WABA has to be enumerated.
+    expect(url.searchParams.get('scope')).toContain('business_management');
+  });
+});
