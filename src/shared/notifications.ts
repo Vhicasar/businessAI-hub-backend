@@ -19,6 +19,7 @@ export const NOTIFICATION_TYPES: NotificationType[] = [
   { key: 'order.paid', label: 'Payments received', description: 'An order or invoice is paid' },
   { key: 'lead.new', label: 'New leads', description: 'A new lead is captured' },
   { key: 'sms.low_balance', label: 'SMS low balance', description: 'Your SMS wallet is running low' },
+  { key: 'channel.disconnected', label: 'Channel problems', description: 'A connected channel stopped working' },
 ];
 
 /** Push-capable client platforms a user can toggle independently. */

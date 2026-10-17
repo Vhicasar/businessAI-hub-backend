@@ -1,5 +1,7 @@
 import { prismaUnscoped } from '../../infrastructure/database/prisma';
 import { logger } from '../../shared/logger';
+import { notifyService } from '../notifications/notify.service';
+import { permissionsForRole } from '../roles/role-permissions';
 import type { ChannelConnectionStatus } from '@prisma/client';
 
 /**
@@ -51,9 +53,34 @@ export function classifyProviderError(message: string): ChannelConnectionStatus 
  */
 export function friendlyMessage(
   channelType: string,
-  status: ChannelConnectionStatus
+  status: ChannelConnectionStatus,
+  /**
+   * The provider's raw words, used only to pick a more specific sentence.
+   *
+   * Never returned verbatim. "3 NO [AUTHENTICATIONFAILED] Invalid credentials
+   * (Failure)" is precise and useless to the person who has to fix it.
+   */
+  rawMessage?: string,
 ): string {
   const name = channelLabel(channelType);
+
+  /*
+   * Mail is worth a sentence of its own.
+   *
+   * A rejected IMAP login is almost always one of three things, and "Email is
+   * not working right now" sends the business looking for an outage instead of
+   * at the mailbox settings they changed last week. Gmail and Outlook in
+   * particular refuse an ordinary account password outright once two-step
+   * verification is on, which is the single most common cause.
+   */
+  if (channelType === 'EMAIL' && rawMessage && /auth|credential|login|password/i.test(rawMessage)) {
+    return (
+      'Email sign-in was refused by the mail server. Check the mailbox username and password in ' +
+      'Settings → Integrations → Channels. If this mailbox uses Gmail, Outlook or two-step ' +
+      'verification, it needs an app password rather than the account password.'
+    );
+  }
+
   switch (status) {
     case 'EXPIRED':
       return `${name} connection expired. Reconnect ${name} to continue receiving messages.`;
@@ -110,6 +137,49 @@ export async function markWebhookReceived(accountId: string): Promise<void> {
 }
 
 /**
+ * Tell the people who can fix it.
+ *
+ * A broken channel is invisible by design: no messages arrive, and an empty
+ * inbox looks like a quiet day. The settings page shows the reason, but only
+ * to someone who thinks to go and look — so whoever is allowed to manage
+ * channels gets a notification the moment the status turns, and only then.
+ */
+async function announceChannelBroken(
+  organizationId: string,
+  accountName: string,
+  channelType: string,
+  message: string,
+): Promise<void> {
+  try {
+    const memberships = await prismaUnscoped.membership.findMany({
+      where: { organizationId, isActive: true, deletedAt: null },
+      select: { userId: true, roleId: true },
+    });
+    const cache = new Map<string, Set<string>>();
+    const recipients: string[] = [];
+    for (const membership of memberships) {
+      if (!membership.roleId) continue;
+      let granted = cache.get(membership.roleId);
+      if (!granted) {
+        granted = await permissionsForRole(membership.roleId);
+        cache.set(membership.roleId, granted);
+      }
+      if (granted.has('inbox.manage_channels')) recipients.push(membership.userId);
+    }
+    if (recipients.length === 0) return;
+    await notifyService.notifyUsers(organizationId, recipients, {
+      type: 'channel.disconnected',
+      title: `${channelLabel(channelType)} needs attention`,
+      body: message,
+      data: { channelType, accountName },
+    });
+  } catch (err) {
+    // Never let the announcement cost us the status we just recorded.
+    logger.warn({ err, organizationId, channelType }, 'Could not announce channel failure');
+  }
+}
+
+/**
  * Record that something went wrong with this channel.
  *
  * Returns the status it settled on, so a caller can decide whether to keep
@@ -122,15 +192,25 @@ export async function markChannelError(
   rawMessage: string
 ): Promise<ChannelConnectionStatus> {
   const status = classifyProviderError(rawMessage);
+  const message = friendlyMessage(channelType, status, rawMessage);
   try {
+    // Read first, so a channel that is newly broken can be announced once
+    // rather than on every retry.
+    const before = await prismaUnscoped.channelAccount.findUnique({
+      where: { id: accountId },
+      select: { status: true, organizationId: true, name: true },
+    });
     await prismaUnscoped.channelAccount.update({
       where: { id: accountId },
       data: {
         status,
-        lastError: friendlyMessage(channelType, status),
+        lastError: message,
         lastErrorAt: new Date(),
       },
     });
+    if (before && before.status !== status && status !== 'CONNECTED') {
+      await announceChannelBroken(before.organizationId, before.name, channelType, message);
+    }
   } catch (err) {
     logger.warn({ err, accountId }, 'Could not record channel error');
   }
@@ -185,7 +265,7 @@ export async function markChannelSetupFailed(
     data: {
       isActive: false,
       status: 'ERROR',
-      lastError: friendlyMessage(channelType, 'ERROR'),
+      lastError: friendlyMessage(channelType, 'ERROR', rawMessage),
       lastErrorAt: new Date(),
     },
   }).catch((err) => logger.warn({ err, accountId }, 'Could not record channel setup failure'));

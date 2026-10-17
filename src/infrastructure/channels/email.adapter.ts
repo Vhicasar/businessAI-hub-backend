@@ -61,7 +61,13 @@ export class EmailAdapter implements ChannelAdapter {
     try {
       await client.connect();
     } catch {
-      throw new AppError('CHANNEL_MISCONFIGURED', 400, 'The mailbox credentials could not be verified with the IMAP server.');
+      throw new AppError(
+        'CHANNEL_MISCONFIGURED',
+        400,
+        'The mail server refused these IMAP details. Check the username and password — mailboxes on ' +
+          'Gmail, Outlook or any account with two-step verification need an app password rather than ' +
+          'the account password.',
+      );
     } finally {
       await client.logout().catch(() => undefined);
     }
@@ -72,7 +78,12 @@ export class EmailAdapter implements ChannelAdapter {
       auth: c.smtpUser ? { user: c.smtpUser, pass: c.smtpPass ?? '' } : undefined,
     });
     await transport.verify().catch(() => {
-      throw new AppError('CHANNEL_MISCONFIGURED', 400, 'The mailbox credentials could not be verified with the SMTP server.');
+      throw new AppError(
+        'CHANNEL_MISCONFIGURED',
+        400,
+        'The mail server refused these SMTP details. Check the sending username and password — an app ' +
+          'password is required for Gmail, Outlook and any account with two-step verification.',
+      );
     });
     return 'Email connected. Incoming mail is checked about once a minute.';
   }

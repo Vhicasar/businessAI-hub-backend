@@ -10,6 +10,8 @@
  * told: a dead token needs them to reconnect, a rate limit needs them to do
  * nothing at all, and neither should ever surface the provider's own wording.
  */
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { prismaUnscoped as db } from '../../src/infrastructure/database/prisma';
 import {
   classifyProviderError,
@@ -138,6 +140,36 @@ async function main() {
     check('an unknown account is swallowed, not thrown',
       !threw,
       'a webhook must never be lost over its own bookkeeping');
+  }
+
+  // ── 8. A background poller must record what it discovers ────────────────
+  /*
+   * The IMAP poller used to catch its own failures and only log them. A
+   * mailbox whose password had been changed therefore kept showing as
+   * connected, no mail arrived for days, and the only trace was a warning
+   * every 60 seconds in a log nobody reads. A poller is the one place that
+   * learns a channel is broken, so it is the one place that must say so.
+   */
+  console.log('\nThe email poller reports what it finds');
+  {
+    const poller = readFileSync(
+      join(__dirname, '../../src/infrastructure/channels/email.poller.ts'), 'utf8',
+    );
+    check('a failed cycle marks the channel, not just the log',
+      poller.includes('markChannelError('),
+      'email.poller.ts catches its errors without recording them on the account');
+    check('a recovered mailbox is marked healthy again',
+      poller.includes('markChannelConnected('),
+      'a fixed channel would stay showing last week\'s failure');
+    check('a refused password is told apart from a dropped connection',
+      /authenticationFailed/.test(poller) && /AUTH(ENTICATION|ORIZATION)FAILED/.test(poller),
+      'without this every failure gets the same retry and the same message');
+    check('a doomed login is not retried every cycle',
+      poller.includes('pollRetryAfter') && /AUTH_BACKOFF_MS/.test(poller),
+      'retrying a rejected password every 60s is how a mailbox gets locked out');
+    check('the backoff is actually honoured before polling',
+      /pollRetryAfter[\s\S]{0,400}continue;/.test(poller),
+      'the deadline is written but never read');
   }
 
   await cleanup();

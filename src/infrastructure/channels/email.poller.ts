@@ -7,6 +7,10 @@ import { requestContext } from '../../shared/context';
 import { decrypt } from '../../shared/crypto';
 import { logger } from '../../shared/logger';
 import { inboxService } from '../../application/inbox/inbox.service';
+import {
+  markChannelConnected,
+  markChannelError,
+} from '../../application/inbox/channel-health.service';
 
 const POLL_INTERVAL_MS = 60_000;
 let timer: NodeJS.Timeout | null = null;
@@ -23,6 +27,63 @@ interface EmailSyncMetadata extends Record<string, unknown> {
   syncSince?: string;
   lastUid?: number;
   uidValidity?: string;
+  /** Consecutive failed poll cycles — drives the retry backoff below. */
+  pollFailures?: number;
+  /** ISO timestamp before which this mailbox is not worth contacting again. */
+  pollRetryAfter?: string;
+}
+
+/*
+ * How long to wait after a failed cycle before trying this mailbox again.
+ *
+ * Two schedules, because the two kinds of failure deserve different patience.
+ * A refused password will be refused again a minute later, and hammering it
+ * every 60s is how a mailbox gets locked out by the provider — so a rejected
+ * login waits a quarter of an hour, then an hour, then settles at six. A
+ * timeout or a dropped connection usually clears on its own, so the first
+ * retry is immediate (the next ordinary cycle) and only a persistent one
+ * slows down.
+ */
+const AUTH_BACKOFF_MS = [15 * 60_000, 60 * 60_000, 6 * 60 * 60_000];
+const TRANSIENT_BACKOFF_MS = [0, 5 * 60_000, 15 * 60_000, 60 * 60_000];
+
+function backoffFor(failures: number, authFailed: boolean): number {
+  const schedule = authFailed ? AUTH_BACKOFF_MS : TRANSIENT_BACKOFF_MS;
+  const index = Math.min(Math.max(failures, 1), schedule.length) - 1;
+  return schedule[index] ?? 0;
+}
+
+/**
+ * Did the mail server itself reject the sign-in?
+ *
+ * ImapFlow surfaces this as `authenticationFailed` plus the server's own
+ * response code, e.g. `3 NO [AUTHENTICATIONFAILED] Invalid credentials`. It
+ * matters because it is the one failure no amount of retrying will fix: the
+ * mailbox needs a corrected password, or — on Gmail and Outlook with two-step
+ * verification — an app password.
+ */
+function isAuthFailure(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as {
+    authenticationFailed?: boolean;
+    serverResponseCode?: string;
+    responseText?: string;
+    message?: string;
+  };
+  if (e.authenticationFailed === true) return true;
+  if (typeof e.serverResponseCode === 'string' && /AUTH(ENTICATION|ORIZATION)FAILED/i.test(e.serverResponseCode)) {
+    return true;
+  }
+  return /invalid credentials|authentication failed|invalid login|login failed|app password/i.test(
+    `${e.responseText ?? ''} ${e.message ?? ''}`,
+  );
+}
+
+/** What the log should show: the server's words, never an object dump. */
+function describeError(err: unknown): string {
+  if (!err || typeof err !== 'object') return String(err);
+  const e = err as { responseText?: string; message?: string };
+  return e.responseText || e.message || String(err);
 }
 
 /**
@@ -268,19 +329,91 @@ async function saveSyncMetadata(
     .catch((e) => logger.warn({ err: e, accountId }, 'Failed to persist email sync watermark'));
 }
 
+/**
+ * Write only the retry bookkeeping, on top of whatever is in the row now.
+ *
+ * Deliberately re-reads. `pollAccount` advances the UID cursor during the same
+ * cycle, so merging onto the snapshot taken before the poll would roll that
+ * cursor back and make the mailbox re-fetch mail it had already imported.
+ */
+async function patchPollState(accountId: string, update: Record<string, unknown>): Promise<void> {
+  const row = await prismaUnscoped.channelAccount
+    .findUnique({ where: { id: accountId }, select: { metadata: true } })
+    .catch(() => null);
+  const current = (row?.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+    ? (row.metadata as Record<string, unknown>)
+    : {});
+  await saveSyncMetadata(accountId, current, update);
+}
+
 async function pollAll(): Promise<void> {
   if (running) return; // skip overlapping cycles
   running = true;
   try {
     const accounts = await prismaUnscoped.channelAccount.findMany({
       where: { channelType: 'EMAIL', isActive: true, deletedAt: null },
-      select: { id: true, organizationId: true, credentialsEnc: true, createdAt: true, metadata: true },
+      select: {
+        id: true,
+        organizationId: true,
+        credentialsEnc: true,
+        createdAt: true,
+        metadata: true,
+        status: true,
+      },
     });
     for (const account of accounts) {
+      const meta = ((account.metadata as EmailSyncMetadata | null) ?? {});
+
+      // Still inside the backoff window from an earlier failure — leave it be.
+      const retryAfter = typeof meta.pollRetryAfter === 'string' ? Date.parse(meta.pollRetryAfter) : NaN;
+      if (!Number.isNaN(retryAfter) && retryAfter > Date.now()) continue;
+
       try {
         await pollAccount(account);
+
+        /*
+         * A clean cycle is proof the credentials work, so clear the failure
+         * state. Guarded, because the overwhelming majority of cycles are
+         * healthy ones and should cost no writes at all.
+         */
+        if (meta.pollFailures || meta.pollRetryAfter) {
+          await patchPollState(account.id, { pollFailures: 0, pollRetryAfter: null });
+        }
+        if (account.status !== 'CONNECTED') {
+          await markChannelConnected(account.id);
+          logger.info({ accountId: account.id }, 'Email channel recovered — polling again');
+        }
       } catch (e) {
-        logger.warn({ err: e, accountId: account.id }, 'Email poll failed for account');
+        /*
+         * Record the failure against the channel, not just in the log.
+         *
+         * Without this the business sees a healthy-looking Email channel while
+         * no mail has arrived for days, and the only trace is a warning in the
+         * server log that nobody is watching.
+         */
+        const authFailed = isAuthFailure(e);
+        const failures = (typeof meta.pollFailures === 'number' ? meta.pollFailures : 0) + 1;
+        const wait = backoffFor(failures, authFailed);
+
+        await markChannelError(account.id, 'EMAIL', describeError(e));
+        await patchPollState(account.id, {
+          pollFailures: failures,
+          pollRetryAfter: wait > 0 ? new Date(Date.now() + wait).toISOString() : null,
+        });
+
+        logger.warn(
+          {
+            err: e,
+            accountId: account.id,
+            organizationId: account.organizationId,
+            authFailed,
+            failures,
+            retryInMs: wait,
+          },
+          authFailed
+            ? 'Email poll rejected by mail server — channel marked for reconnection'
+            : 'Email poll failed for account',
+        );
       }
     }
   } finally {
@@ -300,6 +433,9 @@ export function startEmailInboundPoller(): void {
   void pollAll();
   logger.info('Email inbound poller started (60s interval)');
 }
+
+/** Internals exposed for the poller-health guards only. */
+export const __testing = { isAuthFailure, describeError, backoffFor };
 
 export function stopEmailInboundPoller(): void {
   if (timer) clearInterval(timer);
