@@ -105,6 +105,26 @@ describe('a popup that returns nothing is recoverable', () => {
     expect(page).toMatch(/start\('redirect'\)/);
   });
 
+  /*
+   * Both mobile platforms claim facebook.com for the Facebook app, which does
+   * not implement this signup: it opens, closes, and nothing happens. No web
+   * page can prevent that handoff, so a phone must be given the link to finish
+   * elsewhere rather than being walked into it.
+   */
+  it('hands a phone the link instead of navigating into the Facebook app', () => {
+    const page = readFileSync(
+      join(__dirname, '../../../web/src/features/settings/ChannelsSettingsPage.tsx'), 'utf8',
+    );
+    expect(page).toMatch(/handoffUrl/);
+    // The mobile branch must return the link, not assign window.location.
+    const mobileBranch = page.slice(page.indexOf('const onMobile'), page.indexOf('if (type !== \'WHATSAPP\''));
+    expect(mobileBranch).toMatch(/return \{ handoffUrl: started\.url \}/);
+    expect(mobileBranch).not.toMatch(/window\.location/);
+    // And the business must be told why, and be able to take the link with them.
+    expect(page).toMatch(/Finish connecting WhatsApp on a computer/);
+    expect(page).toMatch(/clipboard\.writeText\(handoff\)/);
+  });
+
   it('the server honours a redirect-flow request instead of forcing the popup', () => {
     const route = readFileSync(
       join(__dirname, '../../src/presentation/http/v1/inbox.routes.ts'), 'utf8',
