@@ -1,5 +1,5 @@
 import type { AiCompletionOptions, AiMessage, AiProvider } from '../../application/ai/ai-provider';
-import { AppError } from '../../shared/errors';
+import { providerError } from './provider-error';
 
 /**
  * OpenAI-compatible chat completions — works with OpenAI, Ollama, vLLM,
@@ -57,7 +57,7 @@ export class OpenAiCompatibleProvider implements AiProvider {
 
     this.usage = result.usage ?? null;
     if (!result.ok) {
-      throw new AppError('AI_PROVIDER_ERROR', 502, `AI provider: ${result.errorMessage ?? result.status}`);
+      throw providerError('openai', result.errorMessage ?? '', result.status);
     }
     return result.content;
   }

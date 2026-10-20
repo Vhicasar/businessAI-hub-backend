@@ -196,8 +196,16 @@ console.log('\n=== 4. THE WEB HIDES AND BLOCKS THE SAME THINGS ===');
     // A redirect renders no feature; its destination is what gets guarded.
     // Both spellings: `Navigate`, and the alias that forwards query strings.
     if (!component || component === 'Navigate' || component === 'RedirectKeepingQuery') continue;
-    // A commented-out route is not reachable.
-    if (/^\s*\/\//m.test(block.split('\n')[0] ?? '')) continue;
+    /*
+     * A commented-out route is not reachable.
+     *
+     * Read backwards from the match to the start of its own line, because the
+     * `//` usually sits before `path:` on the same line — a paused feature is
+     * commented route by route, and only looking at the start of the captured
+     * block made those look live.
+     */
+    const lineStart = router.lastIndexOf('\n', start) + 1;
+    if (router.slice(lineStart, start).trimStart().startsWith('//')) continue;
     if (/RequirePermission|RequireFeature/.test(block)) continue;
     open.push(`${path} <${component}>`);
   }

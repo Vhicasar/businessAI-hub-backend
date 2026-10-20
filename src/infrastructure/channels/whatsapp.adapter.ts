@@ -14,6 +14,7 @@ import type {
 import { mediaDownloadFailure, normalizedMimeType } from '../../application/inbox/channel-adapter';
 import { mediaKindFor } from '../../application/inbox/channel-adapter';
 import { AppError } from '../../shared/errors';
+import { classifyMetaFailure, MetaSendError, parseMetaError } from './meta-error';
 
 // Was pinned to v21.0 and ignored META_GRAPH_VERSION.
 const graph = () => env.meta.graphUrl;
@@ -381,9 +382,18 @@ export class WhatsAppAdapter implements ChannelAdapter {
       },
         body: JSON.stringify(body),
       });
-      const json = (await res.json()) as { messages?: { id: string }[]; error?: { message?: string } };
+      const json = (await res.json()) as { messages?: { id: string }[]; error?: Record<string, unknown> };
       if (!res.ok || !json.messages?.[0]) {
-        throw new AppError('CHANNEL_SEND_FAILED', 502, `WhatsApp send failed: ${json.error?.message ?? res.status}`);
+        /*
+         * Keep Meta's numeric code, not just its sentence.
+         *
+         * A campaign has to tell "add a payment method" apart from "this
+         * template is paused", and only the code says which. The wording moves
+         * between API versions; the code does not.
+         */
+        const detail = parseMetaError(json, res.status);
+        const kind = classifyMetaFailure(detail);
+        throw new MetaSendError(kind, detail, `WhatsApp send failed: ${detail.message}`);
       }
       providerMessageId ||= json.messages[0].id;
     }

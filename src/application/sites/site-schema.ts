@@ -134,3 +134,119 @@ export function normalizeSections(value: unknown): SiteSection[] {
   if (!Array.isArray(value)) return [];
   return value.map((entry) => siteSectionSchema.safeParse(entry)).filter((entry) => entry.success).map((entry) => entry.data);
 }
+
+/**
+ * Read an animation name the way a person would.
+ *
+ * The names are decorative hints, and a model will offer `fadeUp` or
+ * `slideUp` as readily as the five this schema accepts. Losing an entire
+ * section over the word for its entrance animation is absurd, so a near miss
+ * is matched and anything unrecognisable falls back to the default.
+ */
+function animationName(value: string): string | undefined {
+  const key = value.toLowerCase().replace(/[^a-z]/g, '');
+  const known: Record<string, string> = {
+    none: 'none', fade: 'fade', fadein: 'fade', fadeup: 'fade', fadeinup: 'fade',
+    reveal: 'reveal', revealup: 'reveal',
+    slideup: 'slide-up', slide: 'slide-up', slidein: 'slide-up', slideinup: 'slide-up',
+    scale: 'scale', zoom: 'scale', zoomin: 'scale', grow: 'scale',
+  };
+  return known[key];
+}
+
+const BREAKPOINTS = new Set(['desktop', 'tablet', 'mobile']);
+const RESPONSIVE_KEYS = new Set(['hidden', 'columns', 'align', 'paddingY', 'fontScale']);
+
+/** The keys a section is allowed to carry; everything else is content. */
+const SECTION_KEYS = new Set([
+  'id', 'type', 'variant', 'name', 'hidden', 'props', 'binding', 'responsive', 'animation',
+]);
+
+/**
+ * Make a language model's best effort fit the section schema.
+ *
+ * `siteSectionSchema` is strict on purpose: an API client that posts unknown
+ * keys should be told so, not silently corrected. A model is not an API
+ * client — it is approximating a shape from a paragraph of description, and it
+ * will volunteer a `title` here or forget an `id` there. Rejecting the whole
+ * section for that discarded entire websites over a single stray key, and the
+ * business was told only that the AI "did not return a valid editable
+ * website".
+ *
+ * So: keep the keys the schema knows, mint an id when one is missing, and fold
+ * anything else into `props` rather than throwing the content away — the
+ * renderer ignores props it has no use for, and the editor shows them. What is
+ * still not salvageable (no recognisable section type) is reported, not
+ * silently dropped.
+ */
+export function coerceAiSections(value: unknown): { sections: SiteSection[]; rejected: { index: number; reason: string }[] } {
+  const rejected: { index: number; reason: string }[] = [];
+  if (!Array.isArray(value)) return { sections: [], rejected: [{ index: -1, reason: 'not an array' }] };
+
+  const sections: SiteSection[] = [];
+  value.forEach((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      rejected.push({ index, reason: 'not an object' });
+      return;
+    }
+    const source = entry as Record<string, unknown>;
+    const known: Record<string, unknown> = {};
+    const extra: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(source)) {
+      if (SECTION_KEYS.has(key)) known[key] = item;
+      else extra[key] = item;
+    }
+    if (!known.id || typeof known.id !== 'string') known.id = `sec_${randomUUID()}`;
+
+    /*
+     * Presentation hints the model is most likely to improvise.
+     *
+     * `responsive` is per-breakpoint settings and `animation` is one word, but
+     * a model reading a field list without a shape guesses — gpt-5.4-mini
+     * returns `responsive: { mobile: "stack" }` and `animation: { type: "none",
+     * delay: 0 }`, both reasonable and both wrong. These are hints with
+     * perfectly good defaults, so a value we cannot read is dropped rather
+     * than taking the whole section down with it.
+     */
+    if (known.animation !== undefined) {
+      const nested = typeof known.animation === 'string'
+        ? known.animation
+        : (known.animation as { type?: unknown } | null)?.type;
+      known.animation = typeof nested === 'string' ? animationName(nested) : undefined;
+    }
+    if (known.hidden !== undefined && typeof known.hidden !== 'boolean') {
+      known.hidden = known.hidden === 'true' ? true : known.hidden === 'false' ? false : undefined;
+    }
+    if (known.responsive !== undefined) {
+      const source = known.responsive;
+      if (!source || typeof source !== 'object' || Array.isArray(source)) known.responsive = undefined;
+      else {
+        const usable: Record<string, unknown> = {};
+        for (const [breakpoint, settings] of Object.entries(source as Record<string, unknown>)) {
+          if (!BREAKPOINTS.has(breakpoint)) continue;
+          if (!settings || typeof settings !== 'object' || Array.isArray(settings)) continue;
+          // The per-breakpoint object is strict too, so an invented key such as
+          // `{ stack: true }` would sink the section from one level further down.
+          const kept: Record<string, unknown> = {};
+          for (const [key, item] of Object.entries(settings as Record<string, unknown>)) {
+            if (RESPONSIVE_KEYS.has(key)) kept[key] = item;
+          }
+          if (Object.keys(kept).length) usable[breakpoint] = kept;
+        }
+        known.responsive = usable;
+      }
+    }
+    for (const key of ['animation', 'responsive', 'variant', 'hidden'] as const) {
+      if (known[key] === undefined) delete known[key];   // let the schema default it
+    }
+    const props = (known.props && typeof known.props === 'object' && !Array.isArray(known.props))
+      ? known.props as Record<string, unknown>
+      : {};
+    known.props = Object.keys(extra).length ? { ...extra, ...props } : props;
+
+    const parsed = siteSectionSchema.safeParse(known);
+    if (parsed.success) sections.push(parsed.data);
+    else rejected.push({ index, reason: parsed.error.issues.map((i) => `${i.path.join('.') || 'section'}: ${i.message}`).join('; ').slice(0, 160) });
+  });
+  return { sections, rejected };
+}

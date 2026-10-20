@@ -5,6 +5,7 @@ import { requestContext } from './shared/context';
 import { connectDatabase, disconnectDatabase } from './infrastructure/database/prisma';
 import { getRedis, QUEUE_NAMES } from './infrastructure/queue/queue';
 import { workflowService, type Payload, type Target, type Trigger } from './application/crm/workflow.service';
+import { dispatchWhatsAppCampaign } from './application/messaging/whatsapp-campaign.service';
 import { campaignService } from './application/messaging/campaign.service';
 import { installAiMetering } from './application/ai/ai-usage.service';
 
@@ -51,6 +52,17 @@ async function bootstrap(): Promise<void> {
     QUEUE_NAMES.campaign,
     async (job: Job) => {
       const { campaignId, ctx } = job.data as { campaignId: string; ctx: JobCtx };
+      /*
+       * WhatsApp campaigns dispatch in resumable batches and can halt on a
+       * Meta billing refusal, so they have their own loop rather than the
+       * one-pass send the other channels use.
+       */
+      if (job.name === 'whatsapp-dispatch') {
+        const organizationId = ctx?.organizationId;
+        if (!organizationId) throw new Error('WhatsApp campaign job has no tenant');
+        await runInTenant('cmp', job.id, ctx, () => dispatchWhatsAppCampaign(campaignId, organizationId));
+        return;
+      }
       await runInTenant('cmp', job.id, ctx ?? {}, () => campaignService.sendNow(campaignId));
     },
     { connection, concurrency: 3 }, // lower — each job fans out to many sends

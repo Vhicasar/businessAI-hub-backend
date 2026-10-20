@@ -17,7 +17,8 @@ import type { AiProvider } from './ai-provider';
  * `Organization.settings.aiProvider`; the key is encrypted at rest (AES-256-GCM).
  */
 
-const PROVIDERS = ['openai', 'anthropic', 'gemini', 'deepseek', 'azure', 'ollama', 'openrouter', 'custom'] as const;
+/* DeepSeek removed — see the note on AI_PROVIDER in shared/config/env.ts. */
+const PROVIDERS = ['openai', 'anthropic', 'gemini', 'azure', 'ollama', 'openrouter', 'custom'] as const;
 
 export const aiAccountSchema = z.object({
   provider: z.enum(PROVIDERS),

@@ -112,7 +112,18 @@ const envSchema = z
     MAX_UPLOAD_MB: z.coerce.number().int().min(1).max(50).default(10),
 
     // --- AI (provider-agnostic; 'none' disables all AI features gracefully) ---
-    AI_PROVIDER: z.enum(['none', 'anthropic', 'openai', 'deepseek']).default('none'),
+    /*
+     * DeepSeek is deliberately absent.
+     *
+     * Google's Third Party Data Safety review refused verification while the
+     * product could route to DeepSeek at all, because DeepSeek's published
+     * terms reserve the right to train on submitted content — which the
+     * Limited Use requirement of the Google API Services User Data Policy
+     * forbids for data obtained from Google APIs. The data-policy gateway
+     * already stops Google data reaching any provider; removing the option
+     * removes the conflict rather than arguing about it.
+     */
+    AI_PROVIDER: z.enum(['none', 'anthropic', 'openai']).default('none'),
     AI_API_KEY: z.string().optional().or(z.literal('')),
     AI_MODEL: z.string().optional().or(z.literal('')),
     /** For OpenAI-compatible servers (Ollama, vLLM, OpenRouter…). */

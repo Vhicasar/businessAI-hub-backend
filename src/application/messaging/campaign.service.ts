@@ -13,6 +13,7 @@ import { AppError } from '../../shared/errors';
 import { pickChannelFor } from '../inbox/channel-allowance.service';
 import { smsWalletService } from '../billing/sms-wallet.service';
 import { smsSendService } from '../sms/sms-send.service';
+import { audienceService, segmentSchema, type SegmentDefinition } from './audience.service';
 
 function orgId(): string {
   const id = requestContext.get()?.organizationId;
@@ -20,7 +21,15 @@ function orgId(): string {
   return id;
 }
 
-// CampaignType → the ChannelType used to deliver it.
+/*
+ * CampaignType → the ChannelType used to deliver it.
+ *
+ * WhatsApp is deliberately absent from what this composer can create: a
+ * marketing message there must go out as an approved template against a
+ * specific Business Account, with Meta's own billing in the way, none of which
+ * a free-text body can express. It has its own builder. Existing WhatsApp
+ * campaigns still map here so their history keeps rendering.
+ */
 function channelFor(type: string): ChannelType {
   return type === 'SMS' ? 'SMS' : type === 'WHATSAPP' ? 'WHATSAPP' : 'EMAIL';
 }
@@ -30,20 +39,35 @@ const MAX_RECIPIENTS = 1000;
 
 export const createCampaignSchema = z.object({
   name: z.string().trim().min(1).max(160),
-  type: z.enum(['EMAIL', 'SMS', 'WHATSAPP']),
+  type: z.enum(['EMAIL', 'SMS']),
   subject: z.string().trim().max(200).nullable().optional(),
   body: z.string().trim().min(1).max(5000),
   imageUrl: z.string().url().max(2000).nullable().optional(),
   templateName: z.string().trim().max(512).nullable().optional(),
   templateLanguage: z.string().trim().max(20).default('en_US'),
-  audience: z.enum(['ALL_OPTED_IN', 'SELECTED']).default('ALL_OPTED_IN'),
+  audience: z.enum(['ALL_OPTED_IN', 'SELECTED', 'SEGMENT']).default('ALL_OPTED_IN'),
   recipientIds: z.array(z.string().cuid()).max(MAX_RECIPIENTS).default([]),
+  /**
+   * The same purchase-history segments the WhatsApp builder offers.
+   *
+   * Email and SMS had only "everyone opted in" or a list picked by hand, so
+   * reaching lapsed customers meant exporting a spreadsheet and pasting ids
+   * back in. The segment engine is channel-agnostic; only eligibility differs.
+   */
+  segment: segmentSchema.optional(),
 }).superRefine((value, ctx) => {
   if (value.audience === 'SELECTED' && value.recipientIds.length === 0) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ['recipientIds'],
       message: 'Select at least one contact',
+    });
+  }
+  if (value.audience === 'SEGMENT' && !value.segment) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['segment'],
+      message: 'Choose a segment',
     });
   }
 });
@@ -119,10 +143,10 @@ export const campaignService = {
   },
 
   /** Preview the reachable, opted-in audience size without sending. */
-  async audience(type: 'EMAIL' | 'SMS' | 'WHATSAPP') {
+  async audience(type: 'EMAIL' | 'SMS' | 'WHATSAPP', segment?: SegmentDefinition) {
     const channel = channelFor(type);
     const [customers, account] = await Promise.all([
-      this.reachableCustomers(channel),
+      this.audienceFor(channel, segment ? 'SEGMENT' : 'ALL_OPTED_IN', undefined, segment),
       // A marketing blast should go out of the channel the business set aside
       // for marketing, not whichever instance happens to be oldest — the
       // support inbox answering a campaign reply is not what anyone wants.
@@ -147,6 +171,33 @@ export const campaignService = {
       creditQuote,
       sample: customers.slice(0, 5).map((c) => c.firstName),
     };
+  },
+
+  /**
+   * The customers a campaign's audience setting resolves to.
+   *
+   * A segment goes through the shared engine, which applies consent,
+   * addressability and de-duplication for the channel in question. Everything
+   * else keeps the behaviour it had.
+   */
+  async audienceFor(
+    channel: ChannelType,
+    audience: string | undefined,
+    recipientIds: string[] | undefined,
+    segment: SegmentDefinition | undefined,
+  ) {
+    if (audience === 'SEGMENT' && segment) {
+      const resolved = await audienceService.resolve(
+        orgId(), segment, channel as 'EMAIL' | 'SMS' | 'WHATSAPP', MAX_RECIPIENTS,
+      );
+      return resolved.members.map((member) => ({
+        id: member.customerId,
+        firstName: member.firstName,
+        lastName: member.lastName,
+        phone: member.address,
+      }));
+    }
+    return this.reachableCustomers(channel, audience === 'SELECTED' ? recipientIds : undefined);
   },
 
   async reachableCustomers(channel: ChannelType, recipientIds?: string[]) {
@@ -208,10 +259,9 @@ export const campaignService = {
       throw new ConflictError('Campaign has already been sent');
     }
     const channel = channelFor(campaign.type);
-    const content = (campaign.content as { audience?: string; recipientIds?: string[] }) ?? {};
-    const selectedIds = content.audience === 'SELECTED' ? content.recipientIds ?? [] : undefined;
+    const content = (campaign.content as { audience?: string; recipientIds?: string[]; segment?: SegmentDefinition }) ?? {};
     const [customers, ent, account] = await Promise.all([
-      this.reachableCustomers(channel, selectedIds),
+      this.audienceFor(channel, content.audience, content.recipientIds, content.segment),
       resolveEntitlements(orgId()),
       // A marketing blast should go out of the channel the business set aside
       // for marketing, not whichever instance happens to be oldest — the
@@ -299,12 +349,12 @@ export const campaignService = {
       templateLanguage?: string;
       audience?: string;
       recipientIds?: string[];
+      segment?: SegmentDefinition;
     }) ?? {};
     const body = content.body ?? '';
     const imageUrl = content.imageUrl ?? '';
 
-    const selectedIds = content.audience === 'SELECTED' ? content.recipientIds ?? [] : undefined;
-    const customers = await this.reachableCustomers(channel, selectedIds);
+    const customers = await this.audienceFor(channel, content.audience, content.recipientIds, content.segment);
 
     /*
      * SMS goes through the SMS module rather than one message at a time.
@@ -368,7 +418,7 @@ export const campaignService = {
     let failed = 0;
     for (const c of customers) {
       // Attach the image by including its URL (email/WhatsApp preview it; SMS links it).
-      const text = renderTemplate(body, { firstName: c.firstName }) + (imageUrl ? `\n\n${imageUrl}` : '');
+      const text = renderTemplate(body, { firstName: c.firstName ?? '' }) + (imageUrl ? `\n\n${imageUrl}` : '');
       const outcome = await messagingService.sendToCustomer(c.id, channel, text, {
         campaignId: id,
         subject: campaign.subject ?? undefined,

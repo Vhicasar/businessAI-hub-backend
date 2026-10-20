@@ -98,9 +98,9 @@ export const FALLBACK: SiteCatalog = {
       ],
       fields: [], plans: ['growth'], auth: 'oauth' as const,
     },
-    ...['shopify', 'woocommerce', 'slack', 'zapier', 'openai', 'anthropic', 'gemini', 'deepseek'].map((id) => ({
+    ...['shopify', 'woocommerce', 'slack', 'zapier', 'openai', 'anthropic', 'gemini'].map((id) => ({
       id, name: id.split('_').map((v) => v.charAt(0).toUpperCase() + v.slice(1)).join(' '),
-      category: (['shopify', 'woocommerce'].includes(id) ? 'COMMERCE' : ['openai', 'anthropic', 'gemini', 'deepseek'].includes(id) ? 'AI' : 'PRODUCTIVITY') as CatalogIntegration['category'],
+      category: (['shopify', 'woocommerce'].includes(id) ? 'COMMERCE' : ['openai', 'anthropic', 'gemini'].includes(id) ? 'AI' : 'PRODUCTIVITY') as CatalogIntegration['category'],
       enabled: true, description: `Connect ${id.replace('_', ' ')} to your workspace.`, setupGuide: ['Create credentials in the provider dashboard.', 'Copy the API key or access token.', 'Paste it here and save the connection.'], fields: [{ key: 'apiKey', label: 'API key or access token', required: true, secret: true }], plans: ['business', 'enterprise'],
     })),
   ],

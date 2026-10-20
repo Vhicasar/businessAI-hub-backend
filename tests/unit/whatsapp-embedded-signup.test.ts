@@ -164,12 +164,25 @@ describe('a popup that returns nothing is recoverable', () => {
     expect(page).not.toMatch(/\n\s*startOAuth\.mutate\(c\.type\);/);
   });
 
-  it('nobody is asked to copy a link, and nobody is told to use a computer', () => {
+  /*
+   * Chrome skips the app handoff only when the address was typed, which no web
+   * page can arrange — so pasting the link into a new tab is the one route
+   * that always finishes, proved in the field on Android. The tab is still
+   * opened automatically, because it works on iOS and wherever the app is
+   * absent; the link stays visible for when it does not.
+   */
+  it('leaves the signup link in plain sight, not behind a modal', () => {
     const page = readFileSync(
       join(__dirname, '../../../web/src/features/settings/ChannelsSettingsPage.tsx'), 'utf8',
     );
-    expect(page).not.toMatch(/handoffUrl|setHandoff|Finish connecting WhatsApp on a computer/);
+    expect(page).toMatch(/setSignupLink\(data\.url\)/);
+    expect(page).toMatch(/clipboard\.writeText\(signupLink\)/);
+    // Shown inline next to the page's own banners, so nothing has to be closed.
+    expect(page).toMatch(/\{signupLink && \(\s*\n\s*<Alert/);
+    // Nobody is sent to a computer, and nobody is blocked from trying here.
     expect(page).not.toMatch(/needsComputer|COMPUTER_ONLY_NOTE/);
+    // A finished connection makes the link stale.
+    expect(page).toMatch(/setAwaitingProvider\(false\);\s*\n\s*setSignupLink\(null\);/);
   });
 
   it('hands the outcome back to the tab that asked, and closes', () => {

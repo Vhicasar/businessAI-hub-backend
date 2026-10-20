@@ -152,12 +152,12 @@ function build(src: AiConfigSource): AiProvider | null {
     case 'ollama':
     case 'vllm':
     case 'gemini':
-    case 'deepseek':
     case 'custom':
+      /* No DeepSeek branch — see the note on AI_PROVIDER in shared/config/env.ts. */
       return new OpenAiCompatibleProvider(
         src.apiKey ?? '',
-        src.model || (src.provider === 'deepseek' ? 'deepseek-chat' : 'gpt-4o-mini'),
-        src.baseUrl || (src.provider === 'deepseek' ? 'https://api.deepseek.com/v1' : undefined),
+        src.model || 'gpt-4o-mini',
+        src.baseUrl || undefined,
         src.provider,
       );
     default:

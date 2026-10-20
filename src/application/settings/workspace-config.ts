@@ -28,6 +28,19 @@ export interface WorkspaceConfig {
   };
   /** Admin limit overrides applied on top of the plan entitlements. */
   limits: Record<string, number>;
+  /**
+   * Meta's published WhatsApp rates, as entered by the platform administrator.
+   *
+   * Absent by default and absent on purpose: Meta exposes no pricing API, so
+   * an estimate is only as good as the day someone copied the rates across.
+   * Without this the product reports a cost as unavailable rather than
+   * guessing at what a business will be charged.
+   */
+  whatsappRateCard?: {
+    rates: { country: string; currency: string; marketing: number; utility?: number; authentication?: number }[];
+    effectiveDate: string;
+    source: string;
+  } | null;
   billing: { failedSubscriptionGraceDays: number };
   /** { [integrationId]: { enabled } } — admin can disable an integration. */
   integrations: Record<string, { enabled: boolean }>;
@@ -93,6 +106,7 @@ export interface WorkspaceConfigOverride {
   billing?: Partial<WorkspaceConfig['billing']>;
   integrations?: Record<string, { enabled: boolean }>;
   channels?: Record<string, Partial<ChannelPolicy>>;
+  whatsappRateCard?: WorkspaceConfig['whatsappRateCard'];
 }
 
 let override: WorkspaceConfigOverride | null = null;
@@ -110,6 +124,7 @@ export function getWorkspaceConfig(): WorkspaceConfig {
     communication: { ...DEFAULTS.communication, ...(override.communication ?? {}) },
     storage: { ...DEFAULTS.storage, ...(override.storage ?? {}) },
     limits: { ...DEFAULTS.limits, ...(override.limits ?? {}) },
+    whatsappRateCard: override.whatsappRateCard ?? DEFAULTS.whatsappRateCard ?? null,
     billing: { ...DEFAULTS.billing, ...(override.billing ?? {}) },
     integrations: { ...DEFAULTS.integrations, ...(override.integrations ?? {}) },
     // Each type is merged over the default individually, so the admin can set

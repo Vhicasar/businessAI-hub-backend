@@ -165,6 +165,54 @@ function main(): void {
       classifiers.map((f) => relative(SRC, f)).join(', '));
   }
 
+  /*
+   * Google's Third Party Data Safety review refused verification while the
+   * product could route to DeepSeek at all — its published terms reserve the
+   * right to train on submitted content, which the Limited Use requirement
+   * forbids for Google data. The gateway already blocked Google data reaching
+   * any provider; the option was removed so there is nothing left to argue.
+   */
+  console.log('\nNo AI provider Google has objected to');
+  {
+    const files = [
+      'src/shared/config/env.ts',
+      'src/application/ai/org-ai.service.ts',
+      'src/infrastructure/ai/index.ts',
+      'src/application/catalog/site-catalog.service.ts',
+    ];
+    const offending: string[] = [];
+    for (const file of files) {
+      const source = readFileSync(join(__dirname, '../../', file), 'utf8');
+      // Only selectable values count; the comments explaining the removal
+      // name DeepSeek on purpose and must not trip this.
+      for (const match of source.matchAll(/'deepseek'/gi)) {
+        const lineStart = source.lastIndexOf('\n', match.index!) + 1;
+        const line = source.slice(lineStart, source.indexOf('\n', match.index!));
+        if (!line.trimStart().startsWith('*') && !line.trimStart().startsWith('//')) {
+          offending.push(`${file}: ${line.trim().slice(0, 70)}`);
+        }
+      }
+    }
+    check('DeepSeek is not selectable as an AI provider', offending.length === 0, offending.join(' | '));
+  }
+
+  console.log('\nThe Limited Use statement is published where a reviewer can read it');
+  {
+    const pages = readFileSync(
+      '/Users/mac/Desktop/Development/web/businessAI-hub-home/src/data/pages.ts', 'utf8',
+    );
+    check('the privacy policy carries the affirmative statement',
+      /adhere to the Google User Data Policy, including the Limited Use requirements/.test(pages));
+    check('a dedicated Google user data page exists',
+      pages.includes("path: '/google-user-data'"));
+    check('it names the single scope the product requests',
+      pages.includes('auth/calendar.events.owned'));
+    const site = readFileSync(
+      '/Users/mac/Desktop/Development/web/businessAI-hub-home/src/data/site.ts', 'utf8',
+    );
+    check('and it is linked from the site footer', site.includes("href: '/google-user-data'"));
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 }

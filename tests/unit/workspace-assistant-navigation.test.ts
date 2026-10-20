@@ -49,9 +49,31 @@ describe('workspace assistant navigation registry', () => {
     const paths = WORKSPACE_DESTINATIONS.map((item) => item.path);
     expect(paths).not.toContain('/settings/billing');
     expect(paths).not.toContain('/settings/knowledge');
-    expect(paths).not.toContain('/website');
+    // Designs is still commented out of the router; the website builder is not.
     expect(paths).not.toContain('/designs');
     expect(paths.every((path) => !path.includes(':'))).toBe(true);
+  });
+
+  /*
+   * The assistant can only name a page this registry knows about, so a page
+   * that is live but missing here is a page the assistant will deny exists.
+   * That is exactly what happened to the website builder: asked "how do I
+   * create my website?", the assistant sent the business to the channels
+   * settings and said it saw no website-builder page in their workspace.
+   */
+  it('knows about the website builder', () => {
+    const website = WORKSPACE_DESTINATIONS.find((item) => item.path === '/website');
+    expect(website).toBeDefined();
+    expect(website?.permissions).toContain('marketing.read');
+    expect(website?.pathPatterns).toContain('/website/:siteId');
+    for (const word of ['website', 'website builder', 'publish website', 'custom domain']) {
+      expect(website?.keywords).toContain(word);
+    }
+  });
+
+  it('suggests it when somebody asks how to create a website', () => {
+    const paths = suggestions('How do I create my website?', context({}));
+    expect(paths).toContain('/website');
   });
 
   it('does not suggest a page the role cannot access', () => {

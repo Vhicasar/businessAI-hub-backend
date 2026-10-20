@@ -1,6 +1,7 @@
 import { prismaUnscoped } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { campaignService } from './campaign.service';
+import { whatsappCampaignService } from './whatsapp-campaign.service';
 import { logger } from '../../shared/logger';
 
 /**
@@ -27,14 +28,26 @@ import { logger } from '../../shared/logger';
  */
 const GRACE_HOURS = 6;
 
-export async function runScheduledCampaigns(now = new Date()): Promise<{ sent: number; stale: number }> {
+/**
+ * Send what is due.
+ *
+ * `organizationId` narrows the sweep to one business. Production never passes
+ * it — the sweep is platform-wide by design — but a test that wants to prove
+ * its own campaign goes out must not be able to fire everyone else's as a side
+ * effect.
+ */
+export async function runScheduledCampaigns(
+  now = new Date(),
+  organizationId?: string,
+): Promise<{ sent: number; stale: number }> {
   const due = await prismaUnscoped.campaign.findMany({
     where: {
       status: 'SCHEDULED',
       deletedAt: null,
       scheduledAt: { not: null, lte: now },
+      ...(organizationId ? { organizationId } : {}),
     },
-    select: { id: true, organizationId: true, name: true, scheduledAt: true },
+    select: { id: true, organizationId: true, name: true, scheduledAt: true, type: true },
     orderBy: { scheduledAt: 'asc' },
     take: 100,
   });
@@ -61,7 +74,15 @@ export async function runScheduledCampaigns(now = new Date()): Promise<{ sent: n
       // that business.
       await requestContext.run(
         { requestId: `campaign-${campaign.id}`, organizationId: campaign.organizationId },
-        () => campaignService.send(campaign.id),
+        /*
+         * WhatsApp dispatches in resumable batches and can halt on a Meta
+         * billing refusal, so it has its own path. Sending it through the
+         * generic one would ignore its template, its segment and the billing
+         * check — a scheduled WhatsApp campaign would simply never go out.
+         */
+        () => (campaign.type === 'WHATSAPP'
+          ? whatsappCampaignService.dispatch(campaign.id, campaign.organizationId)
+          : campaignService.send(campaign.id)),
       );
       sent += 1;
       logger.info({ campaignId: campaign.id, name: campaign.name }, 'Scheduled campaign sent');

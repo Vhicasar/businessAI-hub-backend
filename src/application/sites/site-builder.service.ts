@@ -8,13 +8,22 @@ import { getWorkspaceConfig } from '../settings/workspace-config';
 import { resolveEntitlements } from '../billing/entitlements';
 import { domainConfigService } from './domain-config.service';
 import { encrypt } from '../../shared/crypto';
+import { logger } from '../../shared/logger';
 import { addOnsService } from '../billing/add-ons.service';
-import { getAiProvider } from '../../infrastructure/ai';
+/*
+ * `resolveAi`, not `getAiProvider`: the website builder is an AI surface like
+ * any other, so it must run on the business's own provider when they have
+ * connected one. Reading the platform configuration directly meant a business
+ * that had set up its own key still had its website work billed to the
+ * platform's — and, when the platform key was empty, refused outright.
+ */
+import { resolveAi } from '../ai/org-ai.service';
+import { aiCredits } from '../billing/ai-credits';
 import { extractJson } from '../ai/ai-provider';
 import {
   DEFAULT_NAVIGATION, DEFAULT_SETTINGS, DEFAULT_THEME_V2, SITE_SCHEMA_VERSION,
   blankHomepage, normalizeSections, siteNavigationSchema, siteSectionSchema,
-  siteSettingsSchema, siteThemeSchema,
+  siteSettingsSchema, siteThemeSchema, coerceAiSections,
 } from './site-schema';
 
 const orgId = () => {
@@ -26,9 +35,52 @@ const orgId = () => {
 const userId = () => requestContext.get()?.userId ?? null;
 const SLUG = /^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$/;
 const SUBDOMAIN = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
-const RESERVED = new Set(['www', 'app', 'api', 'admin', 'mail', 'sites', 'docs', 'blog', 'help', 'status']);
+/**
+ * Subdomains a tenant may not claim.
+ *
+ * Not cosmetic. The website renderer is mounted last in this same app, after
+ * every application route, so a site published on a hostname the platform
+ * itself relies on would answer for every path those routes do not match —
+ * a tenant taking `api` or the deployment's own hostname would be serving
+ * their homepage at an address the business reads as ours.
+ *
+ * `SITE_RESERVED_SUBDOMAINS` extends this for a deployment whose
+ * infrastructure sits on other names under the same base domain.
+ */
+const RESERVED = new Set([
+  'www', 'app', 'api', 'admin', 'mail', 'sites', 'docs', 'blog', 'help', 'status',
+  // The platform's own and conventional service names.
+  'businesshub', 'hub', 'cdn', 'static', 'assets', 'media', 'files',
+  'smtp', 'imap', 'pop', 'webmail', 'mx', 'autodiscover', 'ns1', 'ns2', 'ftp',
+  'staging', 'auth', 'billing', 'portal',
+  ...String(process.env.SITE_RESERVED_SUBDOMAINS ?? '')
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean),
+]);
 const DOMAIN = /^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
-const CUSTOM_DOMAIN_TARGET = process.env.SITE_CUSTOM_DOMAIN_TARGET || 'sites.businesshub.ai';
+/**
+ * Where a customer's own domain has to point.
+ *
+ * This is the hostname of the server that will answer for their domain, so it
+ * belongs to the deployment, not to the source code. The platform
+ * administrator sets it in Vhicasar Admin → Deployments; a hardcoded default
+ * would hand every customer's DNS to somebody else's platform, and — worse —
+ * verification would then check against that same wrong name and could never
+ * pass, no matter what the customer did.
+ */
+async function customDomainTarget(): Promise<string> {
+  const config = await domainConfigService.active();
+  const target = config?.cnameTarget || process.env.SITE_CUSTOM_DOMAIN_TARGET;
+  if (!target) {
+    throw new AppError(
+      'SITE_HOSTING_NOT_CONFIGURED',
+      503,
+      'Managed website hosting is not configured by the platform administrator, so there is no address for a custom domain to point at.',
+    );
+  }
+  return target.toLowerCase();
+}
 
 export const pageSeoSchema = z.object({
   title: z.string().trim().max(120).optional().default(''),
@@ -42,7 +94,16 @@ const optionalPageSeoSchema = pageSeoSchema.nullish().transform((value) => pageS
 
 export const createWebsiteSchema = z.object({
   name: z.string().trim().min(2).max(120),
-  mode: z.enum(['BLANK', 'TEMPLATE', 'AI']),
+  /*
+   * "Build with AI" is paused. 'AI' is removed from what the API will accept,
+   * not merely hidden in the UI, so a saved request or a direct API call
+   * cannot start a generation the product is not currently offering.
+   *
+   * To re-enable: put 'AI' back here, restore the branch in `create` below,
+   * and uncomment the tab in web/src/features/website/WebsitePage.tsx. The
+   * generator (`aiDraft`) and its tests are left intact.
+   */
+  mode: z.enum(['BLANK', 'TEMPLATE']),
   templateId: z.string().max(80).optional(),
   prompt: z.string().trim().min(10).max(1500).optional(),
   theme: siteThemeSchema.optional(),
@@ -137,9 +198,30 @@ export function isLegacyAutoCreatedShell(site: {
   return !hasV2DesignTokens && !site.publishedAt && !site.publishedSnapshot && !site.subdomain && !site.customDomain && site.pages.length <= 1;
 }
 
+/**
+ * Turn whatever the model called a page into a usable slug.
+ *
+ * Models write `/contact`, `Contact Us`, or `contact-page/`. Replacing the bad
+ * characters one for one leaves `-contact`, which then fails validation and
+ * takes the whole build down at the last step — after the model has already
+ * been paid for and the pages are otherwise fine.
+ */
+export function pageSlug(value: unknown, index: number): string {
+  const slug = String(value ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 80)
+    .replace(/-$/, '');
+  return slug || `page-${index + 1}`;
+}
+
 async function aiDraft(name: string, prompt: string) {
-  const provider = getAiProvider('website');
-  if (!provider) throw new AppError('AI_PROVIDER_NOT_CONFIGURED', 503, 'AI website generation is not configured.');
+  const { provider, ownKey } = await resolveAi('website');
+  // Metered like every other AI feature; a business on its own key pays its
+  // own provider and is not charged plan credits twice.
+  if (!ownKey) await aiCredits.consume(orgId());
   const organization = await prisma.organization.findUnique({
     where: { id: orgId() },
     select: { name: true, businessType: true, website: true, city: true, country: true },
@@ -150,18 +232,41 @@ async function aiDraft(name: string, prompt: string) {
       content: 'Design a polished website using the supplied structured schema. Return JSON only with keys theme and pages. ' +
         'theme must contain colors, typography, layout, buttons. Each page contains title, slug and sections. ' +
         'Allowed section types: hero, products, properties, collections, services, features, about, stats, testimonials, gallery, video, logoCloud, team, faq, pricing, contact, newsletter, map, blog, cta, footer, spacer. ' +
-        'Each section must contain id, type, variant, hidden, props, responsive and animation. Never emit HTML, scripts, CSS or invented business claims. Use data binding for products/properties rather than copying records.',
+        'Each section is {id, type, variant, hidden, props, responsive, animation}. `id` is a string starting sec_. `variant` is a short string. `hidden` is a boolean. `props` holds that section\'s content. `responsive` is optional and, when present, maps desktop/tablet/mobile to {hidden?: boolean, columns?: 1-6, align?: left|center|right, paddingY?: number, fontScale?: number} — never to a string. `animation` is optional and is exactly one of none, fade, reveal, slide-up, scale — a plain string, never an object. Omit responsive and animation entirely unless they add something. ' +
+        'Never emit HTML, scripts, CSS or invented business claims. Use data binding for products/properties rather than copying records.',
     },
     { role: 'user', content: JSON.stringify({ request: prompt, websiteName: name, business: organization }) },
-  ], { maxTokens: 3000, temperature: .55, jsonMode: true, dataSources: ['user_provided', 'vhicasar_business'] });
+  ], { maxTokens: 8000, temperature: .55, jsonMode: true, dataSources: ['user_provided', 'vhicasar_business'] });
   const parsed = extractJson<{ theme?: unknown; pages?: { title?: string; slug?: string; sections?: unknown }[] }>(raw);
+  /*
+   * A whole site — theme plus every page — does not fit in 3000 tokens, and a
+   * truncated reply is unparseable JSON that arrived here as the same blank
+   * "invalid website" the business was shown. Distinguish the two, and say
+   * which happened in the log, because the model's reply used to be discarded
+   * and the failure was impossible to diagnose after the fact.
+   */
+  if (!parsed) {
+    logger.warn({ organizationId: orgId(), rawLength: raw.length, sample: raw.slice(0, 400) }, 'AI website generation returned no parseable JSON');
+    throw new AppError('AI_WEBSITE_INVALID', 502, 'The AI response was cut short or unreadable. Try again, or shorten the description.');
+  }
   const theme = siteThemeSchema.safeParse(parsed?.theme);
-  const pages = (parsed?.pages ?? []).slice(0, 10).map((page, index) => ({
-    title: String(page.title || (index === 0 ? 'Home' : `Page ${index + 1}`)).slice(0, 120),
-    slug: index === 0 ? '' : String(page.slug ?? `page-${index + 1}`).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 80),
-    sections: normalizeSections(page.sections),
-  })).filter((page) => page.sections.length);
-  if (!pages.length) throw new AppError('AI_WEBSITE_INVALID', 502, 'The AI did not return a valid editable website. Please try again.');
+  const rejections: { page: number; index: number; reason: string }[] = [];
+  const pages = (parsed?.pages ?? []).slice(0, 10).map((page, index) => {
+    const { sections, rejected } = coerceAiSections(page.sections);
+    rejected.forEach((item) => rejections.push({ page: index, ...item }));
+    return {
+      title: String(page.title || (index === 0 ? 'Home' : `Page ${index + 1}`)).slice(0, 120),
+      slug: index === 0 ? '' : pageSlug(page.slug, index),
+      sections,
+    };
+  }).filter((page) => page.sections.length);
+  if (rejections.length) {
+    logger.warn({ organizationId: orgId(), rejected: rejections.slice(0, 10), kept: pages.length }, 'Some AI website sections could not be used');
+  }
+  if (!pages.length) {
+    logger.warn({ organizationId: orgId(), pagesReturned: parsed?.pages?.length ?? 0, rejected: rejections.slice(0, 10) }, 'AI website generation produced no usable page');
+    throw new AppError('AI_WEBSITE_INVALID', 502, 'The AI did not return a usable website layout. Try again, or describe the pages you want in more detail.');
+  }
   return { theme: theme.success ? theme.data : DEFAULT_THEME_V2, pages };
 }
 
@@ -176,10 +281,26 @@ export const siteBuilderService = {
       limitForOrganization(organizationId),
     ]);
     const sites = allSites.filter((site) => !isLegacyAutoCreatedShell(site));
-    return { sites, limit, used: sites.length };
+    /*
+     * The live address is answered here, not assembled in the browser.
+     *
+     * It depends on the active deployment configuration, which the client has
+     * no business guessing — two places in the editor used to build it from a
+     * hardcoded domain and showed every customer a hostname that does not
+     * exist.
+     */
+    const baseDomain = (await domainConfigService.active())?.baseDomain ?? null;
+    return {
+      sites: sites.map((site) => ({ ...site, publicUrl: publicUrl(site, baseDomain) })),
+      limit,
+      used: sites.length,
+    };
   },
 
-  get: loadSite,
+  async get(id: string) {
+    const [site, config] = await Promise.all([loadSite(id), domainConfigService.active()]);
+    return { ...site, publicUrl: publicUrl(site, config?.baseDomain ?? null) };
+  },
 
   async create(input: z.infer<typeof createWebsiteSchema>) {
     const organizationId = orgId();
@@ -193,12 +314,13 @@ export const siteBuilderService = {
 
     let theme = input.theme ?? DEFAULT_THEME_V2;
     let pages = input.pages;
-    if (input.mode === 'AI') {
-      if (!input.prompt) throw new ValidationError('Describe the website you want to create');
-      const generated = await aiDraft(input.name, input.prompt);
-      theme = generated.theme;
-      pages = generated.pages;
-    }
+    // Paused — see the note on `mode` above.
+    // if (input.mode === 'AI') {
+    //   if (!input.prompt) throw new ValidationError('Describe the website you want to create');
+    //   const generated = await aiDraft(input.name, input.prompt);
+    //   theme = generated.theme;
+    //   pages = generated.pages;
+    // }
     if (!pages?.length) pages = [{ title: 'Home', slug: '', sections: blankHomepage(input.name) }];
     const seen = new Set<string>();
     for (const page of pages) {
@@ -314,17 +436,32 @@ export const siteBuilderService = {
     const collision = await prismaUnscoped.site.findFirst({ where: { customDomain: domain, id: { not: id } }, select: { id: true } });
     if (collision) throw new ConflictError('This domain is already connected to another website');
     const token = `vh_${randomUUID().replace(/-/g, '')}`;
+    const target = await customDomainTarget();
     const site = await prisma.site.update({ where: { id }, data: { customDomain: domain, domainVerificationToken: token, domainVerifiedAt: null } });
-    return { site, dns: { cname: { host: domain, value: CUSTOM_DOMAIN_TARGET }, txt: { host: `_vhicasar.${domain}`, value: token } } };
+    return { site, dns: { cname: { host: domain, value: target }, txt: { host: `_vhicasar.${domain}`, value: token } } };
   },
 
   async verifyDomain(id: string) {
     const site = await loadSite(id);
     if (!site.customDomain || !site.domainVerificationToken) throw new ValidationError('Connect a domain first');
+    const target = await customDomainTarget();
     let cnameVerified = false; let txtVerified = false;
-    try { cnameVerified = (await resolveCname(site.customDomain)).some((entry) => entry.replace(/\.$/, '').toLowerCase() === CUSTOM_DOMAIN_TARGET); } catch { /* DNS propagation. */ }
+    try { cnameVerified = (await resolveCname(site.customDomain)).some((entry) => entry.replace(/\.$/, '').toLowerCase() === target); } catch { /* DNS propagation. */ }
     try { txtVerified = (await resolveTxt(`_vhicasar.${site.customDomain}`)).flat().some((entry) => entry === site.domainVerificationToken); } catch { /* DNS propagation. */ }
-    if (!cnameVerified || !txtVerified) return { verified: false, cnameVerified, txtVerified, reason: 'DNS records are not visible yet. Propagation can take up to 48 hours.' };
+    if (!cnameVerified || !txtVerified) {
+      // Repeat what the records must say. A bare "not visible yet" leaves
+      // somebody staring at their DNS panel with nothing to compare against.
+      return {
+        verified: false,
+        cnameVerified,
+        txtVerified,
+        expected: {
+          cname: { host: site.customDomain, value: target },
+          txt: { host: `_vhicasar.${site.customDomain}`, value: site.domainVerificationToken },
+        },
+        reason: 'DNS records are not visible yet. Propagation can take up to 48 hours.',
+      };
+    }
     await prisma.site.update({ where: { id }, data: { domainVerifiedAt: new Date() } });
     return { verified: true, cnameVerified: true, txtVerified: true };
   },
@@ -367,19 +504,29 @@ export const siteBuilderService = {
     const site = await loadSite(siteId);
     const page = site.pages.find((entry) => entry.id === input.pageId);
     if (!page) throw new NotFoundError('Website page');
-    const provider = getAiProvider('website');
-    if (!provider) throw new AppError('AI_PROVIDER_NOT_CONFIGURED', 503, 'AI website editing is not configured.');
+    const { provider, ownKey } = await resolveAi('website');
+    if (!ownKey) await aiCredits.consume(site.organizationId);
     await this.snapshot(siteId, 'Before AI edit');
     const raw = await provider.complete([
       {
         role: 'system',
-        content: 'You edit a structured website page. Return JSON only as {"sections": [...]}. Preserve section ids for edited sections and create ids beginning with sec_ for new sections. Allowed types: hero, products, properties, collections, services, features, about, stats, testimonials, gallery, video, logoCloud, team, faq, pricing, contact, newsletter, map, blog, cta, footer, spacer. Never emit code, HTML, CSS or scripts. Preserve data bindings and never copy private business records into props.',
+        content: 'You edit a structured website page. Return JSON only as {"sections": [...]}. Preserve section ids for edited sections and create ids beginning with sec_ for new sections. `responsive`, when present, maps desktop/tablet/mobile to {hidden?, columns?, align?, paddingY?, fontScale?} — never to a string; `animation` is one of none, fade, reveal, slide-up, scale as a plain string. Omit both unless they add something. Allowed types: hero, products, properties, collections, services, features, about, stats, testimonials, gallery, video, logoCloud, team, faq, pricing, contact, newsletter, map, blog, cta, footer, spacer. Never emit code, HTML, CSS or scripts. Preserve data bindings and never copy private business records into props.',
       },
       { role: 'user', content: JSON.stringify({ instruction: input.instruction, sections: page.blocks, theme: site.theme }) },
     ], { maxTokens: 3000, temperature: .35, jsonMode: true, dataSources: ['user_provided', 'vhicasar_business'] });
     const parsed = extractJson<{ sections?: unknown }>(raw);
-    const sections = normalizeSections(parsed?.sections);
-    if (!sections.length) throw new AppError('AI_WEBSITE_INVALID', 502, 'The AI edit did not return a valid website structure.');
+    if (!parsed) {
+      logger.warn({ siteId, rawLength: raw.length, sample: raw.slice(0, 400) }, 'AI website edit returned no parseable JSON');
+      throw new AppError('AI_WEBSITE_INVALID', 502, 'The AI response was cut short or unreadable. Try again, or ask for a smaller change.');
+    }
+    const { sections, rejected } = coerceAiSections(parsed?.sections);
+    if (rejected.length) {
+      logger.warn({ siteId, rejected: rejected.slice(0, 10), kept: sections.length }, 'Some AI-edited sections could not be used');
+    }
+    if (!sections.length) {
+      logger.warn({ siteId, rejected: rejected.slice(0, 10) }, 'AI website edit produced no usable section');
+      throw new AppError('AI_WEBSITE_INVALID', 502, 'The AI edit did not produce a usable layout. Try rephrasing the instruction.');
+    }
     await prisma.sitePage.update({ where: { id: page.id }, data: { blocks: sections as object } });
     await prisma.site.update({ where: { id: siteId }, data: { lastEditedByUserId: userId() } });
     return { pageId: page.id, sections };

@@ -1,5 +1,5 @@
 import type { AiCompletionOptions, AiMessage, AiProvider } from '../../application/ai/ai-provider';
-import { AppError } from '../../shared/errors';
+import { providerError } from './provider-error';
 
 /** Anthropic Messages API via fetch — no SDK dependency. */
 export class AnthropicProvider implements AiProvider {
@@ -52,7 +52,7 @@ export class AnthropicProvider implements AiProvider {
         }
       : null;
     if (!res.ok) {
-      throw new AppError('AI_PROVIDER_ERROR', 502, `Anthropic: ${json.error?.message ?? res.status}`);
+      throw providerError('anthropic', json.error?.message ?? '', res.status);
     }
     return (json.content ?? [])
       .filter((b) => b.type === 'text')
