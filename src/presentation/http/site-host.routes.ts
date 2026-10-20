@@ -10,6 +10,7 @@ import { ordersService } from '../../application/orders/orders.service';
 import { paymentLinksService } from '../../application/payments/payment-links.service';
 import { resolveEntitlements } from '../../application/billing/entitlements';
 import { ValidationError } from '../../shared/errors';
+import { logger } from '../../shared/logger';
 import { domainConfigService } from '../../application/sites/domain-config.service';
 
 export const siteHostRoutes = Router();
@@ -100,6 +101,49 @@ async function checkout(site: { id: string; organizationId: string; publishedSna
     return { orderId: order.id, url: payment.url };
   });
 }
+
+/**
+ * Whether this platform will serve a given hostname — Caddy's `ask` endpoint.
+ *
+ * On-demand TLS issues a certificate the first time a hostname is requested,
+ * which is the only practical way to cover both tenant subdomains and the
+ * custom domains businesses bring. Without an `ask` endpoint it will do that
+ * for *any* hostname pointed at the server, so a stranger could burn the
+ * platform's Let's Encrypt rate limit with names we have never heard of.
+ *
+ * This answers the one question Caddy asks: do we serve this? 200 for a
+ * published site or a verified custom domain, 404 for anything else.
+ */
+siteHostRoutes.get('/tls-check', async (req, res, next) => {
+  try {
+    const domain = String(req.query.domain ?? '').toLowerCase().trim();
+    if (!domain || domain.length > 253) return res.status(404).send('no');
+
+    const config = await domainConfigService.active();
+    const baseDomain = config?.baseDomain.toLowerCase();
+
+    // A published subdomain of the platform's own website domain.
+    if (baseDomain && domain.endsWith(`.${baseDomain}`)) {
+      const subdomain = domain.slice(0, -(`.${baseDomain}`.length));
+      if (subdomain && !subdomain.includes('.')) {
+        const site = await prismaUnscoped.site.findFirst({
+          where: { subdomain, status: 'PUBLISHED' }, select: { id: true },
+        });
+        if (site) return res.status(200).send('ok');
+      }
+    }
+
+    // A customer's own domain, but only once they have proved they own it.
+    const custom = await prismaUnscoped.site.findFirst({
+      where: { customDomain: domain, domainVerifiedAt: { not: null }, status: 'PUBLISHED' },
+      select: { id: true },
+    });
+    if (custom) return res.status(200).send('ok');
+
+    logger.info({ domain }, 'Refused a certificate request for an unknown hostname');
+    return res.status(404).send('no');
+  } catch (error) { next(error); }
+});
 
 siteHostRoutes.post('/:subdomain/forms/:kind', async (req, res, next) => {
   try {

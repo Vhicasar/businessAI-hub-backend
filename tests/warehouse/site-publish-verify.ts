@@ -105,6 +105,17 @@ async function main() {
   const missing = await sitePublicService.resolve(sub, 'no-such-page', 'subdomain');
   check('an unknown path renders nothing rather than the homepage', !missing);
 
+  /*
+   * The address has to come back from publish itself.
+   *
+   * It used to return the bare row, so the editor had nothing to show at the
+   * one moment it mattered and the person was left guessing their own URL.
+   */
+  check('publish returns the address the site is now reachable at',
+    typeof (published as { publicUrl?: string }).publicUrl === 'string'
+      && (published as { publicUrl: string }).publicUrl === `https://${sub}.${config?.baseDomain}`,
+    String((published as { publicUrl?: string }).publicUrl));
+
   // ── 5b. Over real HTTP, through the host router ──────────────────────────
   console.log('\nServing over HTTP (localhost:4999)');
   const base = 'http://127.0.0.1:4999';
@@ -138,6 +149,29 @@ async function main() {
     check('and serves that site, by host alone', hostBody.includes('E2E Shop'));
   }
 
+  // ── 5c. The certificate gate ────────────────────────────────────────────
+  /*
+   * Caddy's on-demand TLS asks this before requesting a certificate. Without
+   * it, anyone who points a domain at the server can make the platform ask
+   * Let's Encrypt for a certificate, and the rate limit is shared.
+   */
+  console.log('\nCertificate requests are only allowed for hostnames we serve');
+  {
+    const ask = async (domain: string) => {
+      const r = await fetch(`${base}/site/tls-check?domain=${encodeURIComponent(domain)}`);
+      return r.status;
+    };
+    check('a published site may get a certificate',
+      await ask(`${sub}.${config?.baseDomain}`) === 200);
+    check('an unknown subdomain may not',
+      await ask(`not-a-real-site.${config?.baseDomain}`) === 404);
+    check('a stranger\'s domain may not',
+      await ask('someone-elses-domain.example') === 404);
+    check('an unverified custom domain may not',
+      await ask('www.e2e-example.invalid') === 404);
+    check('and nonsense is refused rather than erroring', await ask('') === 404);
+  }
+
   // ── 6. Draft edits must not touch what is live ──────────────────────────
   console.log('\nDraft isolation');
   const home = pages.find((p) => p.isHome) as { id: string };
@@ -166,6 +200,9 @@ async function main() {
   await asOrg(() => siteBuilderService.unpublish(siteId));
   const afterUnpublish = await sitePublicService.resolve(sub, '', 'subdomain');
   check('an unpublished site stops serving', !afterUnpublish);
+  const unpublished = await asOrg(() => siteBuilderService.get(siteId));
+  check('and the editor still gets a consistent shape back',
+    'publicUrl' in (unpublished as object));
 
   await cleanup();
   console.log(`\n${passed} passed, ${failed} failed`);

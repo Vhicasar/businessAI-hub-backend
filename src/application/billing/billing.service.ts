@@ -2,6 +2,8 @@ import { z } from 'zod';
 import type { Plan, Subscription } from '@prisma/client';
 import { prismaUnscoped } from '../../infrastructure/database/prisma';
 import { logger } from '../../shared/logger';
+import { planMigrationService } from './plan-migration.service';
+import { currentVersion } from './plan-versions';
 import { AppError, NotFoundError } from '../../shared/errors';
 import { getActivePaymentProvider, getChargeCurrencies } from '../../infrastructure/payments';
 import type { NormalizedWebhookEvent, PaymentProvider } from '../../infrastructure/payments';
@@ -463,7 +465,7 @@ export const billingService = {
     if (dup) return;
     const sub = await prismaUnscoped.subscription.findFirst({
       where: { providerSubscriptionCode: event.subscriptionCode },
-      include: { plan: true },
+      include: { plan: true, planVersion: true },
     });
     if (!sub) {
       logger.warn({ event }, 'Renewal for unknown subscription code');
@@ -471,6 +473,16 @@ export const billingService = {
     }
     const now = new Date();
     const end = addInterval(now, sub.interval as Interval);
+    /*
+     * Renewal is where a scheduled migration lands.
+     *
+     * "At next renewal" is the safe default for a version that costs more or
+     * takes something away, and this is the moment it becomes true. Applied
+     * before the billing record is written so the business is charged the
+     * version they are actually on.
+     */
+    const applied = await planMigrationService.applyPendingAtRenewal(sub.id);
+    const terms = applied ?? sub.planVersion ?? sub.plan;
     await prismaUnscoped.subscription.update({
       where: { id: sub.id },
       data: { status: 'ACTIVE', pastDueAt: null, currentPeriodStart: now, currentPeriodEnd: end },
@@ -478,8 +490,8 @@ export const billingService = {
     await prismaUnscoped.billingRecord.create({
       data: {
         subscriptionId: sub.id,
-        amount: sub.interval === 'YEARLY' ? Number(sub.plan.priceYearly) : Number(sub.plan.priceMonthly),
-        currency: sub.plan.currency,
+        amount: sub.interval === 'YEARLY' ? Number(terms.priceYearly) : Number(terms.priceMonthly),
+        currency: terms.currency,
         status: 'PAID',
         periodStart: now,
         periodEnd: end,
@@ -669,8 +681,20 @@ export const billingService = {
       orderBy: { createdAt: 'desc' },
     });
 
+    /*
+     * A new or changed subscription takes the version being sold today.
+     *
+     * Never an older one: a legacy version exists to protect the people
+     * already on it, not to be handed out again. If a plan somehow has no
+     * version the pointer is left null and entitlements fall back to the plan
+     * row, which is the pre-versioning behaviour rather than a failure.
+     */
+    const version = await currentVersion(params.planId);
     const data = {
       planId: params.planId,
+      planVersionId: version?.id ?? null,
+      pendingPlanVersionId: null,
+      grandfathered: false,
       interval: params.interval,
       status: 'ACTIVE' as const,
       currentPeriodStart: now,
@@ -692,6 +716,29 @@ export const billingService = {
           data: { organizationId: params.orgId, ...data },
           include: { plan: true },
         });
+
+    /*
+     * A line in the business's own history. Written here rather than inferred
+     * later, because "what were they on in March" cannot be reconstructed
+     * from a plan row that has been edited since.
+     */
+    await prismaUnscoped.subscriptionHistory.updateMany({
+      where: { subscriptionId: sub.id, endedAt: null },
+      data: { endedAt: now },
+    });
+    await prismaUnscoped.subscriptionHistory.create({
+      data: {
+        organizationId: params.orgId,
+        subscriptionId: sub.id,
+        planId: params.planId,
+        planVersionId: version?.id ?? null,
+        version: version?.version ?? null,
+        priceMonthly: version ? version.priceMonthly : sub.plan.priceMonthly,
+        currency: version?.currency ?? sub.plan.currency,
+        interval: params.interval,
+        changeType: existing ? 'UPGRADED' : 'SUBSCRIBED',
+      },
+    }).catch((err) => logger.warn({ err, orgId: params.orgId }, 'Could not record subscription history'));
 
     if (params.amount > 0 && params.providerRef) {
       const dup = await prismaUnscoped.billingRecord.findFirst({

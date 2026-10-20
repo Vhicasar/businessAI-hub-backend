@@ -270,6 +270,19 @@ async function aiDraft(name: string, prompt: string) {
   return { theme: theme.success ? theme.data : DEFAULT_THEME_V2, pages };
 }
 
+/**
+ * A site, with the address it is actually reachable at.
+ *
+ * Every path that hands a site back to the editor goes through this, because
+ * the one moment the address matters most is immediately after publishing —
+ * and `publish` used to return the bare row, so the screen had nothing to
+ * show and the person had to guess their own URL.
+ */
+async function withPublicUrl(id: string) {
+  const [site, config] = await Promise.all([loadSite(id), domainConfigService.active()]);
+  return { ...site, publicUrl: publicUrl(site, config?.baseDomain ?? null) };
+}
+
 export const siteBuilderService = {
   async list() {
     const organizationId = orgId();
@@ -298,8 +311,7 @@ export const siteBuilderService = {
   },
 
   async get(id: string) {
-    const [site, config] = await Promise.all([loadSite(id), domainConfigService.active()]);
-    return { ...site, publicUrl: publicUrl(site, config?.baseDomain ?? null) };
+    return withPublicUrl(id);
   },
 
   async create(input: z.infer<typeof createWebsiteSchema>) {
@@ -541,7 +553,7 @@ export const siteBuilderService = {
       ...(oldHome && oldHome.id !== pageId ? [prisma.sitePage.update({ where: { id: oldHome.id }, data: { isHome: false, slug: oldHome.slug || 'home' } })] : []),
       prisma.sitePage.update({ where: { id: pageId }, data: { isHome: true, slug: '' } }),
     ]);
-    return loadSite(siteId);
+    return withPublicUrl(siteId);
   },
 
   async deletePage(siteId: string, pageId: string) {
@@ -577,7 +589,7 @@ export const siteBuilderService = {
       prisma.sitePage.deleteMany({ where: { siteId: id } }),
       ...value.pages.map((page, position) => prisma.sitePage.create({ data: { organizationId: site.organizationId, siteId: id, title: page.title, slug: page.slug, blocks: page.sections as object, seo: (page.seo ?? {}) as object, isHome: page.isHome, showInNav: page.showInNav, status: page.status, position } })),
     ]);
-    return loadSite(id);
+    return withPublicUrl(id);
   },
 
   async publish(id: string, subdomain: string) {
@@ -608,12 +620,15 @@ export const siteBuilderService = {
       await prisma.site.update({ where: { id }, data: { status: 'FAILED', publishError: 'Publishing failed. The previous live version is still available.' } }).catch(() => undefined);
       throw error;
     }
-    return loadSite(id);
+    return withPublicUrl(id);
   },
 
   async unpublish(id: string) {
     await loadSite(id);
-    return prisma.site.update({ where: { id }, data: { status: 'UNPUBLISHED', unpublishedAt: new Date() }, include: { pages: { orderBy: { position: 'asc' } } } });
+    await prisma.site.update({ where: { id }, data: { status: 'UNPUBLISHED', unpublishedAt: new Date() } });
+    // Same shape as every other site response, so the editor does not have to
+    // special-case which call it just made.
+    return withPublicUrl(id);
   },
 
   async analytics(id: string, days = 30) {

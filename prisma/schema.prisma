@@ -4435,6 +4435,12 @@ model Plan {
   updatedAt         DateTime @updatedAt
 
   subscriptions Subscription[]
+  versions      PlanVersion[]
+  migrations    PlanMigration[]
+
+  /// The version new subscribers get. Null only before the first version is
+  /// cut, which the backfill migration does for every existing plan.
+  currentVersionId String? @unique
 }
 
 /// Maps a local plan (× interval × currency) to the recurring plan created in a
@@ -4459,6 +4465,145 @@ model ProviderPlan {
   @@index([provider, providerPlanCode])
 }
 
+/// An immutable snapshot of a plan's commercial terms.
+///
+/// A plan row is a moving target: the admin edits it and the sync rewrites it,
+/// which used to change what every existing subscriber was entitled to,
+/// silently and retroactively. A version records what was true when somebody
+/// subscribed, so their entitlements stop depending on what the plan says
+/// today. Versions are never edited once published and never deleted.
+model PlanVersion {
+  id                String    @id @default(cuid())
+  planId            String
+  /// 1, 2, 3 … within the plan. Shown to admins as "v2".
+  version           Int
+  priceMonthly      Decimal   @db.Decimal(14, 2)
+  priceYearly       Decimal   @db.Decimal(14, 2)
+  currency          String    @db.Char(3)
+  prices            Json?
+  maxUsers          Int?
+  maxBranches       Int?
+  maxProducts       Int?
+  maxChannels       Int?
+  maxContacts       Int?
+  maxMarketingReach Int?
+  aiCreditsMonthly  Int?
+  features          Json
+  /// What the admin changed and why, for the version history.
+  notes             String?
+  /// Null while a draft; set once it may be sold.
+  publishedAt       DateTime?
+  /// Set when a newer version supersedes it. Retired versions keep serving
+  /// their existing subscribers; they are only hidden from new ones.
+  retiredAt         DateTime?
+  createdByUserId   String?
+  createdAt         DateTime  @default(now())
+
+  plan          Plan                  @relation(fields: [planId], references: [id])
+  subscriptions Subscription[]        @relation("SubscriptionPlanVersion")
+  pending       Subscription[]        @relation("SubscriptionPendingVersion")
+  historyRows   SubscriptionHistory[]
+  migratedFrom  PlanMigration[]       @relation("MigrationFrom")
+  migratedTo    PlanMigration[]       @relation("MigrationTo")
+
+  @@unique([planId, version])
+  @@index([planId, publishedAt])
+}
+
+/// One administrator's decision to move subscribers from one version to another.
+///
+/// Recorded before anything moves, so a run that dies halfway can be resumed
+/// and so the decision itself — who, when, which strategy, how many affected —
+/// survives independently of the subscriptions it touched.
+model PlanMigration {
+  id                String           @id @default(cuid())
+  planId            String
+  fromVersionId     String
+  toVersionId       String
+  timing            MigrationTiming  @default(NEXT_RENEWAL)
+  pricing           MigrationPricing @default(APPLY_AT_RENEWAL)
+  status            MigrationStatus  @default(PENDING)
+  /// Counted when the migration is created, so the admin's confirmation and
+  /// the work agree on the number even if subscriptions change afterwards.
+  totalCount        Int              @default(0)
+  migratedCount     Int              @default(0)
+  failedCount       Int              @default(0)
+  reason            String?
+  initiatedByUserId String?
+  initiatedByEmail  String?
+  createdAt         DateTime         @default(now())
+  startedAt         DateTime?
+  completedAt       DateTime?
+
+  plan        Plan                  @relation(fields: [planId], references: [id])
+  fromVersion PlanVersion           @relation("MigrationFrom", fields: [fromVersionId], references: [id])
+  toVersion   PlanVersion           @relation("MigrationTo", fields: [toVersionId], references: [id])
+  history     SubscriptionHistory[]
+
+  @@index([planId, status])
+}
+
+/// What a business was on, and when.
+///
+/// Written on subscribe, on migration and on any version change, so "which
+/// terms applied in March" is answerable without inferring it from the plan's
+/// current state.
+model SubscriptionHistory {
+  id             String                 @id @default(cuid())
+  organizationId String
+  subscriptionId String
+  planId         String
+  planVersionId  String?
+  version        Int?
+  priceMonthly   Decimal?               @db.Decimal(14, 2)
+  currency       String?                @db.Char(3)
+  interval       PlanInterval?
+  changeType     SubscriptionChangeType
+  startedAt      DateTime               @default(now())
+  endedAt        DateTime?
+  migrationId    String?
+  initiatedBy    String?
+  reason         String?
+  createdAt      DateTime               @default(now())
+
+  planVersion PlanVersion?   @relation(fields: [planVersionId], references: [id])
+  migration   PlanMigration? @relation(fields: [migrationId], references: [id])
+
+  @@index([organizationId, startedAt])
+  @@index([subscriptionId])
+}
+
+enum MigrationTiming {
+  IMMEDIATE
+  NEXT_RENEWAL
+}
+
+enum MigrationPricing {
+  /// Charge the old price until the period ends, then the new one.
+  KEEP_UNTIL_RENEWAL
+  /// New price from now.
+  APPLY_IMMEDIATELY
+  /// New price from the next renewal.
+  APPLY_AT_RENEWAL
+}
+
+enum MigrationStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  /// Some subscriptions moved, some did not. Resumable.
+  PARTIAL
+  CANCELLED
+}
+
+enum SubscriptionChangeType {
+  SUBSCRIBED
+  MIGRATED
+  UPGRADED
+  DOWNGRADED
+  CANCELLED
+}
+
 model Subscription {
   id                       String             @id @default(cuid())
   organizationId           String
@@ -4475,11 +4620,22 @@ model Subscription {
   provider                 String?
   providerCustomerCode     String?
   providerSubscriptionCode String?
+  /// The exact terms governing this subscription. Nullable only so the
+  /// backfill can run; every row has one afterwards, and entitlements fall
+  /// back to the plan row if it is ever missing rather than failing closed.
+  planVersionId            String?
+  /// A migration scheduled for the next renewal. Entitlements ignore it until
+  /// it is applied, which is the whole point of scheduling.
+  pendingPlanVersionId     String?
+  /// Left on an older version by an administrator's explicit choice.
+  grandfathered            Boolean            @default(false)
   createdAt                DateTime           @default(now())
   updatedAt                DateTime           @updatedAt
 
   organization   Organization    @relation(fields: [organizationId], references: [id])
   plan           Plan            @relation(fields: [planId], references: [id])
+  planVersion    PlanVersion?    @relation("SubscriptionPlanVersion", fields: [planVersionId], references: [id])
+  pendingVersion PlanVersion?    @relation("SubscriptionPendingVersion", fields: [pendingPlanVersionId], references: [id])
   billingRecords BillingRecord[]
 
   @@index([organizationId, status])

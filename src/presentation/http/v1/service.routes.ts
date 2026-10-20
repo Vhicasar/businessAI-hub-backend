@@ -7,6 +7,8 @@ import { logger } from '../../../shared/logger';
 import { ForbiddenError, NotFoundError } from '../../../shared/errors';
 import { prismaUnscoped } from '../../../infrastructure/database/prisma';
 import { domainConfigSchema, domainConfigService } from '../../../application/sites/domain-config.service';
+import { migrationSchema, planMigrationService } from '../../../application/billing/plan-migration.service';
+import { newVersionSchema, planVersionAdmin } from '../../../application/billing/plan-version-admin.service';
 import { getActivePaymentProvider } from '../../../infrastructure/payments';
 import { mailer } from '../../../infrastructure/mail/mailer';
 import { platformMonitoringService, platformAdminService } from '../../../application/monitoring/platform-monitoring.service';
@@ -1352,3 +1354,66 @@ serviceRoutes.post(
     });
   })
 );
+
+/*
+ * Plan versions and migrations, for the Vhicasar Admin.
+ *
+ * On the service router, so every route here is already behind the shared
+ * service key and reachable only by the admin — a business cannot change its
+ * own plan terms, and nothing on this router trusts a frontend.
+ */
+serviceRoutes.get('/plans/:planId/versions', wrap(async (req, res) => {
+  res.json({ success: true, data: await planVersionAdmin.versions(req.params.planId as string) });
+}));
+
+serviceRoutes.get('/plans/overview', wrap(async (_req, res) => {
+  res.json({ success: true, data: await planVersionAdmin.overview() });
+}));
+
+/** Cut a new version. Existing subscribers are untouched by this alone. */
+serviceRoutes.post('/plans/:planId/versions',
+  validate({ body: newVersionSchema }),
+  wrap(async (req, res) => {
+    res.status(201).json({ success: true, data: await planVersionAdmin.create(req.params.planId as string, req.body) });
+  }));
+
+serviceRoutes.get('/plans/versions/:fromId/compare/:toId', wrap(async (req, res) => {
+  res.json({
+    success: true,
+    data: await planVersionAdmin.compare(req.params.fromId as string, req.params.toId as string),
+  });
+}));
+
+serviceRoutes.post('/plans/migrations/preview',
+  validate({ body: z.object({ toVersionId: z.string().cuid(), fromVersionId: z.string().cuid().optional() }) }),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await planMigrationService.preview(req.body) });
+  }));
+
+/** Move subscribers. Requires the count the administrator confirmed. */
+serviceRoutes.post('/plans/migrations',
+  validate({ body: migrationSchema.extend({
+    expectedCount: z.number().int().min(0).optional(),
+    initiatedByUserId: z.string().optional(),
+    initiatedByEmail: z.string().email().optional(),
+  }) }),
+  wrap(async (req, res) => {
+    res.status(201).json({ success: true, data: await planMigrationService.start(req.body) });
+  }));
+
+/** Finish a migration that stopped partway. Safe to call repeatedly. */
+serviceRoutes.post('/plans/migrations/:id/resume', wrap(async (req, res) => {
+  res.json({ success: true, data: await planMigrationService.run(req.params.id as string) });
+}));
+
+serviceRoutes.post('/plans/migrations/:id/cancel', wrap(async (req, res) => {
+  res.json({ success: true, data: await planMigrationService.cancel(req.params.id as string) });
+}));
+
+serviceRoutes.get('/plans/:planId/migrations', wrap(async (req, res) => {
+  res.json({ success: true, data: await planMigrationService.migrationsFor(req.params.planId as string) });
+}));
+
+serviceRoutes.get('/organizations/:organizationId/subscription-history', wrap(async (req, res) => {
+  res.json({ success: true, data: await planMigrationService.historyFor(req.params.organizationId as string) });
+}));

@@ -25,6 +25,11 @@ export interface PlanLimits {
 }
 
 export interface Entitlements {
+  /** The version number governing this subscription, when it has one. */
+  planVersion?: number | null;
+  planVersionId?: string | null;
+  /** Deliberately left on an older version by an administrator. */
+  grandfathered?: boolean;
   organizationId: string;
   planId: string;
   planSlug: string;
@@ -41,20 +46,33 @@ export interface Entitlements {
 
 const ACTIVE_STATUSES: SubscriptionStatus[] = ['TRIALING', 'ACTIVE', 'PAST_DUE'];
 
-function limitsOf(plan: Plan): PlanLimits {
+/**
+ * The commercial terms an entitlement check reads.
+ *
+ * A `Plan` row and a `PlanVersion` row carry the same shape, which is what
+ * makes this switchable: a subscription pinned to a version is answered from
+ * that version, and anything without one falls back to the plan. The fallback
+ * matters — an entitlement check must never fail closed and lock a business
+ * out of its own workspace because a version pointer is missing.
+ */
+type PlanTerms = Pick<Plan,
+  'maxUsers' | 'maxBranches' | 'maxProducts' | 'maxChannels' | 'maxContacts'
+  | 'maxMarketingReach' | 'aiCreditsMonthly' | 'features'>;
+
+function limitsOf(terms: PlanTerms): PlanLimits {
   return {
-    maxUsers: plan.maxUsers,
-    maxBranches: plan.maxBranches,
-    maxProducts: plan.maxProducts,
-    maxChannels: plan.maxChannels,
-    maxContacts: plan.maxContacts,
-    maxMarketingReach: plan.maxMarketingReach,
-    aiCreditsMonthly: plan.aiCreditsMonthly,
+    maxUsers: terms.maxUsers,
+    maxBranches: terms.maxBranches,
+    maxProducts: terms.maxProducts,
+    maxChannels: terms.maxChannels,
+    maxContacts: terms.maxContacts,
+    maxMarketingReach: terms.maxMarketingReach,
+    aiCreditsMonthly: terms.aiCreditsMonthly,
   };
 }
 
-function featureSet(plan: Plan): Set<string> {
-  const raw = plan.features;
+function featureSet(terms: PlanTerms): Set<string> {
+  const raw = terms.features;
   const arr = Array.isArray(raw) ? (raw as unknown[]) : [];
   return new Set(arr.filter((f): f is string => typeof f === 'string'));
 }
@@ -127,7 +145,7 @@ export async function resolveEntitlements(orgId?: string): Promise<Entitlements>
   let subscription = await prismaUnscoped.subscription.findFirst({
     where: { organizationId, status: { in: ACTIVE_STATUSES } },
     orderBy: { createdAt: 'desc' },
-    include: { plan: true },
+    include: { plan: true, planVersion: true },
   });
   if (
     subscription &&
@@ -204,7 +222,17 @@ export async function resolveEntitlements(orgId?: string): Promise<Entitlements>
     },
     { aiCredits: 0, users: 0, channels: 0, features: new Set<string>() },
   );
-  const limits = limitsOf(plan);
+  /*
+   * The version governs, not the plan.
+   *
+   * This is the whole point of versioning: a business that subscribed to
+   * Growth v1 keeps v1's price, limits and features when Growth v2 is
+   * published, instead of silently inheriting whatever the plan row was last
+   * edited to say. An admin override still wins, and a subscription with no
+   * version — only possible before the backfill — falls back to the plan.
+   */
+  const terms: PlanTerms = overriddenPlan ?? subscription?.planVersion ?? plan;
+  const limits = limitsOf(terms);
   if (limits.maxUsers !== null) limits.maxUsers += additions.users;
   if (limits.maxChannels !== null) limits.maxChannels += additions.channels;
   if (limits.aiCreditsMonthly !== null) limits.aiCreditsMonthly += additions.aiCredits;
@@ -213,7 +241,7 @@ export async function resolveEntitlements(orgId?: string): Promise<Entitlements>
       limits[key as keyof PlanLimits] = value;
     }
   }
-  const features = featureSet(plan);
+  const features = featureSet(terms);
   for (const feature of additions.features) features.add(feature);
   for (const [feature, enabled] of Object.entries(usableOverride?.features ?? {})) {
     if (enabled) features.add(feature);
@@ -225,6 +253,10 @@ export async function resolveEntitlements(orgId?: string): Promise<Entitlements>
     planId: plan.id,
     planSlug: plan.slug,
     planName: plan.name,
+    /** Which version answered this, so support can tell v1 from v2. */
+    planVersion: subscription?.planVersion?.version ?? null,
+    planVersionId: subscription?.planVersionId ?? null,
+    grandfathered: subscription?.grandfathered ?? false,
     status: subscription?.status ?? 'NONE',
     limits,
     features,

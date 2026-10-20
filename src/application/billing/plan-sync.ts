@@ -4,6 +4,7 @@ import { env } from '../../shared/config/env';
 import { logger } from '../../shared/logger';
 import { PLAN_CATALOG, type FeatureKey } from '../../shared/plans';
 import { toPriceBook } from '../../shared/billing-currency';
+import { createVersion, sameTerms, termsOfPlan, termsOfVersion } from './plan-versions';
 
 /**
  * Unifies pricing with the Vhicasar Admin: the admin is the single source of
@@ -113,12 +114,45 @@ export async function syncPlansFromAdmin(): Promise<{ synced: number } | null> {
       isActive: true,
       position: p.position,
     };
-    await prismaUnscoped.plan.upsert({
+    const plan = await prismaUnscoped.plan.upsert({
       where: { slug: p.slug },
       // Keep functional feature keys; only refresh them for slugs we know.
       update: featureKeys ? { ...commercial, features: featureKeys } : commercial,
       create: { slug: p.slug, ...commercial, maxBranches: null, maxProducts: null, features: featureKeys ?? [] },
     });
+
+    /*
+     * An edit in the admin cuts a new version; it does not rewrite the old one.
+     *
+     * This used to be the most dangerous line in the billing system. The plan
+     * row is upserted by slug every few minutes, so changing a price or a seat
+     * limit in the admin silently re-priced and re-limited every business
+     * already subscribed — retroactively, with no record, and without anybody
+     * choosing it.
+     *
+     * The plan row still holds the current terms, because that is what new
+     * subscribers and the pricing page read. What changed is that existing
+     * subscriptions point at a version instead, so they keep what they
+     * subscribed to until an administrator deliberately migrates them.
+     */
+    const terms = termsOfPlan(plan);
+    const current = plan.currentVersionId
+      ? await prismaUnscoped.planVersion.findUnique({ where: { id: plan.currentVersionId } })
+      : null;
+    if (!current) {
+      await createVersion(plan.id, terms, { notes: 'First version, created from the admin catalog.' });
+    } else if (!sameTerms(termsOfVersion(current), terms)) {
+      const version = await createVersion(plan.id, terms, {
+        notes: 'Created automatically because the plan changed in Vhicasar Admin.',
+      });
+      const kept = await prismaUnscoped.subscription.count({
+        where: { planVersionId: current.id, status: { in: ['ACTIVE', 'TRIALING', 'PAST_DUE'] } },
+      });
+      logger.info(
+        { plan: p.slug, from: current.version, to: version.version, subscribersKept: kept },
+        'Plan changed in the admin — new version cut; existing subscribers keep their current terms',
+      );
+    }
   }
 
   logger.info({ count: plans.length, tenant: env.adminCatalog.tenantSlug }, 'Synced plan catalog from Vhicasar Admin');
