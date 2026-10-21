@@ -22,6 +22,7 @@ import { catalogService } from '../../src/application/catalog/catalog.service';
 import { exportEntity } from '../../src/application/data-transfer/data-transfer.service';
 import { FIELD_DEFS } from '../../src/application/data-transfer/fields';
 import { addOnsService } from '../../src/application/billing/add-ons.service';
+import { isPaidPlan, resolveEntitlements } from '../../src/application/billing/entitlements';
 import { siteBuilderService } from '../../src/application/sites/site-builder.service';
 import { domainConfigService } from '../../src/application/sites/domain-config.service';
 
@@ -63,8 +64,10 @@ async function main() {
   check('switching it off is observed', !whatsappCampaignsEnabled());
   check('the session payload stops listing it',
     !enabledPlatformFeatures().includes(PLATFORM_FEATURES.whatsappCampaigns));
-  check('the other switch is unaffected',
-    isPlatformFeatureEnabled(PLATFORM_FEATURES.freePlanWebsiteSubdomain));
+  // The two switches carry different defaults on purpose: campaigns are on
+  // unless withdrawn, free-plan publishing is off unless granted.
+  check('the other switch keeps its own default',
+    !isPlatformFeatureEnabled(PLATFORM_FEATURES.freePlanWebsiteSubdomain));
 
   // ── 2. Campaigns refused in the API, not merely hidden ──────────────────
   console.log('\nWhatsApp campaigns while switched off');
@@ -312,6 +315,105 @@ async function main() {
   check('the summary is emptied as well as hidden', js.includes("summary.innerHTML='';summary.hidden=true"));
   check('a preview makes no server calls', cartScript('s', '/p', true).includes('PREVIEW=true'));
 
+  // ── 10b. Website AI and publishing are paid-plan capabilities ──────────
+  console.log('\nWebsite builder: paid-plan gates');
+  flags(null);
+
+  // This organisation has no subscription, so it is on the free plan.
+  let ent = await resolveEntitlements(orgId);
+  check('the verification workspace is on the free plan', !isPaidPlan(ent), `${ent.planSlug}/${ent.status}`);
+
+  let aiBuild = '';
+  await asOrg(async () => {
+    try { await siteBuilderService.create({ name: `AI Site ${stamp}`, mode: 'AI', prompt: 'A shop selling cold drinks in Lagos' } as never); }
+    catch (err) { aiBuild = (err as { code?: string }).code ?? (err as Error).message; }
+  });
+  check('Build with AI is refused on the free plan', aiBuild === 'PLAN_UPGRADE_REQUIRED', aiBuild);
+
+  // The mode must be *accepted and refused*, not rejected as an unknown value —
+  // a validation error cannot be turned into an upgrade prompt.
+  check('and refused as an upgrade, not as a schema error',
+    !/invalid|enum|expected/i.test(aiBuild), aiBuild);
+
+  const aiSite = await asOrg(() => siteBuilderService.create({ name: `Gate Site ${stamp}`, mode: 'BLANK' } as never)) as { id: string };
+  let aiEditCode = '';
+  await asOrg(async () => {
+    const page = await db.sitePage.findFirstOrThrow({ where: { siteId: aiSite.id }, select: { id: true } });
+    try { await siteBuilderService.aiEdit(aiSite.id, { pageId: page.id, instruction: 'Make it feel more premium' } as never); }
+    catch (err) { aiEditCode = (err as { code?: string }).code ?? (err as Error).message; }
+  });
+  check('Ask Vhicasar AI is refused on the free plan', aiEditCode === 'PLAN_UPGRADE_REQUIRED', aiEditCode);
+
+  let publishCode = '';
+  await asOrg(async () => {
+    try { await siteBuilderService.publish(aiSite.id, `gate${stamp}`.slice(0, 20)); }
+    catch (err) { publishCode = (err as { code?: string }).code ?? (err as Error).message; }
+  });
+  check('publishing is refused on the free plan', publishCode === 'PLAN_UPGRADE_REQUIRED', publishCode);
+
+  const freeInfo = await asOrg(() => siteBuilderService.deploymentInfo());
+  check('the editor is told an upgrade is needed', freeInfo.publishNeedsUpgrade === true);
+
+  /*
+   * Now put the workspace on a paid plan and prove every one of those opens.
+   * A gate that never opens is indistinguishable from a broken feature.
+   */
+  const growth = await db.plan.findUnique({ where: { slug: 'growth' } });
+  if (growth) {
+    const now = new Date();
+    const sub = await db.subscription.create({
+      data: {
+        organizationId: orgId, planId: growth.id, status: 'ACTIVE', interval: 'MONTHLY',
+        currentPeriodStart: now, currentPeriodEnd: new Date(now.getTime() + 30 * 86_400_000),
+      },
+    });
+    ent = await resolveEntitlements(orgId);
+    check('the workspace is now on a paid plan', isPaidPlan(ent), `${ent.planSlug}/${ent.status}`);
+
+    const paidInfo = await asOrg(() => siteBuilderService.deploymentInfo());
+    check('publishing no longer needs an upgrade', paidInfo.publishNeedsUpgrade === false);
+    check('and the editor reports it as included', paidInfo.canPublishToSubdomain === true);
+
+    const paidOffers = await asOrg(() => addOnsService.list());
+    check('the subdomain add-on is not sold to a paid plan',
+      !paidOffers.some((item) => item.id === 'website_subdomain'));
+
+    // The AI gate must open too — checked by the error no longer being the
+    // upgrade one, since a real generation needs a provider.
+    let paidAiCode = '';
+    await asOrg(async () => {
+      const page = await db.sitePage.findFirstOrThrow({ where: { siteId: aiSite.id }, select: { id: true } });
+      try { await siteBuilderService.aiEdit(aiSite.id, { pageId: page.id, instruction: 'Make it feel more premium' } as never); }
+      catch (err) { paidAiCode = (err as { code?: string }).code ?? (err as Error).message; }
+    });
+    check('Ask Vhicasar AI is no longer blocked by the plan', paidAiCode !== 'PLAN_UPGRADE_REQUIRED', paidAiCode || 'succeeded');
+
+    await db.subscription.delete({ where: { id: sub.id } });
+  } else {
+    console.log('    (no growth plan seeded; paid-plan half skipped)');
+  }
+
+  // A free plan with the add-on still publishes — it has already paid for this.
+  await db.addOnPurchase.create({
+    data: {
+      organizationId: orgId, addOnId: 'website_subdomain', title: 'Website Subdomain',
+      billingType: 'MONTHLY', amount: 0, currency: 'NGN', entitlements: { features: ['website_subdomain'] },
+    },
+  });
+  const addOnInfo = await asOrg(() => siteBuilderService.deploymentInfo());
+  check('a free plan holding the add-on may still publish', addOnInfo.canPublishToSubdomain === true);
+  await db.addOnPurchase.deleteMany({ where: { organizationId: orgId, addOnId: 'website_subdomain' } });
+
+  // And the administrator can still include publishing for the free plan.
+  flags({ free_plan_website_subdomain: true });
+  const switchedOn = await asOrg(() => siteBuilderService.deploymentInfo());
+  check('the admin switch still opens publishing for the free plan', switchedOn.canPublishToSubdomain === true);
+  flags(null);
+  const switchedOff = await asOrg(() => siteBuilderService.deploymentInfo());
+  check('and it is closed again by default', switchedOff.publishNeedsUpgrade === true);
+
+  await asOrg(() => siteBuilderService.remove(aiSite.id)).catch(() => undefined);
+
   // ── 11a. The subdomain add-on is not sold when it is included ──────────
   console.log('\nWebsite subdomain add-on');
   flags({ free_plan_website_subdomain: true });
@@ -416,7 +518,7 @@ async function main() {
     catch (err) { refusal = (err as { code?: string }).code ?? (err as Error).message; }
   });
   check('with the switch off, a free plan cannot publish to a subdomain',
-    refusal === 'SUBDOMAIN_ADD_ON_REQUIRED', refusal);
+    refusal === 'PLAN_UPGRADE_REQUIRED', refusal);
   let info = await asOrg(() => siteBuilderService.deploymentInfo());
   check('and the editor is told publishing is not included', info.subdomainIncluded === false && info.canPublishToSubdomain === false);
 

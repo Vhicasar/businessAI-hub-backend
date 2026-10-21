@@ -5,7 +5,7 @@ import { prisma, prismaUnscoped } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
 import { AppError, ConflictError, NotFoundError, ValidationError } from '../../shared/errors';
 import { getWorkspaceConfig } from '../settings/workspace-config';
-import { resolveEntitlements } from '../billing/entitlements';
+import { isPaidPlan, resolveEntitlements } from '../billing/entitlements';
 import { domainConfigService } from './domain-config.service';
 import { encrypt } from '../../shared/crypto';
 import { logger } from '../../shared/logger';
@@ -57,11 +57,39 @@ const SUBDOMAIN_FEATURE = 'website_subdomain';
  * required. A business that already published keeps its site either way —
  * `publish` only consults this when the subdomain is actually changing.
  */
+/**
+ * The AI tools in the website builder are a paid-plan capability.
+ *
+ * Both of them — generating a whole site, and editing one by instruction —
+ * cost an AI call per use against the platform's own provider, which is why
+ * they sit behind a subscription rather than being offered to every workspace
+ * that signs up.
+ *
+ * Refused with a code the interface recognises, so a free-plan user is shown
+ * the way to subscribe rather than a dead end. `PLAN_UPGRADE_REQUIRED` is what
+ * the builder listens for.
+ */
+async function requireWebsiteAi(what: string): Promise<void> {
+  const entitlements = await resolveEntitlements(orgId());
+  if (isPaidPlan(entitlements)) return;
+  throw new AppError(
+    'PLAN_UPGRADE_REQUIRED', 402,
+    `${what} is available on a paid plan. Upgrade your subscription to use it.`,
+    { kind: 'website_ai' },
+  );
+}
+
 async function subdomainPublishingAllowed(organizationId: string): Promise<
-  { allowed: true; via: 'entitlement' | 'platform' } | { allowed: false }
+  { allowed: true; via: 'plan' | 'entitlement' | 'platform' } | { allowed: false }
 > {
   const entitlements = await resolveEntitlements(organizationId);
+  // A paying workspace publishes as part of its plan.
+  if (isPaidPlan(entitlements)) return { allowed: true, via: 'plan' };
+  // An explicit grant still counts, however it was obtained — a free-plan
+  // workspace that bought the Website Subdomain add-on has paid for exactly
+  // this and must not be told to subscribe.
   if (entitlements.features.has(SUBDOMAIN_FEATURE)) return { allowed: true, via: 'entitlement' };
+  // And the administrator can still include it for the free plan.
   if (isPlatformFeatureEnabled(PLATFORM_FEATURES.freePlanWebsiteSubdomain)) {
     return { allowed: true, via: 'platform' };
   }
@@ -133,15 +161,13 @@ const optionalPageSeoSchema = pageSeoSchema.nullish().transform((value) => pageS
 export const createWebsiteSchema = z.object({
   name: z.string().trim().min(2).max(120),
   /*
-   * "Build with AI" is paused. 'AI' is removed from what the API will accept,
-   * not merely hidden in the UI, so a saved request or a direct API call
-   * cannot start a generation the product is not currently offering.
+   * "Build with AI" is available on a paid plan.
    *
-   * To re-enable: put 'AI' back here, restore the branch in `create` below,
-   * and uncomment the tab in web/src/features/website/WebsitePage.tsx. The
-   * generator (`aiDraft`) and its tests are left intact.
+   * The mode is accepted here and refused in `create` rather than removed from
+   * the schema, so a free-plan request gets an answer it can act on — an
+   * upgrade prompt — instead of a validation error about an unknown value.
    */
-  mode: z.enum(['BLANK', 'TEMPLATE']),
+  mode: z.enum(['BLANK', 'TEMPLATE', 'AI']),
   templateId: z.string().max(80).optional(),
   prompt: z.string().trim().min(10).max(1500).optional(),
   theme: siteThemeSchema.optional(),
@@ -364,13 +390,13 @@ export const siteBuilderService = {
 
     let theme = input.theme ?? DEFAULT_THEME_V2;
     let pages = input.pages;
-    // Paused — see the note on `mode` above.
-    // if (input.mode === 'AI') {
-    //   if (!input.prompt) throw new ValidationError('Describe the website you want to create');
-    //   const generated = await aiDraft(input.name, input.prompt);
-    //   theme = generated.theme;
-    //   pages = generated.pages;
-    // }
+    if (input.mode === 'AI') {
+      await requireWebsiteAi('Building a website with AI');
+      if (!input.prompt) throw new ValidationError('Describe the website you want to create');
+      const generated = await aiDraft(input.name, input.prompt);
+      theme = generated.theme;
+      pages = generated.pages;
+    }
     if (!pages?.length) pages = [{ title: 'Home', slug: '', sections: blankHomepage(input.name) }];
     const seen = new Set<string>();
     for (const page of pages) {
@@ -480,8 +506,10 @@ export const siteBuilderService = {
        * apart: a workspace that bought the add-on should still see it as
        * active rather than be told hosting is simply free.
        */
-      subdomainIncluded: permission.allowed && permission.via === 'platform',
+      subdomainIncluded: permission.allowed && permission.via !== 'entitlement',
       canPublishToSubdomain: permission.allowed,
+      /** Publishing is blocked only because the workspace is on the free plan. */
+      publishNeedsUpgrade: !permission.allowed,
       addOn: addOn ? { id: addOn.id, title: addOn.title, billingType: addOn.billingType, price: addOn.price, active: addOn.activePurchases.length > 0 } : null,
     };
   },
@@ -568,6 +596,7 @@ export const siteBuilderService = {
   },
 
   async aiEdit(siteId: string, input: z.infer<typeof aiWebsiteEditSchema>) {
+    await requireWebsiteAi('Editing a website with AI');
     const site = await loadSite(siteId);
     const page = site.pages.find((entry) => entry.id === input.pageId);
     if (!page) throw new NotFoundError('Website page');
@@ -660,9 +689,10 @@ export const siteBuilderService = {
       const permission = await subdomainPublishingAllowed(site.organizationId);
       if (!permission.allowed) {
         throw new AppError(
-          'SUBDOMAIN_ADD_ON_REQUIRED', 402,
-          'Publishing to a platform subdomain is not included on this workspace. '
-          + 'Activate the Website Subdomain add-on to publish.',
+          'PLAN_UPGRADE_REQUIRED', 402,
+          'Publishing a website is available on a paid plan. Upgrade your subscription to publish, '
+          + 'or activate the Website Subdomain add-on.',
+          { kind: 'website_publish' },
         );
       }
     }

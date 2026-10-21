@@ -23,6 +23,7 @@ import { PLAN_CATALOG } from '../../shared/plans';
 import { modulesFor } from '../modules/business-modules';
 import { channelPolicy, isChannelEnabled } from '../settings/workspace-config';
 import { enabledPlatformFeatures } from '../settings/platform-features';
+import { isPaidPlan } from '../billing/entitlements';
 import { supportedChannels } from '../../infrastructure/channels/registry';
 import { resolveEntitlements } from '../billing/entitlements';
 import { resolveLocale } from '../../shared/currency';
@@ -850,6 +851,18 @@ export const authService = {
       memberships: user.memberships.map((m) => ({
         ...m,
         features: [...(entitlementsByOrg.get(m.organization.id)?.features ?? [])],
+        /*
+         * Whether this workspace is paying for something.
+         *
+         * Sent as a plain yes/no rather than a plan name or a price, so the
+         * interface can draw an upgrade prompt without having to know what the
+         * plans are called or what they cost. The server enforces the gate
+         * regardless; this only decides what the builder offers.
+         */
+        paidPlan: (() => {
+          const ent = entitlementsByOrg.get(m.organization.id);
+          return ent ? isPaidPlan(ent) : false;
+        })(),
         accessRestriction: entitlementsByOrg.get(m.organization.id)?.accessRestriction ?? null,
         modules: modulesByOrg.get(m.organization.id) ?? [],
         channels: availableChannels,

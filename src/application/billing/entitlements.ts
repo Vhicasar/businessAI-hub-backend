@@ -274,3 +274,28 @@ export async function resolveEntitlements(orgId?: string): Promise<Entitlements>
 export function hasFeature(ent: Entitlements, feature: FeatureKey): boolean {
   return ent.features.has(feature);
 }
+
+/**
+ * The plan a workspace falls back to when it has no subscription at all.
+ *
+ * Not a pricing statement: it is the row `resolveEntitlements` reaches for when
+ * nothing else applies, which is what makes "is this workspace paying?" a
+ * question with a definite answer.
+ */
+export const FREE_PLAN_SLUG = 'starter';
+
+/**
+ * Whether this workspace is on a paid plan.
+ *
+ * Deliberately not a price comparison. Enterprise is quoted rather than listed,
+ * so its monthly price is stored as zero and a price test would call it free —
+ * which is the opposite of true. What actually distinguishes a paying workspace
+ * is that it holds a subscription to something other than the fallback plan.
+ *
+ * A platform-admin grant counts, because `planSlug` already reflects an
+ * override by the time this is asked: support putting a workspace on Growth for
+ * a month should give it Growth's features, including these.
+ */
+export function isPaidPlan(ent: Entitlements): boolean {
+  return ent.status !== 'NONE' && ent.planSlug !== FREE_PLAN_SLUG;
+}

@@ -41,15 +41,24 @@ export const PLATFORM_FEATURES = {
 export type PlatformFeature = (typeof PLATFORM_FEATURES)[keyof typeof PLATFORM_FEATURES];
 
 /**
- * Every platform switch defaults to on.
+ * What a switch means when the administrator has never set it.
  *
- * A flag the admin has never touched must leave the product behaving as it
- * does today, and an admin or sync outage must not quietly withdraw a feature
- * businesses are mid-way through using. Turning something off is always an
- * explicit decision someone made.
+ * Most default to on: a flag nobody has touched must leave the product
+ * behaving as it does today, and an admin or sync outage must not quietly
+ * withdraw a feature businesses are mid-way through using.
+ *
+ * The free-plan subdomain switch is the exception and defaults to **off**,
+ * because publishing belongs to a paid plan. Defaulting it on would hand a
+ * paid capability to every workspace that signs up, which is a commercial
+ * decision rather than a conservative fallback.
  */
+const DEFAULTS: Record<PlatformFeature, boolean> = {
+  whatsapp_campaigns: true,
+  free_plan_website_subdomain: false,
+};
+
 export function isPlatformFeatureEnabled(feature: PlatformFeature): boolean {
-  return isFeatureEnabled(feature, true);
+  return isFeatureEnabled(feature, DEFAULTS[feature] ?? true);
 }
 
 /** The switches that are on, for the session payload the web app gates UI with. */

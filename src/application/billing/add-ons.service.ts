@@ -3,7 +3,7 @@ import { prismaUnscoped } from '../../infrastructure/database/prisma';
 import { getActivePaymentProvider, getChargeCurrencies } from '../../infrastructure/payments';
 import { AppError, NotFoundError } from '../../shared/errors';
 import { exchangeRates } from '../../shared/exchange-rates';
-import { currentOrgId } from './entitlements';
+import { currentOrgId, isPaidPlan, resolveEntitlements } from './entitlements';
 import { getSiteCatalog, type CatalogAddOn } from '../catalog/site-catalog.service';
 import { ensureFreshPaymentConfig } from './payment-config-sync';
 import { PLATFORM_FEATURES, isPlatformFeatureEnabled } from '../settings/platform-features';
@@ -22,9 +22,12 @@ const SUBDOMAIN_ADD_ON = 'website_subdomain';
  * with its purchase shown as active — hiding it would make a thing they are
  * being billed for disappear from the only page that mentions it.
  */
-function offerable(addOnId: string, hasActivePurchase: boolean): boolean {
+function offerable(addOnId: string, hasActivePurchase: boolean, paidPlan: boolean): boolean {
   if (addOnId !== SUBDOMAIN_ADD_ON) return true;
   if (hasActivePurchase) return true;
+  // A paid plan already publishes, so this would be selling them what they
+  // have; and the administrator may have included it for the free plan too.
+  if (paidPlan) return false;
   return !isPlatformFeatureEnabled(PLATFORM_FEATURES.freePlanWebsiteSubdomain);
 }
 
@@ -53,16 +56,18 @@ async function priced(addOn: CatalogAddOn, currency: string) {
 export const addOnsService = {
   async list() {
     const organizationId = currentOrgId();
-    const [catalog, org, purchases] = await Promise.all([
+    const [catalog, org, purchases, entitlements] = await Promise.all([
       getSiteCatalog(),
       prismaUnscoped.organization.findUniqueOrThrow({ where: { id: organizationId }, select: { currency: true } }),
       prismaUnscoped.addOnPurchase.findMany({
         where: { organizationId, OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
         orderBy: { purchasedAt: 'desc' },
       }),
+      resolveEntitlements(organizationId),
     ]);
+    const paidPlan = isPaidPlan(entitlements);
     const offered = catalog.addOns.filter((item) => item.enabled
-      && offerable(item.id, purchases.some((purchase) => purchase.addOnId === item.id)));
+      && offerable(item.id, purchases.some((purchase) => purchase.addOnId === item.id), paidPlan));
     return Promise.all(offered.map(async (item) => ({
       ...item,
       price: await priced(item, org.currency),
@@ -84,7 +89,7 @@ export const addOnsService = {
     if (active) return { activated: true, alreadyActive: true, purchaseId: active.id };
     // Hidden in the list, and refused here too: a stale page or a direct call
     // must not be able to sell something that is already included.
-    if (!offerable(addOnId, false)) {
+    if (!offerable(addOnId, false, isPaidPlan(await resolveEntitlements(organizationId)))) {
       throw new AppError(
         'ADD_ON_NOT_REQUIRED', 409,
         'Publishing a website to a platform subdomain is already included on this workspace.',
