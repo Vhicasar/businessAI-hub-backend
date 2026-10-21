@@ -14,6 +14,7 @@ import { pickChannelFor } from '../inbox/channel-allowance.service';
 import { smsWalletService } from '../billing/sms-wallet.service';
 import { smsSendService } from '../sms/sms-send.service';
 import { audienceService, segmentSchema, type SegmentDefinition } from './audience.service';
+import { PLATFORM_FEATURES, isPlatformFeatureEnabled } from '../settings/platform-features';
 
 function orgId(): string {
   const id = requestContext.get()?.organizationId;
@@ -32,6 +33,24 @@ function orgId(): string {
  */
 function channelFor(type: string): ChannelType {
   return type === 'SMS' ? 'SMS' : type === 'WHATSAPP' ? 'WHATSAPP' : 'EMAIL';
+}
+
+/**
+ * The platform switch, enforced on this path too.
+ *
+ * This composer cannot *create* a WhatsApp campaign — the type enum excludes
+ * it — but it can still send one, because a campaign saved as a draft before
+ * the dedicated builder existed is a row this service will happily pick up.
+ * Without this, switching WhatsApp campaigns off would leave that route open.
+ */
+function requireWhatsAppCampaignsEnabledFor(type: string): void {
+  if (type !== 'WHATSAPP') return;
+  if (isPlatformFeatureEnabled(PLATFORM_FEATURES.whatsappCampaigns)) return;
+  throw new AppError(
+    'WHATSAPP_CAMPAIGNS_DISABLED', 403,
+    'WhatsApp campaigns are currently unavailable on this platform. This campaign has been left '
+    + 'exactly as it is and can be sent if the feature is switched back on.',
+  );
 }
 
 /** Cap a single send batch — protects against accidental mass-sends. */
@@ -258,6 +277,7 @@ export const campaignService = {
     if (!['DRAFT', 'SCHEDULED'].includes(campaign.status)) {
       throw new ConflictError('Campaign has already been sent');
     }
+    requireWhatsAppCampaignsEnabledFor(campaign.type);
     const channel = channelFor(campaign.type);
     const content = (campaign.content as { audience?: string; recipientIds?: string[]; segment?: SegmentDefinition }) ?? {};
     const [customers, ent, account] = await Promise.all([
@@ -341,6 +361,7 @@ export const campaignService = {
   async sendNow(id: string) {
     const campaign = await prisma.campaign.findFirst({ where: { id, deletedAt: null } });
     if (!campaign) throw new NotFoundError('Campaign');
+    requireWhatsAppCampaignsEnabledFor(campaign.type);
     const channel = channelFor(campaign.type);
     const content = (campaign.content as {
       body?: string;

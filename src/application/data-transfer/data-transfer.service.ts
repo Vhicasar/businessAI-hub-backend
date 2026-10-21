@@ -1,5 +1,8 @@
 import { prisma } from '../../infrastructure/database/prisma';
 import { logger } from '../../shared/logger';
+import { requestContext } from '../../shared/context';
+import { filesService } from '../files/files.service';
+import { ingestImageFromUrl } from './image-ingest';
 import { customersService } from '../customers/customers.service';
 import { crmService } from '../crm/crm.service';
 import { canSeeSalary, employeesService } from '../employees/employees.service';
@@ -46,6 +49,15 @@ export interface ImportResult {
   skipped: number;
   failed: number;
   errors: { row: number; message: string }[];
+  /**
+   * Rows that imported but not completely.
+   *
+   * Separate from `errors` because the record exists and the import worked —
+   * a product whose picture could not be downloaded is still a product, and
+   * reporting it as a failure would send someone looking for a row that is
+   * sitting in their catalogue.
+   */
+  warnings: { row: number; message: string }[];
 }
 
 /** column index → target field key (null = ignore this column). */
@@ -150,7 +162,9 @@ function names(row: MappedRow): { first?: string; last?: string } {
   };
 }
 
-type RowImporter = (row: MappedRow) => Promise<'created' | 'skipped'>;
+type RowOutcome = 'created' | 'skipped';
+/** An outcome, or an outcome with something worth saying about the row. */
+type RowImporter = (row: MappedRow) => Promise<RowOutcome | { outcome: RowOutcome; warning: string }>;
 
 interface Ctx {
   organizationId: string;
@@ -513,8 +527,9 @@ function importerFor(entity: Entity, ctx: Ctx): RowImporter {
           ? await lookupOrCreate(ctx.brands, brandName, (n) => catalogService.createBrand(n))
           : null;
 
+        const imageUrl = val(row, 'imageUrl');
         try {
-          await catalogService.createProduct(
+          const product = await catalogService.createProduct(
             {
               name,
               description: val(row, 'description') ?? null,
@@ -534,6 +549,32 @@ function importerFor(entity: Entity, ctx: Ctx): RowImporter {
             } as never,
             ctx.currency,
           );
+          /*
+           * The image is attached after the product exists, and a failure here
+           * is reported without undoing the product.
+           *
+           * A link in a spreadsheet is the one field that depends on somebody
+           * else's server still being up, so it is the field most likely to
+           * fail — and losing a whole catalogue row because a CDN 404'd would
+           * be the wrong trade. The row imports, and the reason the picture is
+           * missing is reported against it.
+           */
+          // `createProduct` takes its dto through a `never` cast above, which
+          // leaves its result untyped here; the id is all this needs.
+          const productId = String((product as Record<string, unknown>).id ?? '');
+          if (imageUrl) {
+            const ingested = await ingestImageFromUrl(imageUrl, {
+              organizationId: ctx.organizationId,
+              uploadedById: requestContext.get()?.userId ?? null,
+              entityId: productId,
+            });
+            if (ingested.fileId) {
+              await catalogService.addProductImage(productId, { fileId: ingested.fileId, altText: name })
+                .catch(() => undefined);
+            } else if (ingested.error) {
+              return { outcome: 'created' as const, warning: `${ingested.error} — the product was imported without a picture.` };
+            }
+          }
           return 'created';
         } catch (e) {
           if (/sku .* already in use/i.test(msg(e))) return 'skipped';
@@ -840,7 +881,7 @@ const PRODUCT_STATUSES = ['ACTIVE', 'DRAFT', 'ARCHIVED'];
  */
 export async function importEntity(entity: Entity, csv: string, mapping?: Mapping): Promise<ImportResult> {
   const rows = parseCsv(csv);
-  const result: ImportResult = { total: 0, created: 0, skipped: 0, failed: 0, errors: [] };
+  const result: ImportResult = { total: 0, created: 0, skipped: 0, failed: 0, errors: [], warnings: [] };
   if (rows.length <= 1) return result;
 
   const headers = rows[0]!;
@@ -968,7 +1009,11 @@ export async function importEntity(entity: Entity, csv: string, mapping?: Mappin
       row[field] = cells[Number(idxStr)] ?? '';
     }
     try {
-      const outcome = await importRow(row);
+      const reported = await importRow(row);
+      const outcome = typeof reported === 'string' ? reported : reported.outcome;
+      if (typeof reported !== 'string' && result.warnings.length < 100) {
+        result.warnings.push({ row: i + 2, message: reported.warning });
+      }
       if (outcome === 'created') result.created += 1;
       else result.skipped += 1;
     } catch (e) {
@@ -1096,9 +1141,20 @@ export async function exportEntity(entity: Entity): Promise<{ filename: string; 
               stockLevels: { select: { quantity: true } },
             },
           },
+          // The first gallery image, so an export can be edited and imported
+          // back with its pictures intact rather than losing them in the trip.
+          images: { orderBy: { position: 'asc' }, take: 1, select: { fileId: true } },
         },
         orderBy: { createdAt: 'desc' },
       });
+      /*
+       * Resolved in one query rather than per row.
+       *
+       * These are the ordinary public object-storage URLs the website already
+       * serves the same pictures from — not signed links, which would expire
+       * before anyone finished editing the spreadsheet, and never credentials.
+       */
+      const imageUrls = await filesService.urlMap(rows.map((p) => p.images[0]?.fileId));
       const flat = rows.map((p) => {
         const v = p.variants[0];
         const cf = (p.customFields ?? {}) as Record<string, unknown>;
@@ -1116,12 +1172,13 @@ export async function exportEntity(entity: Entity): Promise<{ filename: string; 
           category: p.category?.name ?? '',
           brand: p.brand?.name ?? '',
           description: p.description ?? '',
+          imageUrl: (p.images[0] ? imageUrls.get(p.images[0].fileId) : '') ?? '',
           taxRate: p.taxRate,
           status: p.status,
         };
       });
       const headers = ['productId', 'externalId', 'name', 'sku', 'variantName', 'price', 'compareAtPrice',
-        'costPrice', 'stock', 'barcode', 'category', 'brand', 'description', 'taxRate', 'status'];
+        'costPrice', 'stock', 'barcode', 'category', 'brand', 'description', 'imageUrl', 'taxRate', 'status'];
       return { filename: `products-${stamp}.csv`, csv: toCsv(headers, flat) };
     }
     case 'kb-articles': {

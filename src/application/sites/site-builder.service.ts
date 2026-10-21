@@ -10,6 +10,7 @@ import { domainConfigService } from './domain-config.service';
 import { encrypt } from '../../shared/crypto';
 import { logger } from '../../shared/logger';
 import { addOnsService } from '../billing/add-ons.service';
+import { PLATFORM_FEATURES, isPlatformFeatureEnabled } from '../settings/platform-features';
 /*
  * `resolveAi`, not `getAiProvider`: the website builder is an AI surface like
  * any other, so it must run on the business's own provider when they have
@@ -32,6 +33,41 @@ const orgId = () => {
   return value;
 };
 
+/** The entitlement an explicit subdomain grant carries, however it was obtained. */
+const SUBDOMAIN_FEATURE = 'website_subdomain';
+
+/**
+ * Whether this business may publish a website to a platform subdomain.
+ *
+ * Publishing used to require the Website Subdomain add-on outright, which made
+ * a website something a business had to buy before it could have one at all —
+ * and a business with no website has nothing to put a payment link on, so the
+ * add-on was gating the thing that would have justified it.
+ *
+ * Two ways through, in this order:
+ *
+ *  - An explicit grant. Read from the entitlement resolver rather than from
+ *    the purchase table directly, so a plan that includes the feature, an
+ *    add-on purchase and a platform-admin override all count — which is the
+ *    point of having one entitlement system.
+ *  - The platform switch, which the administrator uses to decide whether a
+ *    subdomain is included at no cost. On by default.
+ *
+ * With the switch off, behaviour returns to what it was: the grant is
+ * required. A business that already published keeps its site either way —
+ * `publish` only consults this when the subdomain is actually changing.
+ */
+async function subdomainPublishingAllowed(organizationId: string): Promise<
+  { allowed: true; via: 'entitlement' | 'platform' } | { allowed: false }
+> {
+  const entitlements = await resolveEntitlements(organizationId);
+  if (entitlements.features.has(SUBDOMAIN_FEATURE)) return { allowed: true, via: 'entitlement' };
+  if (isPlatformFeatureEnabled(PLATFORM_FEATURES.freePlanWebsiteSubdomain)) {
+    return { allowed: true, via: 'platform' };
+  }
+  return { allowed: false };
+}
+
 const userId = () => requestContext.get()?.userId ?? null;
 const SLUG = /^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$/;
 const SUBDOMAIN = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
@@ -53,6 +89,8 @@ const RESERVED = new Set([
   'businesshub', 'hub', 'cdn', 'static', 'assets', 'media', 'files',
   'smtp', 'imap', 'pop', 'webmail', 'mx', 'autodiscover', 'ns1', 'ns2', 'ftp',
   'staging', 'auth', 'billing', 'portal',
+  // Names a customer would read as the platform speaking, not a business.
+  'support', 'dashboard', 'account', 'accounts', 'login', 'signup', 'pay', 'checkout',
   ...String(process.env.SITE_RESERVED_SUBDOMAINS ?? '')
     .split(',')
     .map((entry) => entry.trim().toLowerCase())
@@ -426,9 +464,26 @@ export const siteBuilderService = {
   },
 
   async deploymentInfo() {
-    const [config, addOns] = await Promise.all([domainConfigService.active(), addOnsService.list()]);
-    const addOn = addOns.find((item) => item.id === 'website_subdomain');
-    return { baseDomain: config?.baseDomain ?? null, provider: config?.provider ?? null, managedDomainsEnabled: Boolean(config), addOn: addOn ? { id: addOn.id, title: addOn.title, billingType: addOn.billingType, price: addOn.price, active: addOn.activePurchases.length > 0 } : null };
+    const [config, addOns, permission] = await Promise.all([
+      domainConfigService.active(),
+      addOnsService.list(),
+      subdomainPublishingAllowed(orgId()),
+    ]);
+    const addOn = addOns.find((item) => item.id === SUBDOMAIN_FEATURE);
+    return {
+      baseDomain: config?.baseDomain ?? null,
+      provider: config?.provider ?? null,
+      managedDomainsEnabled: Boolean(config),
+      /*
+       * Whether publishing is available without buying anything, so the editor
+       * can stop advertising an add-on that is not needed. `via` tells the two
+       * apart: a workspace that bought the add-on should still see it as
+       * active rather than be told hosting is simply free.
+       */
+      subdomainIncluded: permission.allowed && permission.via === 'platform',
+      canPublishToSubdomain: permission.allowed,
+      addOn: addOn ? { id: addOn.id, title: addOn.title, billingType: addOn.billingType, price: addOn.price, active: addOn.activePurchases.length > 0 } : null,
+    };
   },
 
   async subdomainAvailable(siteId: string, value: string) {
@@ -602,11 +657,14 @@ export const siteBuilderService = {
     if (!deployment) throw new AppError('SITE_HOSTING_NOT_CONFIGURED', 503, 'Managed website hosting is not configured by the platform administrator.');
     const alreadyUsesSubdomain = site.subdomain === value && site.publishedAt !== null;
     if (!alreadyUsesSubdomain) {
-      const purchase = await prismaUnscoped.addOnPurchase.findFirst({
-        where: { organizationId: site.organizationId, addOnId: 'website_subdomain', OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
-        select: { id: true },
-      });
-      if (!purchase) throw new AppError('SUBDOMAIN_ADD_ON_REQUIRED', 402, 'Activate the Website Subdomain add-on before publishing.');
+      const permission = await subdomainPublishingAllowed(site.organizationId);
+      if (!permission.allowed) {
+        throw new AppError(
+          'SUBDOMAIN_ADD_ON_REQUIRED', 402,
+          'Publishing to a platform subdomain is not included on this workspace. '
+          + 'Activate the Website Subdomain add-on to publish.',
+        );
+      }
     }
     if (!site.pages.length || !site.pages.some((page) => page.isHome)) throw new ValidationError('The website needs a homepage before publishing');
     const release = snapshot(site);

@@ -1,4 +1,5 @@
-import type { OrderStatus, Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
+import type { OrderStatus } from '@prisma/client';
 import { ConflictError, NotFoundError, ValidationError } from '../../shared/errors';
 import { prisma } from '../../infrastructure/database/prisma';
 import { requestContext } from '../../shared/context';
@@ -218,24 +219,42 @@ export const ordersService = {
     const couponResult = dto.couponCode ? await validateCoupon(dto.couponCode, couponBase, dto.customerId) : null;
 
     const created = await prisma.$transaction(async (tx) => {
-      // Reserve stock (row-by-row so error messages are precise).
+      /*
+       * Reserve stock, one row at a time so the error names the item.
+       *
+       * The claim and the check are a single statement on purpose. Reading the
+       * level and then incrementing it is two, and between them another
+       * checkout can read the same figure: both see one unit left, both decide
+       * it is theirs, and the business has sold stock it does not have. Here
+       * the condition lives in the `WHERE`, so Postgres takes the row lock and
+       * re-evaluates it against what the other transaction committed — the
+       * second one matches nothing and is turned away.
+       *
+       * `quantity - reserved >= n` is not expressible in a Prisma `where`,
+       * which is why this is raw SQL rather than `updateMany`.
+       */
       for (const item of dto.items) {
         const v = variantMap.get(item.variantId)!;
-        const level = await tx.stockLevel.findUnique({
-          where: {
-            warehouseId_variantId: { warehouseId: warehouse.id, variantId: item.variantId },
-          },
-        });
-        const available = level ? Number(level.quantity) - Number(level.reserved) : 0;
-        if (available < item.quantity) {
+        const claimed = await tx.$executeRaw(Prisma.sql`
+          UPDATE "StockLevel"
+             SET reserved = reserved + ${item.quantity}
+           WHERE "warehouseId" = ${warehouse.id}
+             AND "variantId" = ${item.variantId}
+             AND quantity - reserved >= ${item.quantity}
+        `);
+        if (claimed !== 1) {
+          // Nothing was claimed. Read the level only now, for the message.
+          const level = await tx.stockLevel.findUnique({
+            where: {
+              warehouseId_variantId: { warehouseId: warehouse.id, variantId: item.variantId },
+            },
+            select: { quantity: true, reserved: true },
+          });
+          const available = level ? Number(level.quantity) - Number(level.reserved) : 0;
           throw new ValidationError(
             `Insufficient stock for ${v.sku} at ${warehouse.name} (available ${available}, requested ${item.quantity})`
           );
         }
-        await tx.stockLevel.update({
-          where: { id: level!.id },
-          data: { reserved: { increment: item.quantity } },
-        });
       }
 
       // Totals with snapshots.

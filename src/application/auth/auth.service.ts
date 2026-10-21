@@ -22,6 +22,7 @@ import { SYSTEM_ROLE_TEMPLATES, OWNER_ROLE_NAME } from '../../shared/permissions
 import { PLAN_CATALOG } from '../../shared/plans';
 import { modulesFor } from '../modules/business-modules';
 import { channelPolicy, isChannelEnabled } from '../settings/workspace-config';
+import { enabledPlatformFeatures } from '../settings/platform-features';
 import { supportedChannels } from '../../infrastructure/channels/registry';
 import { resolveEntitlements } from '../billing/entitlements';
 import { resolveLocale } from '../../shared/currency';
@@ -835,6 +836,15 @@ export const authService = {
       if (channelType === 'WEB_CHAT') return isChannelEnabled('WEB_CHAT');
       return channelPolicy(channelType).available;
     });
+    /*
+     * The platform switches that are on.
+     *
+     * Same reasoning again, and the same handling in the UI as a switched-off
+     * channel: these are the operator's decisions, so the web app hides what
+     * is off rather than drawing a padlock on it. No upgrade a business can buy
+     * would turn one back on, and a padlock would invite that conversation.
+     */
+    const platformFeatures = enabledPlatformFeatures();
     return {
       ...user,
       memberships: user.memberships.map((m) => ({
@@ -843,6 +853,7 @@ export const authService = {
         accessRestriction: entitlementsByOrg.get(m.organization.id)?.accessRestriction ?? null,
         modules: modulesByOrg.get(m.organization.id) ?? [],
         channels: availableChannels,
+        platformFeatures,
         organization: {
           id: m.organization.id,
           name: m.organization.name,

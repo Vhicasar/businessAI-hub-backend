@@ -11,6 +11,7 @@ import { requestContext } from '../../src/shared/context';
 import { siteBuilderService } from '../../src/application/sites/site-builder.service';
 import { sitePublicService } from '../../src/application/sites/site-public.service';
 import { domainConfigService } from '../../src/application/sites/domain-config.service';
+import { setWorkspaceConfigOverride } from '../../src/application/settings/workspace-config';
 
 let passed = 0, failed = 0;
 const check = (n: string, ok: boolean, d = '') => {
@@ -77,15 +78,27 @@ async function main() {
     const offered = await asOrg(() => siteBuilderService.subdomainAvailable(siteId, name));
     check(`and it is not offered as available`, (offered as { available: boolean }).available === false);
   }
+  /*
+   * The add-on gate, which is now a platform decision rather than a fixed one.
+   *
+   * A subdomain is included by default, so this has to switch that off to see
+   * the gate at all — and switching it off is exactly what an administrator
+   * who wants to sell hosting would do, so it is worth proving it still bites.
+   */
+  setWorkspaceConfigOverride({ featureFlags: { free_plan_website_subdomain: false } });
   const noAddOn = await asOrg(() => siteBuilderService.publish(siteId, sub)).catch((e) => e);
-  check('publishing without the add-on is refused with 402',
+  check('with subdomains not included, publishing without the add-on is refused with 402',
     (noAddOn as { statusCode?: number }).statusCode === 402,
     `got ${(noAddOn as { statusCode?: number; message?: string }).statusCode} ${(noAddOn as { message?: string }).message ?? ''}`);
 
   await db.addOnPurchase.create({ data: {
     organizationId: orgId, addOnId: 'website_subdomain', title: 'Website Subdomain',
-    billingType: 'MONTHLY', amount: 0, currency: 'NGN', entitlements: {},
+    billingType: 'MONTHLY', amount: 0, currency: 'NGN', entitlements: { features: ['website_subdomain'] },
   } });
+  const withAddOn = await asOrg(() => siteBuilderService.deploymentInfo());
+  check('and the add-on then permits it', withAddOn.canPublishToSubdomain === true);
+  // Back to the shipped default: included, and no add-on needed.
+  setWorkspaceConfigOverride(null);
 
   // ── 4. Publish ──────────────────────────────────────────────────────────
   console.log('\nPublishing');
@@ -170,6 +183,15 @@ async function main() {
     check('an unverified custom domain may not',
       await ask('www.e2e-example.invalid') === 404);
     check('and nonsense is refused rather than erroring', await ask('') === 404);
+    /*
+     * A wildcard site block can swallow a hostname whose own block was
+     * misplaced during an edit; this endpoint then decides whether the app
+     * gets a certificate at all. Refusing its own address turns a config slip
+     * into a total outage with nothing but an SSL error to go on.
+     */
+    const ownHost = (() => { try { return new URL(process.env.WEB_APP_URL ?? 'http://localhost').hostname; } catch { return 'localhost'; } })();
+    check('the platform\'s own hostname is always allowed', await ask(ownHost) === 200, ownHost);
+    check('as is the website base domain', await ask(String(config?.baseDomain)) === 200);
   }
 
   // ── 6. Draft edits must not touch what is live ──────────────────────────

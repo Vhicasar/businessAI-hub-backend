@@ -9,9 +9,11 @@ import { customersService } from '../../application/customers/customers.service'
 import { ordersService } from '../../application/orders/orders.service';
 import { paymentLinksService } from '../../application/payments/payment-links.service';
 import { resolveEntitlements } from '../../application/billing/entitlements';
-import { ValidationError } from '../../shared/errors';
+import { NotFoundError, ValidationError } from '../../shared/errors';
 import { logger } from '../../shared/logger';
+import { env } from '../../shared/config/env';
 import { domainConfigService } from '../../application/sites/domain-config.service';
+import { cartState, orderPaymentState } from '../../application/sites/site-cart.service';
 
 export const siteHostRoutes = Router();
 siteHostRoutes.use(express.urlencoded({ extended: true }));
@@ -78,9 +80,15 @@ async function capture(site: { id: string; organizationId: string }, kind: strin
   await siteBuilderService.recordEvent(site.id, 'FORM_SUBMITTED', page, undefined, undefined, { form: kind });
 }
 
-async function checkout(site: { id: string; organizationId: string; publishedSnapshot?: unknown }, body: Record<string, unknown>) {
+function requireCommerce(site: { publishedSnapshot?: unknown }): void {
   const snapshot = site.publishedSnapshot as { site?: { settings?: { commerce?: { enabled?: boolean } } } } | null;
-  if (snapshot?.site?.settings?.commerce?.enabled !== true) throw new ValidationError('Commerce is not enabled for this website');
+  if (snapshot?.site?.settings?.commerce?.enabled !== true) {
+    throw new ValidationError('Commerce is not enabled for this website');
+  }
+}
+
+async function checkout(site: { id: string; organizationId: string; publishedSnapshot?: unknown }, body: Record<string, unknown>) {
+  requireCommerce(site);
   const email = String(body.email ?? '').trim().toLowerCase();
   const name = String(body.name ?? '').trim();
   const phone = String(body.phone ?? '').trim() || undefined;
@@ -103,6 +111,35 @@ async function checkout(site: { id: string; organizationId: string; publishedSna
 }
 
 /**
+ * Price and stock for what is in a visitor's cart.
+ *
+ * The cart is browser state, so it asks this before it shows a subtotal or
+ * lets anyone press `+`. Commerce being switched off is answered the same way
+ * checkout answers it, so a site that stopped selling stops here too.
+ */
+async function cart(site: { organizationId: string; publishedSnapshot?: unknown }, body: Record<string, unknown>) {
+  requireCommerce(site);
+  const variantIds = Array.isArray(body.variantIds)
+    ? body.variantIds.map((value) => String(value)).filter(Boolean)
+    : [];
+  return { items: await cartState(site.organizationId, variantIds) };
+}
+
+/**
+ * Whether the order a visitor went off to pay for has been paid.
+ *
+ * The payment page is on the platform's own origin, not the website's, so
+ * nothing it does can be heard by the tab the customer was shopping in. That
+ * tab polls this instead, and empties its cart only on a yes from here —
+ * never because the customer merely opened the payment page.
+ */
+async function orderStatus(site: { organizationId: string }, orderId: string) {
+  const state = await orderPaymentState(site.organizationId, orderId);
+  if (!state) throw new NotFoundError('Order');
+  return state;
+}
+
+/**
  * Whether this platform will serve a given hostname — Caddy's `ask` endpoint.
  *
  * On-demand TLS issues a certificate the first time a hostname is requested,
@@ -121,6 +158,24 @@ siteHostRoutes.get('/tls-check', async (req, res, next) => {
 
     const config = await domainConfigService.active();
     const baseDomain = config?.baseDomain.toLowerCase();
+
+    /*
+     * The platform's own hostnames are always allowed.
+     *
+     * A wildcard site block can swallow a hostname whose own block is
+     * misplaced during an edit, and then this endpoint is what decides
+     * whether it gets a certificate. Answering "no" for the app's own address
+     * turns a config slip into a total outage with an SSL error and no
+     * obvious cause — so the hosts the platform is reachable at are approved
+     * here regardless of whether a site is published on them.
+     */
+    const ownHosts = new Set(
+      [env.WEB_APP_URL, env.API_BASE_URL]
+        .map((value) => { try { return new URL(value).hostname.toLowerCase(); } catch { return ''; } })
+        .filter(Boolean),
+    );
+    if (baseDomain) ownHosts.add(baseDomain);
+    if (ownHosts.has(domain)) return res.status(200).send('ok');
 
     // A published subdomain of the platform's own website domain.
     if (baseDomain && domain.endsWith(`.${baseDomain}`)) {
@@ -167,6 +222,22 @@ siteHostRoutes.post('/:subdomain/checkout', async (req, res, next) => {
     const site = await siteBySubdomain(req.params.subdomain as string);
     if (!site) return notFound(res);
     res.json(await checkout(site, req.body as Record<string, unknown>));
+  } catch (error) { next(error); }
+});
+
+siteHostRoutes.post('/:subdomain/cart', async (req, res, next) => {
+  try {
+    const site = await siteBySubdomain(req.params.subdomain as string);
+    if (!site) return notFound(res);
+    res.json(await cart(site, req.body as Record<string, unknown>));
+  } catch (error) { next(error); }
+});
+
+siteHostRoutes.get('/:subdomain/order-status', async (req, res, next) => {
+  try {
+    const site = await siteBySubdomain(req.params.subdomain as string);
+    if (!site) return notFound(res);
+    res.json(await orderStatus(site, String(req.query.order ?? '')));
   } catch (error) { next(error); }
 });
 
@@ -228,7 +299,21 @@ export function customDomainHost(req: Request, res: Response, next: NextFunction
     }).catch(next);
     return;
   }
+  if (req.method === 'POST' && path === 'cart') {
+    lookup().then(async (site) => {
+      if (!site) return next();
+      res.json(await cart(site, req.body as Record<string, unknown>));
+    }).catch(next);
+    return;
+  }
   if (req.method !== 'GET') return next();
+  if (path === 'order-status') {
+    lookup().then(async (site) => {
+      if (!site) return next();
+      res.json(await orderStatus(site, String(req.query.order ?? '')));
+    }).catch(next);
+    return;
+  }
   if (path === 'robots.txt' || path === 'sitemap.xml') {
     Promise.all([
       sitePublicService.discovery(hostname, 'custom'),

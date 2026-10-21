@@ -6,6 +6,27 @@ import { exchangeRates } from '../../shared/exchange-rates';
 import { currentOrgId } from './entitlements';
 import { getSiteCatalog, type CatalogAddOn } from '../catalog/site-catalog.service';
 import { ensureFreshPaymentConfig } from './payment-config-sync';
+import { PLATFORM_FEATURES, isPlatformFeatureEnabled } from '../settings/platform-features';
+
+/** The add-on that is also a platform switch — see `offerable` below. */
+const SUBDOMAIN_ADD_ON = 'website_subdomain';
+
+/**
+ * Whether an add-on should be offered for sale at all.
+ *
+ * Only the website subdomain is conditional, and only because it is the one
+ * add-on the platform can also include for free. Offering it while publishing
+ * is already free would be selling something the business already has.
+ *
+ * A workspace that bought it before the switch was turned on still sees it,
+ * with its purchase shown as active — hiding it would make a thing they are
+ * being billed for disappear from the only page that mentions it.
+ */
+function offerable(addOnId: string, hasActivePurchase: boolean): boolean {
+  if (addOnId !== SUBDOMAIN_ADD_ON) return true;
+  if (hasActivePurchase) return true;
+  return !isPlatformFeatureEnabled(PLATFORM_FEATURES.freePlanWebsiteSubdomain);
+}
 
 export const addOnCheckoutSchema = z.object({ addOnId: z.string().min(1) });
 
@@ -40,7 +61,9 @@ export const addOnsService = {
         orderBy: { purchasedAt: 'desc' },
       }),
     ]);
-    return Promise.all(catalog.addOns.filter((item) => item.enabled).map(async (item) => ({
+    const offered = catalog.addOns.filter((item) => item.enabled
+      && offerable(item.id, purchases.some((purchase) => purchase.addOnId === item.id)));
+    return Promise.all(offered.map(async (item) => ({
       ...item,
       price: await priced(item, org.currency),
       activePurchases: purchases.filter((purchase) => purchase.addOnId === item.id).map((purchase) => ({
@@ -59,6 +82,14 @@ export const addOnsService = {
       where: { organizationId, addOnId, OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
     });
     if (active) return { activated: true, alreadyActive: true, purchaseId: active.id };
+    // Hidden in the list, and refused here too: a stale page or a direct call
+    // must not be able to sell something that is already included.
+    if (!offerable(addOnId, false)) {
+      throw new AppError(
+        'ADD_ON_NOT_REQUIRED', 409,
+        'Publishing a website to a platform subdomain is already included on this workspace.',
+      );
+    }
     const price = await priced(addOn, org.currency);
     // Free promotions must never be sent to a payment gateway as a zero-value
     // transaction. Activate the entitlement immediately and keep the same

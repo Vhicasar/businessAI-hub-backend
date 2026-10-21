@@ -13,6 +13,7 @@ import { segmentSchema, whatsappAudienceService, type AudienceMember } from './a
 import { whatsappTemplateService } from './whatsapp-template.service';
 import { whatsappPricingService } from './whatsapp-pricing.service';
 import { whatsappBillingService } from '../inbox/whatsapp-billing.service';
+import { PLATFORM_FEATURES, isPlatformFeatureEnabled } from '../settings/platform-features';
 
 /**
  * WhatsApp marketing campaigns.
@@ -82,6 +83,17 @@ interface CampaignContent {
   /** Why dispatch stopped, when it did. */
   haltReason?: string;
   haltedAt?: string;
+  /**
+   * Halted because the platform administrator switched campaigns off, rather
+   * than because of anything the business or Meta did.
+   *
+   * Recorded so the campaign can be handed back when the feature returns: a
+   * scheduled campaign paused this way is restored to SCHEDULED by the sweep,
+   * where one a person paused stays paused until that person resumes it.
+   */
+  pausedByPlatform?: boolean;
+  /** The moment it was due, kept so restoring it does not lose the schedule. */
+  platformPausedScheduledAt?: string;
 }
 
 /** The WhatsApp account this campaign sends from, proven to belong to the tenant. */
@@ -97,6 +109,31 @@ async function loadSendingAccount(accountId: string, organizationId: string) {
     throw new NotFoundError('WhatsApp channel');
   }
   return account;
+}
+
+/**
+ * Whether the platform is offering WhatsApp campaigns at all.
+ *
+ * An administrator decision, not a plan one, so it is enforced here rather
+ * than left to the UI: hiding the button would still leave the API open, and
+ * the API is what a campaign is actually launched through.
+ *
+ * Scope is deliberately narrow. This governs campaigns and nothing else —
+ * inbound WhatsApp messages, the inbox, customer conversations and the channel
+ * connection itself all keep working, and no campaign record is touched.
+ */
+export function whatsappCampaignsEnabled(): boolean {
+  return isPlatformFeatureEnabled(PLATFORM_FEATURES.whatsappCampaigns);
+}
+
+export const CAMPAIGNS_DISABLED_MESSAGE =
+  'WhatsApp campaigns are currently unavailable on this platform. Your existing campaigns '
+  + 'and their records are unchanged, and WhatsApp conversations are unaffected.';
+
+function requireCampaignsEnabled(): void {
+  if (!whatsappCampaignsEnabled()) {
+    throw new AppError('WHATSAPP_CAMPAIGNS_DISABLED', 403, CAMPAIGNS_DISABLED_MESSAGE);
+  }
 }
 
 export const whatsappCampaignService = {
@@ -134,6 +171,7 @@ export const whatsappCampaignService = {
    * billing is known to be in the way.
    */
   async preview(input: { channelAccountId: string; templateName: string; templateLanguage: string; variables: Record<string, string>; segment: z.infer<typeof segmentSchema> }) {
+    requireCampaignsEnabled();
     const organizationId = orgId();
     const [account, audience] = await Promise.all([
       loadSendingAccount(input.channelAccountId, organizationId),
@@ -167,6 +205,7 @@ export const whatsappCampaignService = {
    * crash between here and the first send loses nothing and repeats nothing.
    */
   async launch(dto: LaunchDto) {
+    requireCampaignsEnabled();
     const organizationId = orgId();
     const account = await loadSendingAccount(dto.channelAccountId, organizationId);
     const template = await whatsappTemplateService.requireEligible(
@@ -250,6 +289,40 @@ export const whatsappCampaignService = {
     if (campaign.status === 'CANCELLED') throw new ConflictError('This campaign was cancelled');
 
     const content = (campaign.content ?? {}) as CampaignContent;
+
+    /*
+     * The platform switch, checked here rather than only at launch.
+     *
+     * Launch is not the only way a campaign reaches dispatch: the queue worker
+     * and the scheduled sweep both call straight into it, so a campaign
+     * queued or scheduled before the switch was thrown would otherwise still
+     * send. Nothing is deleted or cancelled — it is parked, with the reason
+     * recorded and its due time kept, and handed back when the feature
+     * returns.
+     */
+    if (!whatsappCampaignsEnabled()) {
+      const parked = await prismaUnscoped.campaign.update({
+        where: { id: campaignId },
+        data: {
+          status: 'PAUSED',
+          content: {
+            ...content,
+            haltReason: CAMPAIGNS_DISABLED_MESSAGE,
+            haltedAt: new Date().toISOString(),
+            pausedByPlatform: true,
+            ...(campaign.scheduledAt
+              ? { platformPausedScheduledAt: campaign.scheduledAt.toISOString() }
+              : {}),
+          } as object,
+        },
+        select: { id: true, name: true, status: true, stats: true, completedAt: true },
+      });
+      logger.warn(
+        { campaignId, organizationId },
+        'WhatsApp campaign parked — campaigns are switched off platform-wide',
+      );
+      return parked;
+    }
     if (!content.channelAccountId || !content.templateName) {
       throw new AppError('CAMPAIGN_INCOMPLETE', 400, 'This campaign is missing its WhatsApp account or template.');
     }
@@ -430,6 +503,7 @@ export const whatsappCampaignService = {
    * sent to keeps their SENT row and is skipped by the dispatch query.
    */
   async resume(campaignId: string) {
+    requireCampaignsEnabled();
     const organizationId = orgId();
     const campaign = await prismaUnscoped.campaign.findFirst({ where: { id: campaignId, organizationId, deletedAt: null } });
     if (!campaign) throw new NotFoundError('Campaign');

@@ -172,6 +172,11 @@ export const FIELD_DEFS: Record<Entity, FieldDef[]> = {
     { key: 'stock', label: 'Opening stock', accepts: ['number'], aliases: ['stock', 'quantity', 'qty', 'inventory quantity', 'on hand', 'initial stock', 'available'] },
     { key: 'barcode', label: 'Barcode', accepts: ['text', 'number'], aliases: ['barcode', 'ean', 'upc', 'gtin', 'isbn'] },
     { key: 'description', label: 'Description', accepts: ['text'], aliases: ['description', 'body', 'body html', 'details', 'summary'] },
+    {
+      key: 'imageUrl', label: 'Image URL', accepts: ['text'],
+      aliases: ['image', 'image url', 'image src', 'imageurl', 'photo', 'picture', 'thumbnail', 'image link', 'images'],
+      hint: 'A public https link to the picture; it is downloaded and stored with the product. Rows whose image cannot be fetched still import without one.',
+    },
     { key: 'category', label: 'Category', accepts: ['text', 'fullName'], aliases: ['category', 'product category', 'type', 'product type', 'collection'], hint: 'Created automatically if it does not exist' },
     { key: 'brand', label: 'Brand', accepts: ['text', 'fullName'], aliases: ['brand', 'vendor', 'manufacturer', 'make'], hint: 'Created automatically if it does not exist' },
     { key: 'variantName', label: 'Variant name', accepts: ['text'], aliases: ['variant name', 'variant', 'option', 'variant title'] },
