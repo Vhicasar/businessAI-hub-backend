@@ -20,6 +20,7 @@ import { senderIdService } from '../../../application/sms/sender-id.service';
 import { syncWorkspaceConfigFromAdmin } from '../../../application/settings/workspace-config-sync';
 import { syncOAuthConfigFromAdmin } from '../../../application/integrations/oauth-config-sync';
 import { adminEntitlementOverride, resolveEntitlements, type PlanLimits } from '../../../application/billing/entitlements';
+import * as organizationPurge from '../../../application/organizations/organization-purge.service';
 
 /**
  * Service API — for the Vhicasar Admin, not for tenants or end users.
@@ -65,6 +66,39 @@ serviceRoutes.use(requireServiceKey);
 
 // Platform-admin domain deployment configuration. The external Vhicasar Admin
 // uses these endpoints to add providers/domains and switch the active target.
+/**
+ * Empty a workspace without closing it.
+ *
+ * Behind the service key like everything else here, so only the Vhicasar Admin
+ * can reach it — never a workspace's own staff, however senior. The preflight
+ * is a separate call because nobody should be able to trigger this without
+ * first being shown, in rows, exactly what it takes.
+ */
+serviceRoutes.get('/organizations/:id/purge-preflight', wrap(async (req, res) => {
+  res.json({ success: true, data: await organizationPurge.purgePreflight(req.params.id as string) });
+}));
+
+serviceRoutes.post(
+  '/organizations/:id/purge',
+  validate({
+    body: z.object({
+      /** The workspace's name, typed out. An id alone is too easy to mistype. */
+      confirmName: z.string().trim().min(1),
+      /** Who asked for it, for the log. */
+      actor: z.string().trim().max(200).optional(),
+    }),
+  }),
+  wrap(async (req, res) => {
+    res.json({
+      success: true,
+      data: await organizationPurge.purgeOrganizationData(req.params.id as string, {
+        confirmName: req.body.confirmName,
+        actor: req.body.actor,
+      }),
+    });
+  }),
+);
+
 serviceRoutes.get('/domain-configs', wrap(async (_req, res) => {
   res.json({ success: true, data: await domainConfigService.list() });
 }));
@@ -463,9 +497,19 @@ serviceRoutes.delete('/organizations/:id/permanent', wrap(async (req, res) => {
   const id = req.params.id as string;
   const existing = await prismaUnscoped.organization.findFirst({ where: { id, deletedAt: { not: null } } });
   if (!existing) throw new NotFoundError('Deleted organization');
-  await prismaUnscoped.organization.delete({ where: { id } });
-  logger.warn({ organizationId: id, name: existing.name }, 'service API: organization permanently deleted');
-  res.json({ success: true, data: { permanentlyDeleted: true, id } });
+  /*
+   * This used to delete the organisation row alone, leaving every record it
+   * owned behind — products, invoices, customers, conversations — orphaned
+   * and still readable. Deleting an organisation now deletes what it owns.
+   */
+  const result = await organizationPurge.deleteOrganizationCompletely(id, {
+    actor: req.header('x-admin-actor') ?? 'vhicasar-admin',
+  });
+  logger.warn(
+    { organizationId: id, name: existing.name, totalDeleted: result.totalDeleted },
+    'service API: organization permanently deleted',
+  );
+  res.json({ success: true, data: { permanentlyDeleted: result.organizationRemoved, id, ...result } });
 }));
 
 /** One organisation, same shape as the list. */

@@ -20,6 +20,8 @@ const PERMS: Record<Entity, { read: string[]; write: string[] }> = {
   leads: { read: ['crm.read'], write: ['crm.create'] },
   employees: { read: ['employees.read'], write: ['employees.create'] },
   products: { read: ['catalog.read'], write: ['catalog.create'] },
+  // Same table, same permission — only the kind of row differs.
+  'raw-materials': { read: ['catalog.read'], write: ['catalog.create'] },
   'kb-articles': { read: ['support.read'], write: ['support.update'] },
   suppliers: { read: ['suppliers.read'], write: ['suppliers.create'] },
   'supplier-products': { read: ['suppliers.read'], write: ['suppliers.manage_products'] },

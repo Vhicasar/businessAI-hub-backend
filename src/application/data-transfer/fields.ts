@@ -7,7 +7,16 @@ import type { DetectedType } from './detect';
  */
 
 export const ENTITIES = [
-  'customers', 'leads', 'employees', 'products', 'kb-articles',
+  /*
+   * Raw materials are their own entity, not a flag on products.
+   *
+   * They were imported through `products`, which does not set a manufacturing
+   * type — so every raw material imported from the Raw Materials page arrived
+   * as an ordinary product and appeared under Products. Naming the entity is
+   * what stops that: the importer cannot forget which kind it is building
+   * when the kind is the thing being chosen.
+   */
+  'customers', 'leads', 'employees', 'products', 'raw-materials', 'kb-articles',
   'suppliers', 'supplier-products', 'purchase-orders', 'reorder-levels',
   // Onboarding: the two things a business has to load before it can trade —
   // where stock lives, and how much of it is there on day one.
@@ -189,6 +198,8 @@ export const FIELD_DEFS: Record<Entity, FieldDef[]> = {
     },
   ],
 
+  'raw-materials': [],
+
   suppliers: [
     externalId('Supplier ID (from your old system)', ['supplier id', 'supplierid', 'id', 'external id', 'vendor id', 'reference']),
     { key: 'name', label: 'Supplier name', required: true, accepts: ['text', 'fullName'], aliases: ['name', 'supplier', 'supplier name', 'vendor', 'vendor name', 'company'] },
@@ -271,12 +282,20 @@ export const FIELD_DEFS: Record<Entity, FieldDef[]> = {
   ],
 };
 
+/*
+ * A raw material is described by exactly the columns a product is — it is the
+ * same table and the same importer. Sharing the list rather than copying it
+ * means a column added to one can never go missing from the other.
+ */
+FIELD_DEFS['raw-materials'] = FIELD_DEFS.products;
+
 /** Fields that satisfy a required-field check as a group (either/or). */
 export const EITHER_OR: Record<Entity, string[][]> = {
   customers: [['email', 'phone'], ['firstName', 'fullName']],
   leads: [['email', 'phone'], ['firstName', 'fullName']],
   employees: [['firstName', 'fullName'], ['lastName', 'fullName']],
   products: [],
+  'raw-materials': [],
   'kb-articles': [],
   suppliers: [],
   'supplier-products': [],

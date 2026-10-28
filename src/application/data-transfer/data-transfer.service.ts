@@ -3,6 +3,7 @@ import { logger } from '../../shared/logger';
 import { requestContext } from '../../shared/context';
 import { filesService } from '../files/files.service';
 import { ingestImageFromUrl } from './image-ingest';
+import { productKindWhere } from '../catalog/product-classification';
 import { customersService } from '../customers/customers.service';
 import { crmService } from '../crm/crm.service';
 import { canSeeSalary, employeesService } from '../employees/employees.service';
@@ -503,7 +504,17 @@ function importerFor(entity: Entity, ctx: Ctx): RowImporter {
       };
 
     case 'products':
+    case 'raw-materials':
       return async (row) => {
+        /*
+         * The kind comes from the entity being imported, not from the file.
+         *
+         * Importing raw materials used to go through `products`, which sets no
+         * manufacturing type — so every one of them arrived as an ordinary
+         * product and turned up under Products. The entity names the kind, so
+         * it cannot be left out.
+         */
+        const isRawMaterial = entity === 'raw-materials';
         const name = val(row, 'name');
         const price = num(val(row, 'price'));
         if (!name) throw new Error('Missing product name');
@@ -533,6 +544,8 @@ function importerFor(entity: Entity, ctx: Ctx): RowImporter {
             {
               name,
               description: val(row, 'description') ?? null,
+              // A raw material is an input: it is never offered for sale.
+              ...(isRawMaterial ? { manufacturingType: 'RAW_MATERIAL', sellable: false } : {}),
               categoryId, brandId,
               status: status as never,
               taxRate: num(val(row, 'taxRate')) ?? 0,
@@ -1125,9 +1138,18 @@ export async function exportEntity(entity: Entity): Promise<{ filename: string; 
         'employmentType', 'status', ...(paid ? ['salary', 'currency'] : []), 'hiredAt', 'terminatedAt'];
       return { filename: `employees-${stamp}.csv`, csv: toCsv(headers, flat) };
     }
-    case 'products': {
+    case 'products':
+    case 'raw-materials': {
+      /*
+       * Export the kind that was asked for.
+       *
+       * This exported every product regardless, so exporting from the Raw
+       * Materials page handed back the whole catalogue — and re-importing that
+       * file turned the lot into raw materials. The filter is the same one the
+       * catalogue list uses, so the two always agree.
+       */
       const rows = await prisma.product.findMany({
-        where: { deletedAt: null },
+        where: { deletedAt: null, ...productKindWhere(entity === 'raw-materials' ? 'RAW_MATERIAL' : 'PRODUCT') },
         select: {
           id: true, name: true, description: true, status: true, taxRate: true, customFields: true,
           category: { select: { name: true } },
@@ -1179,7 +1201,7 @@ export async function exportEntity(entity: Entity): Promise<{ filename: string; 
       });
       const headers = ['productId', 'externalId', 'name', 'sku', 'variantName', 'price', 'compareAtPrice',
         'costPrice', 'stock', 'barcode', 'category', 'brand', 'description', 'imageUrl', 'taxRate', 'status'];
-      return { filename: `products-${stamp}.csv`, csv: toCsv(headers, flat) };
+      return { filename: `${entity}-${stamp}.csv`, csv: toCsv(headers, flat) };
     }
     case 'kb-articles': {
       const rows = await prisma.kbArticle.findMany({
