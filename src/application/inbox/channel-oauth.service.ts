@@ -96,9 +96,16 @@ export function oauthUnavailableReason(channelType: ChannelType): string | null 
   if (!(channelType in OAUTH_CHANNELS)) {
     return `${channelType} cannot be connected automatically — it is set up with its own credentials.`;
   }
-  // if (channelType === 'INSTAGRAM' ? !(instagramApp().appId && instagramApp().appSecret) : !metaConfigured()) {
-  //   return 'One-click connection is not configured on this deployment yet. Connect with your own credentials, or ask your administrator to finish the Meta app setup.';
-  // }
+  /*
+   * Restored. With this commented out the function always answered "no
+   * reason", while `supportsOAuth` above — the same check — still reported the
+   * channel as unavailable. The interface was therefore told one-click connect
+   * could not be offered and given nothing to say about why, so the only
+   * remaining signal was a Meta error page after the redirect.
+   */
+  if (channelType === 'INSTAGRAM' ? !(instagramApp().appId && instagramApp().appSecret) : !metaConfigured()) {
+    return 'One-click connection is not configured on this deployment yet. Connect with your own credentials, or ask your administrator to finish the Meta app setup.';
+  }
   return null;
 }
 

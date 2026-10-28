@@ -111,7 +111,9 @@ async function main() {
     const sub = await db.subscription.findFirstOrThrow({ where: { organizationId: orgId } });
     await db.subscription.update({
       where: { id: sub.id },
-      data: { planId: starter.id, status: 'TRIALING' },
+      // A real plan change repins the version; a raw update must too, or
+      // entitlements keep answering from the plan left behind.
+      data: { planId: starter.id, planVersionId: null, status: 'TRIALING' },
     });
     await db.billingRecord.create({
       data: {
@@ -155,6 +157,7 @@ async function main() {
       where: { id: sub.id },
       data: {
         planId: growth.id,
+        planVersionId: null,
         status: 'ACTIVE',
         currentPeriodStart: new Date(Date.now() - 60 * 86_400_000),
         currentPeriodEnd: new Date(Date.now() - 86_400_000),
@@ -180,6 +183,7 @@ async function main() {
       where: { id: sub.id },
       data: {
         planId: starter.id,
+        planVersionId: null,
         status: 'TRIALING',
         currentPeriodStart: new Date(),
         currentPeriodEnd: new Date(Date.now() + 13 * 86_400_000),
@@ -272,8 +276,21 @@ async function main() {
       branches: 'branchesRoutes',
     };
 
+    /*
+     * Channels are rationed per type, not by one total.
+     *
+     * `allowanceFor` reads the same `maxChannels` entitlement and refuses the
+     * connection, so the limit is enforced — just not through the generic
+     * `enforceLimit` helper the other four use. Looking only for that helper
+     * reports a limit as missing while it is doing its job.
+     */
+    const channelAllowanceEnforces =
+      readFileSync('src/application/inbox/channel-allowance.service.ts', 'utf8').includes('limits.maxChannels')
+      && /allowanceFor\(/.test(readFileSync('src/application/inbox/channels.service.ts', 'utf8'));
+
     for (const [kind, model] of Object.entries(countable)) {
-      const enforced = routeSrc.includes(`enforceLimit('${kind}')`);
+      const enforced = routeSrc.includes(`enforceLimit('${kind}')`)
+        || (kind === 'channels' && channelAllowanceEnforces);
       const creatable = new RegExp(`\\.${model}\\.(create|createMany|upsert)\\(`).test(appSrc);
       const reachable = mounted(routers[kind]!);
 
@@ -325,9 +342,18 @@ async function main() {
       !/<Navigate to="\/[^"]*" replace \/>/.test(router),
       'a bare <Navigate to="…"> alias is present',
     );
+    /*
+     * What matters is that the alias carries the incoming search and hash
+     * through, not the exact expression it uses to do it — the helper now
+     * merges a destination that has its own query rather than concatenating,
+     * and pinning the old string would fail a correct implementation.
+     */
+    const alias = readFileSync('../web/src/app/RedirectKeepingQuery.tsx', 'utf8');
     check(
       'aliases forward search and hash',
-      readFileSync('../web/src/app/RedirectKeepingQuery.tsx', 'utf8').includes('${search}${hash}'),
+      /const \{ search, hash \} = useLocation\(\)/.test(alias)
+      && alias.includes('${hash}')
+      && /search/.test(alias.split('useLocation()')[1] ?? ''),
     );
 
     // Where the gateway is told to return to.

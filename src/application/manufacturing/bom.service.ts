@@ -138,6 +138,19 @@ export const bomService = {
     const version = (latest?.version ?? 0) + 1;
     const bomNumber = await nextBomNumber();
 
+    /*
+     * Writing a recipe for something is the business saying it makes it.
+     *
+     * `manufacturingEnabled` defaults to false — most products are bought, not
+     * made — and nothing ever set it, so it stayed false even for products
+     * with a recipe and a production history. Setting it here means the flag
+     * finally describes something true.
+     */
+    await prisma.product.update({
+      where: { id: dto.productId },
+      data: { manufacturingEnabled: true },
+    }).catch(() => undefined);
+
     const bom = await prisma.$transaction(async (tx) => {
       if (dto.activate) await deactivateOthers(tx, dto.productId, null);
       return tx.billOfMaterial.create({
@@ -336,6 +349,67 @@ export const bomService = {
    * compare the answer with stock. Scrap is included, because a recipe that
    * needs 100 bottles and loses 2% needs 102 to be bought.
    */
+  /**
+   * Delete a recipe outright.
+   *
+   * Archiving keeps a recipe that was used to make something, which is the
+   * right default — a production order citing version 3 should still be able
+   * to show what version 3 said. So this refuses whenever an order or a plan
+   * points at it, and the message says which.
+   *
+   * Its own lines go with it: a `BillOfMaterialItem` has no meaning apart from
+   * the recipe it belongs to.
+   */
+  async remove(id: string) {
+    const bom = await prisma.billOfMaterial.findFirst({
+      where: { id },
+      select: { id: true, bomNumber: true, version: true, productId: true, product: { select: { name: true } } },
+    });
+    if (!bom) throw new NotFoundError('Recipe');
+
+    const [orders, plans] = await Promise.all([
+      prisma.productionOrder.count({ where: { bomId: id } }),
+      prisma.productionPlan.count({ where: { bomId: id } }),
+    ]);
+    if (orders > 0 || plans > 0) {
+      const used = [
+        orders > 0 ? `${orders} production order${orders === 1 ? '' : 's'}` : '',
+        plans > 0 ? `${plans} production plan${plans === 1 ? '' : 's'}` : '',
+      ].filter(Boolean).join(' and ');
+      throw new ConflictError(
+        `${bom.bomNumber} cannot be deleted because ${used} refer to it. Archive it instead.`,
+        { orders, plans },
+      );
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.billOfMaterialItem.deleteMany({ where: { bomId: id } });
+      await tx.billOfMaterial.delete({ where: { id } });
+    });
+
+    /*
+     * If that was the last recipe for the product, it is no longer something
+     * the business makes — leaving the flag on would keep it in every "what do
+     * you want to produce?" list with no recipe behind it.
+     */
+    const remaining = await prisma.billOfMaterial.count({ where: { productId: bom.productId } });
+    if (remaining === 0) {
+      await prisma.product.update({
+        where: { id: bom.productId },
+        data: { manufacturingEnabled: false },
+      }).catch(() => undefined);
+    }
+
+    await auditService.record({
+      action: 'bom.deleted',
+      entityType: 'BILL_OF_MATERIAL',
+      entityId: id,
+      before: { bomNumber: bom.bomNumber, version: bom.version, product: bom.product?.name },
+    }).catch(() => undefined);
+
+    return { deleted: true, bomNumber: bom.bomNumber };
+  },
+
   async requirementsFor(bomId: string, quantity: number) {
     const bom = await prisma.billOfMaterial.findFirst({
       where: { id: bomId, deletedAt: null },

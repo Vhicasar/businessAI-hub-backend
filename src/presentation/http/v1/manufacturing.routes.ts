@@ -180,6 +180,15 @@ manufacturingRoutes.post(
   }),
 );
 
+/** Delete a recipe outright. Refused while an order or plan still cites it. */
+manufacturingRoutes.delete(
+  '/boms/:id',
+  requirePermission('bom.delete'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await bomService.remove(req.params.id as string) });
+  }),
+);
+
 // ── Production plans ───────────────────────────────────────────────────────
 manufacturingRoutes.get(
   '/plans',

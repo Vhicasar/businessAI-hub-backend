@@ -80,7 +80,30 @@ async function main() {
     settings: { aiProvider: { provider: 'custom', model: 'stub-model', apiKeyEnc: encrypt('sk-stub'), baseUrl: `http://127.0.0.1:${PORT}/v1`, enabled: true } } } })).id;
   userId = (await db.user.create({ data: { email: `ai-build-${stamp}@example.invalid`, firstName: 'AI', lastName: 'Build', passwordHash: 'x' } })).id;
 
+  /*
+   * Building with AI is a paid-plan capability, so the refusal comes first:
+   * this workspace has no subscription, and the generator must not run.
+   */
   console.log('\nBuilding a website with AI');
+  const refused = await requestContext.run({ requestId: `aib-${stamp}`, organizationId: orgId, userId }, () =>
+    siteBuilderService.create({ name: 'Free Plan Bakery', mode: 'AI', prompt: 'A small bakery in Lagos with a contact page' } as never),
+  ).catch((e) => e);
+  check('a free plan is asked to upgrade',
+    refused instanceof Error && (refused as { code?: string }).code === 'PLAN_UPGRADE_REQUIRED',
+    refused instanceof Error ? refused.message : 'it built anyway');
+
+  // Put it on a paid plan; everything below is about the generator itself.
+  const paidPlan = await db.plan.findFirst({ where: { slug: 'growth' }, select: { id: true } });
+  if (paidPlan) {
+    const now = new Date();
+    await db.subscription.create({
+      data: {
+        organizationId: orgId, planId: paidPlan.id, status: 'ACTIVE', interval: 'MONTHLY',
+        currentPeriodStart: now, currentPeriodEnd: new Date(now.getTime() + 30 * 86_400_000),
+      },
+    });
+  }
+
   const site = await requestContext.run({ requestId: `aib-${stamp}`, organizationId: orgId, userId }, () =>
     siteBuilderService.create({ name: 'Stub Bakery', mode: 'AI', prompt: 'A small bakery in Lagos with a contact page' } as never),
   ).catch((e) => e);

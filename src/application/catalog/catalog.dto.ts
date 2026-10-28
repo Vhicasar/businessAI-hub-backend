@@ -22,7 +22,17 @@ export const variantSchema = z.object({
   barcode: z.string().trim().max(64).nullable().optional(),
   name: z.string().trim().max(120).nullable().optional(),
   options: z.record(z.string()).nullable().optional(),
-  price: z.coerce.number().nonnegative(),
+  /*
+   * Optional, because a raw material does not necessarily have one.
+   *
+   * Flour is bought by the sack at whatever this week's invoice says; a
+   * business tracking it for production has no "price" to type and should not
+   * be made to invent one. Anything actually offered for sale is required to
+   * carry a price by the form that creates it, which is where the distinction
+   * belongs — the API should not refuse a material for lacking a number that
+   * means nothing to it.
+   */
+  price: z.coerce.number().nonnegative().optional(),
   compareAtPrice: z.coerce.number().nonnegative().nullable().optional(),
   costPrice: z.coerce.number().nonnegative().nullable().optional(),
   isDefault: z.boolean().optional(),

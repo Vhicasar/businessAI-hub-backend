@@ -545,7 +545,23 @@ export const channelsService = {
           },
         });
 
-    await recordChannelEvent(account.id, existing ? 'Channel OAuth retry started' : 'Channel OAuth connection started', {
+    /*
+     * A completed sign-in is a connection, so it reads as one.
+     *
+     * The row was left CONNECTING and nothing ever moved it, so a business
+     * that had just signed in successfully saw "Connecting…" indefinitely and
+     * had no way to tell a working channel from a stalled one.
+     *
+     * This is the OAuth path: the authorisation code has already been
+     * exchanged with the provider and the account it names resolved, which is
+     * as much proof as exists at this point. Anything that goes wrong
+     * afterwards — a webhook subscription that will not take, a token the
+     * provider later rejects — moves it off CONNECTED through the usual
+     * health path, which is where a failure belongs.
+     */
+    await markChannelConnected(account.id);
+
+    await recordChannelEvent(account.id, existing ? 'Channel reconnected' : 'Channel connected', {
       body: [
         `Type: ${channelType}`,
         `Account: ${connection.displayName}`,
@@ -555,6 +571,7 @@ export const channelsService = {
         channelType,
         externalId,
         connectedVia: connection.metadata.connectedVia ?? 'oauth',
+        next: { isActive: true, status: 'CONNECTED' },
       },
     });
 

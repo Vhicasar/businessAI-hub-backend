@@ -58,7 +58,12 @@ catalogRoutes.get(
   '/products/:id',
   requirePermission('catalog.read'),
   wrap(async (req, res) => {
-    res.json({ success: true, data: await catalogService.getProduct(req.params.id as string) });
+    // Archived products are readable here, because this is the page that
+    // restores them or removes them for good.
+    res.json({
+      success: true,
+      data: await catalogService.getProduct(req.params.id as string, { includeArchived: true }),
+    });
   })
 );
 
@@ -77,6 +82,38 @@ catalogRoutes.delete(
   wrap(async (req, res) => {
     await catalogService.deleteProduct(req.params.id as string);
     res.json({ success: true, data: { message: 'Product archived' } });
+  })
+);
+
+/** Bring an archived product back into the catalogue. */
+catalogRoutes.post(
+  '/products/:id/restore',
+  requirePermission('catalog.update'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await catalogService.restoreProduct(req.params.id as string) });
+  })
+);
+
+/**
+ * What a permanent delete would take with it, and what is blocking it.
+ *
+ * Read before offering the action, so the confirmation can state the
+ * consequence instead of discovering it on submit.
+ */
+catalogRoutes.get(
+  '/products/:id/purge-preflight',
+  requirePermission('catalog.delete'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await catalogService.purgePreflight(req.params.id as string) });
+  })
+);
+
+/** Permanent, irreversible, and only ever for a product that is archived. */
+catalogRoutes.delete(
+  '/products/:id/permanent',
+  requirePermission('catalog.delete'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await catalogService.purgeProduct(req.params.id as string) });
   })
 );
 

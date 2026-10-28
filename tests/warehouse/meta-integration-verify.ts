@@ -85,9 +85,39 @@ function startGraphStub(): Promise<number> {
         if (url.pathname.includes('/owned_whatsapp_business_accounts')) {
           return json(200, { data: [{ id: 'waba-1', name: 'Eleganz WABA' }] });
         }
+        /*
+         * The WABA's own record. The connect flow reads it for the currency
+         * and the owning business, which is how a conversation is later priced
+         * and attributed. The stub did not serve it, so the suite stopped here
+         * even though the product was asking Graph for something real.
+         */
+        // Templates the business has had approved — read when the connection
+        // finishes so campaigns know what they may send.
+        if (url.pathname.includes('/message_templates')) {
+          return json(200, {
+            data: [
+              { id: 'tpl-1', name: 'order_update', language: 'en_US', status: 'APPROVED', category: 'UTILITY' },
+            ],
+          });
+        }
+        if (/\/waba-1$/.test(url.pathname)) {
+          return json(200, {
+            id: 'waba-1',
+            name: 'Eleganz WABA',
+            currency: 'NGN',
+            owner_business_info: { id: 'biz-1', name: 'Eleganz Group' },
+          });
+        }
         if (url.pathname.includes('/phone_numbers')) {
           return json(200, {
-            data: [{ id: 'phone-1', display_phone_number: '+234 800 000 0001', verified_name: 'Eleganz' }],
+            data: [{
+              id: 'phone-1', display_phone_number: '+234 800 000 0001', verified_name: 'Eleganz',
+              // A registered, verified number. Without these the product
+              // rightly treats the connection as needing setup and leaves it
+              // SETUP_REQUIRED, which is not the path this suite is testing.
+              status: 'CONNECTED', code_verification_status: 'VERIFIED',
+              quality_rating: 'GREEN', platform_type: 'CLOUD_API',
+            }],
           });
         }
         // Pages, for Messenger and Instagram.
@@ -168,8 +198,15 @@ async function main() {
     const ig = oauth.authorizationUrl({
       channelType: 'INSTAGRAM', organizationId: orgId, userId: 'user-1',
     });
+    /*
+     * Either vocabulary counts. Instagram's own login asks for
+     * `instagram_business_manage_messages`; connecting through a Facebook page
+     * asks for `instagram_manage_messages`. Both are "let us read and answer
+     * this account's messages", and which one is sent depends on the login
+     * mode the deployment is configured for.
+     */
     check('Instagram asks to manage messages',
-      new URL(ig.url).searchParams.get('scope')?.includes('instagram_manage_messages') === true);
+      /instagram(_business)?_manage_messages/.test(new URL(ig.url).searchParams.get('scope') ?? ''));
     check('and each channel gets its own callback',
       new URL(ig.url).searchParams.get('redirect_uri')?.endsWith('/instagram/callback') === true);
   }

@@ -181,9 +181,32 @@ export const catalogService = {
   async listProducts(dto: ListProductsDto) {
     const entitlements = await resolveEntitlements();
     await reconcileSubscriptionDrafts(entitlements);
+    /*
+     * Archiving a product soft-deletes it, so an ordinary listing — which
+     * excludes soft-deleted rows — could never show one. Asking for the
+     * archived ones therefore has to look on the other side of that line.
+     *
+     * Without this the Archived filter returned nothing, and archiving read as
+     * permanent deletion: the product vanished from every view with no way to
+     * see it again, let alone bring it back.
+     *
+     * Only this listing crosses the line. Everywhere else — analytics, AI
+     * context, exports, component pickers — keeps treating soft-deleted as
+     * gone, so nothing archived leaks into a place it does not belong.
+     */
+    const archivedOnly = dto.status === 'ARCHIVED';
     const rows = await prisma.product.findMany({
       where: {
-        deletedAt: null,
+        /*
+         * Asking for archived products drops the soft-delete filter entirely
+         * rather than inverting it.
+         *
+         * Archiving from the product page soft-deletes; setting the status to
+         * Archived on the edit form does not. Both are archived as far as
+         * anyone using the product is concerned, so matching only the
+         * soft-deleted ones would hide half of them.
+         */
+        ...(archivedOnly ? {} : { deletedAt: null }),
         subscriptionDraftAt: dto.subscriptionState === 'draft' ? { not: null } : null,
         ...(dto.status ? { status: dto.status } : {}),
         ...(dto.categoryId ? { categoryId: dto.categoryId } : {}),
@@ -219,9 +242,21 @@ export const catalogService = {
     };
   },
 
-  async getProduct(id: string) {
+  /**
+   * One product.
+   *
+   * `includeArchived` exists because archiving soft-deletes, and the product
+   * page is the only place an archived product can be restored or removed for
+   * good. Without it that page answered "not found" for exactly the products
+   * it was needed for, so the Archived list led nowhere.
+   *
+   * Off by default: every other caller — updating, adding a variant, adjusting
+   * stock — is asking about a product in circulation, and should not quietly
+   * start operating on an archived one.
+   */
+  async getProduct(id: string, opts: { includeArchived?: boolean } = {}) {
     const product = await prisma.product.findFirst({
-      where: { id, deletedAt: null },
+      where: { id, ...(opts.includeArchived ? {} : { deletedAt: null }) },
       select: productSelect,
     });
     if (!product) throw new NotFoundError('Product');
@@ -292,7 +327,10 @@ export const catalogService = {
               barcode: v.barcode ?? null,
               name: v.name ?? null,
               options: v.options ?? undefined,
-              price: v.price,
+              // No price given — stored as zero rather than refused. A raw
+              // material priced at nothing is accurate; one that cannot be
+              // created at all is not.
+              price: v.price ?? 0,
               compareAtPrice: v.compareAtPrice ?? null,
               costPrice: v.costPrice ?? null,
               currency,
@@ -363,7 +401,15 @@ export const catalogService = {
   },
 
   async deleteProduct(id: string) {
-    await this.getProduct(id);
+    /*
+     * Archiving something already archived used to report "Product not found",
+     * because the lookup excluded archived rows — a confusing answer to a
+     * reasonable action. It is read inclusively and refused on its own terms.
+     */
+    const existing = await this.getProduct(id, { includeArchived: true });
+    if (existing.status === 'ARCHIVED') {
+      throw new ConflictError(`"${existing.name}" is already archived.`);
+    }
     await prisma.$transaction([
       prisma.product.update({ where: { id }, data: { deletedAt: new Date(), status: 'ARCHIVED' } }),
       prisma.productVariant.updateMany({
@@ -371,6 +417,155 @@ export const catalogService = {
         data: { deletedAt: new Date(), isActive: false },
       }),
     ]);
+  },
+
+  /**
+   * Bring an archived product back.
+   *
+   * The counterpart to archiving, and the thing that makes archiving something
+   * other than a slow delete. Restores the variants too — they were
+   * deactivated with it, and a product whose variants are all inactive is
+   * back in the catalogue but cannot be sold.
+   */
+  async restoreProduct(id: string) {
+    const product = await prisma.product.findFirst({
+      where: { id },
+      select: { id: true, name: true, status: true, deletedAt: true },
+    });
+    if (!product) throw new NotFoundError('Product');
+    if (product.status !== 'ARCHIVED' && product.deletedAt === null) {
+      throw new ValidationError('This product is not archived.');
+    }
+    await prisma.$transaction([
+      prisma.product.update({ where: { id }, data: { deletedAt: null, status: 'ACTIVE' } }),
+      prisma.productVariant.updateMany({
+        where: { productId: id },
+        data: { deletedAt: null, isActive: true },
+      }),
+    ]);
+    return { restored: true, name: product.name };
+  },
+
+  /**
+   * What a permanent delete would destroy, and what is standing in its way.
+   *
+   * Asked before the deed so the interface can say *why* rather than failing
+   * at the database and showing a constraint name. Everything listed under
+   * `blockedBy` is history or a live commitment: an order that was placed, a
+   * production run that consumed it, stock that is still on a shelf. None of
+   * those can be rewritten by removing the product they point at.
+   */
+  async purgePreflight(id: string) {
+    const organizationId = orgId();
+    const product = await prisma.product.findFirst({
+      where: { id },
+      select: { id: true, name: true, status: true, deletedAt: true, variants: { select: { id: true } } },
+    });
+    if (!product) throw new NotFoundError('Product');
+    // An archived product is soft-deleted, so its variants are too — they must
+    // still be counted, or the pre-flight reports a product with no variants
+    // and the delete leaves them behind.
+    const variantIds = product.variants.map((v) => v.id);
+
+    const [orderItems, movements, batches, cartItems, bomUses, productionMaterials, receipts, requisitions, stock] =
+      await Promise.all([
+        prisma.orderItem.count({ where: { variantId: { in: variantIds } } }),
+        prisma.stockMovement.count({ where: { variantId: { in: variantIds } } }),
+        prisma.batch.count({ where: { variantId: { in: variantIds } } }),
+        prisma.cartItem.count({ where: { variantId: { in: variantIds } } }),
+        prisma.billOfMaterialItem.count({ where: { variantId: { in: variantIds } } }),
+        prisma.productionMaterial.count({ where: { variantId: { in: variantIds } } }),
+        prisma.finishedGoodsReceipt.count({ where: { variantId: { in: variantIds } } }),
+        prisma.internalRequisitionItem.count({ where: { variantId: { in: variantIds } } }),
+        prisma.stockLevel.findMany({
+          where: { variantId: { in: variantIds } },
+          select: { quantity: true, reserved: true },
+        }),
+      ]);
+    const onHand = stock.reduce((sum, level) => sum + Number(level.quantity) + Number(level.reserved), 0);
+    const ownRecipes = await prisma.billOfMaterial.count({ where: { productId: id } });
+
+    const blockedBy: { reason: string; count: number }[] = [];
+    const block = (reason: string, count: number) => { if (count > 0) blockedBy.push({ reason, count }); };
+    block('appears on customer orders', orderItems);
+    block('has batches recorded', batches);
+    block('is in a shopping cart', cartItems);
+    block('is used as a component in a recipe', bomUses);
+    block('has been consumed by production', productionMaterials);
+    block('has been received from production', receipts);
+    block('appears on an internal requisition', requisitions);
+    if (onHand > 0) blockedBy.push({ reason: 'still has stock on hand or reserved', count: Math.round(onHand) });
+
+    return {
+      productId: product.id,
+      name: product.name,
+      /*
+       * Stock movements do not block.
+       *
+       * They are this product's own inventory bookkeeping, and a product being
+       * deleted on purpose takes its bookkeeping with it — blocking on them
+       * would make any product that ever had opening stock permanently
+       * undeletable, which is every product. What does block is stock that is
+       * actually there: deleting a product sitting on a shelf loses it.
+       */
+      movements,
+      archived: product.status === 'ARCHIVED' || product.deletedAt !== null,
+      canPurge: blockedBy.length === 0 && (product.status === 'ARCHIVED' || product.deletedAt !== null),
+      blockedBy,
+      /** Removed along with it — these belong to the product and nothing else. */
+      alsoRemoved: {
+        variants: variantIds.length,
+        recipes: ownRecipes,
+      },
+      organizationId,
+    };
+  },
+
+  /**
+   * Remove a product for good.
+   *
+   * Only for one that is already archived. Archiving is the reversible step and
+   * the one people reach for; this is the irreversible one, and offering them
+   * side by side is how a catalogue loses a product somebody still needed.
+   *
+   * Refuses outright when anything references it. The pre-flight above says
+   * what, so the refusal names the obstacle rather than surfacing a foreign key
+   * violation.
+   */
+  async purgeProduct(id: string) {
+    const check = await this.purgePreflight(id);
+    if (!check.archived) {
+      throw new ValidationError('Only an archived product can be permanently deleted. Archive it first.');
+    }
+    if (check.blockedBy.length > 0) {
+      throw new ConflictError(
+        `"${check.name}" cannot be permanently deleted because it ${check.blockedBy.map((b) => b.reason).join(', and ')}.`,
+        { blockedBy: check.blockedBy },
+      );
+    }
+
+    const images = await prisma.productImage.findMany({ where: { productId: id }, select: { fileId: true } });
+
+    await prisma.$transaction(async (tx) => {
+      const variants = await tx.productVariant.findMany({ where: { productId: id }, select: { id: true } });
+      const variantIds = variants.map((v) => v.id);
+      // Everything below belongs to the product rather than recording anything
+      // that happened, so it goes with it.
+      await tx.billOfMaterialItem.deleteMany({ where: { bom: { productId: id } } });
+      await tx.billOfMaterial.deleteMany({ where: { productId: id } });
+      await tx.priceListItem.deleteMany({ where: { variantId: { in: variantIds } } });
+      await tx.supplierProduct.deleteMany({ where: { productId: id } });
+      await tx.productExternalReference.deleteMany({ where: { productId: id } });
+      await tx.productImage.deleteMany({ where: { productId: id } });
+      await tx.stockMovement.deleteMany({ where: { variantId: { in: variantIds } } });
+      await tx.stockLevel.deleteMany({ where: { variantId: { in: variantIds } } });
+      await tx.productVariant.deleteMany({ where: { productId: id } });
+      await tx.product.delete({ where: { id } });
+    });
+
+    // The gallery rows are gone; drop the files they were holding.
+    for (const image of images) await filesService.remove(image.fileId).catch(() => undefined);
+    return { deleted: true, permanent: true };
   },
 
   // ------------------------------------------------------------- variants
@@ -392,7 +587,7 @@ export const catalogService = {
           barcode: dto.barcode ?? null,
           name: dto.name ?? null,
           options: dto.options ?? undefined,
-          price: dto.price,
+          price: dto.price ?? 0,
           compareAtPrice: dto.compareAtPrice ?? null,
           costPrice: dto.costPrice ?? null,
           currency,
