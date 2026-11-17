@@ -33,6 +33,8 @@ let server: Server | null = null;
 /** What the stubbed Meta does next: succeed, or refuse for a given reason. */
 let metaMode: 'ok' | 'billing' | 'billing_after_first' | 'template' | 'rate_limit' = 'ok';
 let sendCount = 0;
+/** Every message body the stub was handed, so the payload can be read back. */
+const sendBodies: Array<Record<string, any>> = [];
 
 const asOrg = <T>(fn: () => Promise<T>, organizationId = orgId) =>
   requestContext.run({ requestId: `wac-${stamp}`, organizationId, userId }, fn);
@@ -53,6 +55,7 @@ async function startStubMeta() {
       res.setHeader('content-type', 'application/json');
       if (req.url?.includes('/messages')) {
         sendCount += 1;
+        try { sendBodies.push(JSON.parse(body || '{}')); } catch { /* ignore */ }
         if (metaMode === 'billing' || (metaMode === 'billing_after_first' && sendCount > 1)) {
           res.statusCode = 400;
           return res.end(JSON.stringify({ error: { code: 131042, error_subcode: 2494055, message: 'Business eligibility payment issue', type: 'OAuthException' } }));
@@ -225,6 +228,25 @@ async function main() {
     billingNow.setupUrl === 'https://business.facebook.com/wa/manage/home/');
   check('the one that got through is recorded as sent', (afterBilling.stats as { sent: number }).sent === 1, JSON.stringify(afterBilling.stats));
 
+  /*
+   * The fault this guards: the adapter sent the rendered sentence as ONE body
+   * parameter whatever the template declared, so a two-placeholder template was
+   * told it had one and Meta refused the lot with
+   * "(#132000) Number of parameters does not match the expected number".
+   */
+  console.log('\nWhat Meta is actually sent for a two-placeholder template');
+  {
+    const sent = sendBodies.find((b) => b.type === 'template');
+    check('the message goes as a template', Boolean(sent), JSON.stringify(sendBodies[0] ?? {}));
+    const params = sent?.template?.components?.[0]?.parameters ?? [];
+    check('with one parameter per placeholder, not one for the whole sentence',
+      params.length === 2, `${params.length} parameter(s): ${JSON.stringify(params)}`);
+    check('carrying the values, not the rendered text',
+      params[0]?.text === 'there' && params[1]?.text === '20%', JSON.stringify(params));
+    check('and never the assembled sentence as a parameter',
+      !params.some((p: any) => String(p?.text ?? '').includes('enjoy')), JSON.stringify(params));
+  }
+
   // ── 6. Receiving still works ─────────────────────────────────────────────
   console.log('\nInbound is unaffected by the billing block');
   const stillActive = await db.channelAccount.findUniqueOrThrow({ where: { id: accountId } });
@@ -258,6 +280,20 @@ async function main() {
   check('and says it was the template', /template/i.test(templateReport.haltReason ?? ''), templateReport.haltReason ?? '');
   const billingUnchanged = await whatsappBillingService.status(accountId, orgId);
   check('the billing state is left alone', billingUnchanged.state === 'READY', billingUnchanged.state);
+
+  /*
+   * The screen never fetches the report — it shows what `launch` returned. So
+   * the reason has to survive on that response, not only on the record. It did
+   * not use to be read from there, which is why a halted campaign said only
+   * "Campaign paused" and left the business with nothing to act on.
+   */
+  const launchStats = (second.stats ?? {}) as { haltReason?: string; sent?: number; total?: number };
+  check('the launch response carries the reason, not just the record',
+    /template/i.test(launchStats.haltReason ?? ''), JSON.stringify(second.stats));
+  check('along with how far it got', typeof launchStats.sent === 'number' && typeof launchStats.total === 'number',
+    JSON.stringify(second.stats));
+  check('and the record agrees with the response',
+    launchStats.haltReason === templateReport.haltReason);
 
   // ── 9. Cancellation ──────────────────────────────────────────────────────
   console.log('\nCancellation');

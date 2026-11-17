@@ -160,6 +160,20 @@ export interface OutboundPayload {
   isMarketing?: boolean;
   templateName?: string;
   templateLanguage?: string;
+  /**
+   * One value per {{n}} the template declares, in order.
+   *
+   * Distinct from `text`, which is those same values already substituted into
+   * the template for our own records. Meta wants the values, not the sentence:
+   * sending the rendered sentence as a single parameter means a two-parameter
+   * template is told it has one, which Meta refuses with
+   * "(#132000) Number of parameters does not match the expected number".
+   *
+   * An empty array is meaningful — a template with no placeholders takes no
+   * parameters at all — so this is left undefined rather than empty by callers
+   * that do not know.
+   */
+  templateParameters?: string[];
   /** Public image URLs to deliver natively when the channel supports media. */
   mediaUrls?: string[];
   /**

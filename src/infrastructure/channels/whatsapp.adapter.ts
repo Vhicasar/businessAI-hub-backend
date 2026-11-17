@@ -62,6 +62,18 @@ interface WaWebhookBody {
 }
 
 /** Shared by all Meta-family adapters (WhatsApp, Messenger, Instagram). */
+/** The `components` Meta expects for a template send, or nothing at all. */
+function templateComponents(payload: OutboundPayload): { components?: unknown[] } {
+  const values = payload.templateParameters ?? (payload.text ? [payload.text] : []);
+  if (!values.length) return {};
+  return {
+    components: [{
+      type: 'body',
+      parameters: values.map((text) => ({ type: 'text', text })),
+    }],
+  };
+}
+
 export function verifyMetaSignature(req: WebhookRequestLike, appSecret: string): boolean {
   const header = req.headers['x-hub-signature-256'];
   const rawBody = (req as { rawBody?: Buffer }).rawBody;
@@ -368,7 +380,17 @@ export class WhatsAppAdapter implements ChannelAdapter {
               template: {
                 name: payload.templateName,
                 language: { code: payload.templateLanguage || 'en_US' },
-                components: [{ type: 'body', parameters: [{ type: 'text', text: payload.text }] }],
+                /*
+                 * Meta counts parameters, and counts them exactly. A template
+                 * with no placeholders must be sent with no body component at
+                 * all; one with two must be sent two values, not the rendered
+                 * sentence as a single value.
+                 *
+                 * Callers that do not supply `templateParameters` keep the old
+                 * single-parameter shape, because changing what they send is
+                 * not this fix's business.
+                 */
+                ...templateComponents(payload),
               },
             }
           : { messaging_product: 'whatsapp', to: payload.recipientExternalId, type: 'text', text: { body: payload.text } }];

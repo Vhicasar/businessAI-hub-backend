@@ -382,6 +382,8 @@ export const whatsappCampaignService = {
             isMarketing: true,
             templateName: template.name,
             templateLanguage: template.language,
+            /* The values themselves, which is what Meta counts. */
+            templateParameters: rendered.parameters,
           },
           {
             id: account.id,
