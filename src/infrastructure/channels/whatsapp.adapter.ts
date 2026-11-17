@@ -54,7 +54,7 @@ interface WaWebhookBody {
           id: string;
           status?: string;
           timestamp?: string;
-          errors?: { title?: string; message?: string }[];
+          errors?: { code?: number; title?: string; message?: string }[];
         }[];
       };
     }[];
@@ -258,6 +258,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
               ? new Date(Number(status.timestamp) * 1000)
               : undefined,
             error: status.errors?.[0]?.message ?? status.errors?.[0]?.title,
+            errorCode: typeof status.errors?.[0]?.code === 'number' ? status.errors[0].code : undefined,
           });
         }
       }

@@ -344,6 +344,61 @@ async function main() {
     check('a receipt for something else is left alone', foreign === false);
   }
 
+  /*
+   * The one that reads as success and is not.
+   *
+   * Meta accepts the message, returns an id, and only afterwards refuses to
+   * deliver it because the business has no payment method. That refusal lands
+   * on the receipt, so the send-path halt never fires — and the campaign
+   * reported "sent" while the customer got nothing.
+   */
+  console.log('\nMeta accepts, then refuses to deliver over billing');
+  {
+    metaMode = 'ok';
+    const third = await asOrg(() => whatsappCampaignService.launch({
+      name: 'Accepted then refused', channelAccountId: accountId,
+      templateName: 'seasonal_offer', templateLanguage: 'en_US',
+      variables: { '1': 'there', '2': '20%' }, segment: { kind: 'ALL_ELIGIBLE' },
+    }));
+    check('it reports as sent at first', third.status === 'SENT', third.status);
+
+    const before = await asOrg(() => whatsappCampaignService.report(third.id));
+    const wamid = before.recipients.find((r) => r.providerMessageId)?.providerMessageId as string;
+    await whatsappCampaignService.applyDeliveryReceipt(orgId, {
+      providerMessageId: wamid, status: 'FAILED',
+      error: 'Business eligibility payment issue', errorCode: 131042,
+    });
+
+    const after = await asOrg(() => whatsappCampaignService.report(third.id));
+    check('the campaign stops calling itself sent', after.status === 'PARTIALLY_SENT', after.status);
+    check('and says it was billing, not a bad campaign',
+      /payment method/i.test(after.haltReason ?? ''), after.haltReason ?? '');
+    const billingFromReceipt = await whatsappBillingService.status(accountId, orgId);
+    check('the account is marked as needing billing', billingFromReceipt.state === 'BILLING_REQUIRED',
+      billingFromReceipt.state);
+    check('so it can be resumed once billing is fixed',
+      ['PARTIALLY_SENT', 'PAUSED', 'FAILED'].includes(after.status));
+
+    /*
+     * An ordinary undeliverable number must not accuse anyone of not paying.
+     * Checked as "does not change the halt", because this campaign halted on
+     * billing earlier in this very suite — asserting on its text alone would
+     * pass or fail for reasons that have nothing to do with this receipt.
+     */
+    const beforePlain = await asOrg(() => whatsappCampaignService.report(campaign.id));
+    const otherWamid = beforePlain.recipients.filter((r) => r.providerMessageId)[1]?.providerMessageId as string;
+    await whatsappCampaignService.applyDeliveryReceipt(orgId, {
+      providerMessageId: otherWamid, status: 'FAILED', error: 'Recipient unreachable', errorCode: 131026,
+    });
+    const afterPlain = await asOrg(() => whatsappCampaignService.report(campaign.id));
+    check('a plain delivery failure leaves the campaign\u2019s halt alone',
+      afterPlain.haltReason === beforePlain.haltReason, `${beforePlain.haltReason} -> ${afterPlain.haltReason}`);
+    check('but is still recorded against that recipient',
+      afterPlain.recipients.find((r) => r.providerMessageId === otherWamid)?.status === 'FAILED');
+    check('with the reason Meta actually gave',
+      /unreachable/i.test(afterPlain.recipients.find((r) => r.providerMessageId === otherWamid)?.error ?? ''));
+  }
+
   // ── 9. Cancellation ──────────────────────────────────────────────────────
   console.log('\nCancellation');
   const cancelled = await asOrg(() => whatsappCampaignService.cancel(second.id));

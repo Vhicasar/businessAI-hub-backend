@@ -226,6 +226,15 @@ export interface NormalizedStatus {
   occurredAt?: Date;
   /** Why it failed, when the provider says. */
   error?: string;
+  /**
+   * The provider's numeric code for that failure.
+   *
+   * Kept apart from the wording because the wording moves between API
+   * versions and the code does not — and telling "add a payment method" apart
+   * from "this number is unreachable" is the difference between warning the
+   * business and quietly dropping one recipient.
+   */
+  errorCode?: number;
 }
 
 export interface WebhookRequestLike {

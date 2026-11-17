@@ -5,7 +5,7 @@ import { logger } from '../../shared/logger';
 import { decrypt } from '../../shared/crypto';
 import { AppError, ConflictError, NotFoundError } from '../../shared/errors';
 import { getAdapter } from '../../infrastructure/channels/registry';
-import { MetaSendError, isRetryable } from '../../infrastructure/channels/meta-error';
+import { MetaSendError, classifyMetaFailure, isRetryable } from '../../infrastructure/channels/meta-error';
 import { enqueue } from '../../infrastructure/queue/queue';
 import { resolveEntitlements } from '../billing/entitlements';
 import { usageService, USAGE_METRICS } from '../billing/usage.service';
@@ -125,6 +125,16 @@ async function loadSendingAccount(accountId: string, organizationId: string) {
 export function whatsappCampaignsEnabled(): boolean {
   return isPlatformFeatureEnabled(PLATFORM_FEATURES.whatsappCampaigns);
 }
+
+/**
+ * What a business is told when Meta accepted the messages and then refused to
+ * deliver them. Deliberately not the word "failed" on its own: nothing is
+ * wrong with the campaign or the template, and the fix is one specific thing.
+ */
+export const BILLING_RECEIPT_MESSAGE =
+  'Meta accepted these messages and then refused to deliver them because this WhatsApp Business '
+  + 'Account has no usable payment method. Add one at Meta, then resume the campaign — anyone '
+  + 'already delivered to will not be messaged again.';
 
 export const CAMPAIGNS_DISABLED_MESSAGE =
   'WhatsApp campaigns are currently unavailable on this platform. Your existing campaigns '
@@ -522,7 +532,7 @@ export const whatsappCampaignService = {
    */
   async applyDeliveryReceipt(
     organizationId: string,
-    update: { providerMessageId: string; status: 'SENT' | 'DELIVERED' | 'READ' | 'FAILED'; occurredAt?: Date; error?: string },
+    update: { providerMessageId: string; status: 'SENT' | 'DELIVERED' | 'READ' | 'FAILED'; occurredAt?: Date; error?: string; errorCode?: number },
   ): Promise<boolean> {
     if (!update.providerMessageId) return false;
     const recipient = await prismaUnscoped.campaignRecipient.findFirst({
@@ -551,11 +561,73 @@ export const whatsappCampaignService = {
         ...(next === 'FAILED' ? { error: (update.error ?? 'Meta could not deliver this message').slice(0, 500) } : {}),
       },
     });
-    if (next === 'FAILED') {
-      logger.warn(
-        { campaignId: recipient.campaignId, organizationId, providerMessageId: update.providerMessageId, reason: update.error },
-        'WhatsApp campaign message failed after Meta accepted it',
-      );
+    if (next !== 'FAILED') return true;
+
+    logger.warn(
+      { campaignId: recipient.campaignId, organizationId, providerMessageId: update.providerMessageId, reason: update.error, metaCode: update.errorCode },
+      'WhatsApp campaign message failed after Meta accepted it',
+    );
+
+    /*
+     * Why the campaign said "sent" while nothing arrived.
+     *
+     * Meta accepts a message, returns an id, and only afterwards decides it
+     * will not deliver it because the business has no payment method. That
+     * refusal arrives here, on the receipt — not on the send — so the halt
+     * that guards the send path never fired and the campaign reported success.
+     *
+     * Classified by the same rules as a send refusal, so a billing problem is
+     * a billing problem whichever way Meta reports it.
+     */
+    const kind = classifyMetaFailure({
+      code: update.errorCode ?? null,
+      subcode: null,
+      type: null,
+      message: update.error ?? '',
+      details: null,
+      httpStatus: 200,
+    });
+    if (kind !== 'BILLING_REQUIRED') return true;
+
+    const campaign = await prismaUnscoped.campaign.findFirst({
+      where: { id: recipient.campaignId, organizationId },
+      select: { id: true, status: true, content: true },
+    });
+    if (!campaign) return true;
+    const content = (campaign.content ?? {}) as CampaignContent;
+
+    /* Record it against the account, so every screen that asks sees it. */
+    if (content.channelAccountId) {
+      await whatsappBillingService.markBillingRequired(content.channelAccountId, {
+        code: update.errorCode ?? 131042,
+        subcode: null,
+        type: null,
+        message: update.error ?? 'Business eligibility payment issue',
+        details: null,
+        httpStatus: 200,
+      }).catch((err) => logger.warn({ err, campaignId: campaign.id }, 'Could not record billing state from a delivery receipt'));
+    }
+
+    /*
+     * And stop the campaign calling itself sent. Every remaining message will
+     * be refused for the same reason, so it is halted exactly as a send-time
+     * billing refusal would halt it — which also makes it resumable once the
+     * business fixes billing.
+     */
+    if (campaign.status !== 'PARTIALLY_SENT') {
+      await prismaUnscoped.campaign.update({
+        where: { id: campaign.id },
+        data: {
+          status: 'PARTIALLY_SENT',
+          completedAt: null,
+          content: {
+            ...content,
+            haltReason: BILLING_RECEIPT_MESSAGE,
+            haltedAt: new Date().toISOString(),
+          } as object,
+        },
+      });
+      logger.warn({ campaignId: campaign.id, organizationId }, 'WhatsApp campaign reopened — Meta refused delivery over billing');
     }
     return true;
   },
