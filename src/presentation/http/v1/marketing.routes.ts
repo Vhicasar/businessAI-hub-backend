@@ -11,9 +11,12 @@ import {
 } from '../../../application/messaging/campaign.service';
 import { couponSchema, promotionSchema, promotionsService } from '../../../application/marketing/promotions.service';
 import { loyaltyProgramSchema, loyaltyService } from '../../../application/marketing/loyalty.service';
-import { launchSchema, whatsappCampaignService } from '../../../application/messaging/whatsapp-campaign.service';
+import {
+  CAMPAIGNS_DISABLED_MESSAGE, launchSchema, whatsappCampaignService, whatsappCampaignsEnabled,
+} from '../../../application/messaging/whatsapp-campaign.service';
+import { AppError } from '../../../shared/errors';
 import { segmentSchema, whatsappAudienceService } from '../../../application/messaging/audience.service';
-import { whatsappTemplateService } from '../../../application/messaging/whatsapp-template.service';
+import { templateDraftSchema, whatsappTemplateService } from '../../../application/messaging/whatsapp-template.service';
 import { whatsappBillingService } from '../../../application/inbox/whatsapp-billing.service';
 
 const wrap =
@@ -21,6 +24,17 @@ const wrap =
   (req, res, next) => {
     fn(req, res).catch(next);
   };
+
+/**
+ * The platform switch that governs WhatsApp campaigns governs the templates
+ * they are sent with. Authoring one is only useful for campaigning, so when
+ * campaigns are off the composer is too — existing templates are untouched.
+ */
+function requireWhatsAppCampaigns(): void {
+  if (!whatsappCampaignsEnabled()) {
+    throw new AppError('WHATSAPP_CAMPAIGNS_DISABLED', 403, CAMPAIGNS_DISABLED_MESSAGE);
+  }
+}
 
 export const marketingRoutes = Router();
 marketingRoutes.use(authenticate, requireTenant, requireFeature('marketing'));
@@ -121,6 +135,39 @@ marketingRoutes.get(
       ? await whatsappTemplateService.refresh(req.params.accountId as string, organizationId)
       : await whatsappTemplateService.list(req.params.accountId as string, organizationId);
     res.json({ success: true, data: templates });
+  }),
+);
+
+/**
+ * Compose a template without leaving the product.
+ *
+ * Meta still reviews it — this removes WhatsApp Manager from the path, not the
+ * approval. `marketing.update` rather than `marketing.create`: the template
+ * belongs to the channel, and whoever may change how the business sends is the
+ * same person who may add a way to send.
+ */
+marketingRoutes.post(
+  '/whatsapp/accounts/:accountId/templates',
+  requirePermission('marketing.update'),
+  validate({ body: templateDraftSchema }),
+  wrap(async (req, res) => {
+    requireWhatsAppCampaigns();
+    const template = await whatsappTemplateService.create(
+      req.params.accountId as string, req.auth!.organizationId!, req.body,
+    );
+    res.status(201).json({ success: true, data: template });
+  }),
+);
+
+marketingRoutes.delete(
+  '/whatsapp/accounts/:accountId/templates/:name',
+  requirePermission('marketing.update'),
+  wrap(async (req, res) => {
+    requireWhatsAppCampaigns();
+    await whatsappTemplateService.remove(
+      req.params.accountId as string, req.auth!.organizationId!, req.params.name as string,
+    );
+    res.json({ success: true, data: { deleted: req.params.name } });
   }),
 );
 

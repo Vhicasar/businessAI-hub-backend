@@ -48,7 +48,7 @@ jobs:
             echo "ready=false" >> "$GITHUB_OUTPUT"
             echo "::warning::Image published to GHCR, but VPS deploy was skipped — set VPS_HOST/VPS_USER/VPS_SSH_KEY (and GHCR_TOKEN) secrets in THIS repo to enable auto-deploy."
           fi
-      - name: SSH — pull & restart agentv-backend
+      - name: SSH — pull & restart every service running this image
         if: steps.cfg.outputs.ready == 'true'
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -57,11 +57,79 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT || 22 }}
           script: |
+            # `set -e` matters more than it looks: without it a failed `pull`
+            # still ran `up -d`, which happily restarted the OLD image and
+            # reported a green deploy.
+            set -eu
             cd ${{ secrets.VPS_APP_DIR || '/opt/vhicasar-admin' }}
             echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-            docker compose pull agentv-backend
-            docker compose up -d --no-deps --force-recreate agentv-backend
-            docker image prune -af
 
+            # Every service built from this image, not just the API.
+            # agentv-worker runs the same image with a different command, so
+            # restarting only agentv-backend left automations and campaign
+            # dispatch on the previous build until somebody restarted it by
+            # hand on the server. Override with a DEPLOY_SERVICES repo variable
+            # if the compose file names them differently.
+            WANTED="${{ vars.DEPLOY_SERVICES || 'agentv-backend agentv-worker' }}"
+            AVAILABLE="$(docker compose config --services)"
+            TARGETS=""
+            for service in $WANTED; do
+              if printf '%s\n' "$AVAILABLE" | grep -qx "$service"; then
+                TARGETS="$TARGETS $service"
+              else
+                echo "note: no service '$service' in this compose file — skipping it"
+              fi
+            done
+            if [ -z "$TARGETS" ]; then
+              echo "::error::None of '$WANTED' exist on the server. Services present:"
+              printf '%s\n' "$AVAILABLE"
+              exit 1
+            fi
+            echo "Deploying:$TARGETS"
 
-# docker compose up -d agentv-backend
+            docker compose pull $TARGETS
+            docker compose up -d --no-deps --force-recreate $TARGETS
+
+            # Migrations are not run here: the backend image's own CMD runs
+            # `prisma migrate deploy` before starting, and the worker overrides
+            # that command, so exactly one container migrates.
+
+            # Give the containers a moment to fall over if they are going to.
+            sleep 10
+
+            # A deploy that goes green while the new container is crash-looping
+            # is worse than one that fails, so wait for each service to settle.
+            for service in $TARGETS; do
+              CID="$(docker compose ps -q "$service")"
+              if [ -z "$CID" ]; then
+                echo "::error::$service has no container after up -d"
+                exit 1
+              fi
+              i=0
+              while [ "$i" -lt 60 ]; do
+                STATE="$(docker inspect -f '{{.State.Status}}' "$CID")"
+                HEALTH="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CID")"
+                case "$STATE:$HEALTH" in
+                  running:healthy|running:none) break ;;
+                  running:starting) ;;
+                  *)
+                    echo "::error::$service is $STATE ($HEALTH) after deploy — rolling output follows"
+                    docker compose logs --tail=80 "$service"
+                    exit 1
+                    ;;
+                esac
+                i=$((i + 1))
+                sleep 5
+              done
+              if [ "$i" -ge 60 ]; then
+                echo "::error::$service did not become healthy within five minutes"
+                docker compose logs --tail=80 "$service"
+                exit 1
+              fi
+              echo "$service: $STATE ($HEALTH)"
+            done
+
+            # Dangling layers only. `prune -af` also deleted the previous
+            # :sha image — the one thing you need in order to roll back — and
+            # on a shared host it reaches other stacks' stopped containers too.
+            docker image prune -f

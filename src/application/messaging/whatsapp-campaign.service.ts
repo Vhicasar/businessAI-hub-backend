@@ -136,6 +136,12 @@ function requireCampaignsEnabled(): void {
   }
 }
 
+/** Meta's per-account template cap, as last reported by a refresh. */
+function quotaLimit(metadata: Record<string, unknown>): number | null {
+  const quota = metadata.templateQuota as { limit?: number | null } | undefined;
+  return typeof quota?.limit === 'number' ? quota.limit : null;
+}
+
 export const whatsappCampaignService = {
   /**
    * The WhatsApp numbers this business can send a campaign from.
@@ -161,6 +167,8 @@ export const whatsappCampaignService = {
         wabaName: typeof metadata.wabaName === 'string' ? metadata.wabaName : null,
         billingState: billing.state ?? 'UNKNOWN',
         templateCount: Array.isArray(metadata.messageTemplates) ? metadata.messageTemplates.length : 0,
+        /* How many more templates Meta will accept, when it has told us. */
+        templateLimit: quotaLimit(metadata),
       };
     });
   },

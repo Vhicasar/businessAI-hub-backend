@@ -10,6 +10,7 @@ import { decrypt } from '../../shared/crypto';
 import { markInboundMessageReceived, markWebhookReceived } from '../../application/inbox/channel-health.service';
 import { env } from '../../shared/config/env';
 import { enrichInboundProfiles } from '../../application/inbox/profile-enrichment.service';
+import { parseTemplateStatusUpdates, whatsappTemplateService } from '../../application/messaging/whatsapp-template.service';
 
 /**
  * Stable Meta receivers live at /whatsapp, /messenger and /instagram.
@@ -71,6 +72,20 @@ async function processForAccount(account: NonNullable<WebhookAccount>, body: unk
   }
   logger.info({ correlationId, accountId: account.id, tenantId: account.organizationId, channelType, phase: 'signature_verified' }, channelType === 'WHATSAPP' ? '[WhatsAppWebhook] SIGNATURE_VALID' : 'Webhook lifecycle');
   await markWebhookReceived(account.id);
+
+  /*
+   * Template decisions ride the same callback as inbound messages, told apart
+   * only by the change's `field`. They are applied before the message pass
+   * and never instead of it: one delivery can legitimately carry both, and a
+   * payload that is only a template decision simply yields no messages.
+   */
+  if (channelType === 'WHATSAPP') {
+    for (const update of parseTemplateStatusUpdates(body)) {
+      await whatsappTemplateService.applyStatusUpdate(account.id, update)
+        .catch((err) => logger.warn({ err, accountId: account.id, template: update.name }, 'Template status update could not be applied'));
+    }
+  }
+
   const parsedMessages = adapter.parseInbound(body);
   const messages = await enrichInboundProfiles(adapter, accountRef, parsedMessages);
   const statuses = adapter.parseStatuses?.(body) ?? [];

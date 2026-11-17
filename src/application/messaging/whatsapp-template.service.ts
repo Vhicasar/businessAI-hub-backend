@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { prismaUnscoped } from '../../infrastructure/database/prisma';
 import { decrypt } from '../../shared/crypto';
 import { env } from '../../shared/config/env';
@@ -16,6 +17,12 @@ import { AppError, NotFoundError, ValidationError } from '../../shared/errors';
  * Templates are synced into the channel's metadata when it connects; this
  * refreshes them on demand, because approval status changes without warning
  * and a campaign built on yesterday's list is built on a guess.
+ *
+ * Templates are also written from here. Meta's Business Management API accepts
+ * a template over the same token the inbox already holds, so a business never
+ * has to open WhatsApp Manager to compose one. What cannot be skipped is the
+ * review: Meta still decides, and takes up to a day over it, so everything
+ * here is built around a template that exists but is not yet sendable.
  */
 
 export interface TemplateVariable {
@@ -119,6 +126,178 @@ async function loadAccount(accountId: string, organizationId: string) {
   return account;
 }
 
+
+/**
+ * Meta's name rules: lowercase alphanumeric and underscores, 512 at most.
+ *
+ * Businesses type "Black Friday Sale". Rejecting that and asking them to
+ * rewrite it in snake_case teaches them Meta's constraint for no benefit, so
+ * the name they type becomes the name Meta sees, converted here and shown back
+ * to them before they submit.
+ */
+export function slugifyTemplateName(input: string): string {
+  const slug = input
+    .normalize('NFKD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .replace(/_{2,}/g, '_')
+    .slice(0, 512);
+  return slug;
+}
+
+/** Meta names languages `en_US` in a template and `en-US` in a webhook. */
+function sameLanguage(a: string, b: string): boolean {
+  return a.replace(/-/g, '_').toLowerCase() === b.replace(/-/g, '_').toLowerCase();
+}
+
+export const templateDraftSchema = z.object({
+  /** What the business typed; slugified before it reaches Meta. */
+  name: z.string().trim().min(1).max(512),
+  language: z.string().trim().min(2).max(20).default('en_US'),
+  category: z.enum(['MARKETING', 'UTILITY']),
+  headerText: z.string().trim().max(60).nullable().optional(),
+  bodyText: z.string().trim().min(1).max(1024),
+  footerText: z.string().trim().max(60).nullable().optional(),
+  /** One example per {{n}} in the body, keyed by index as a string. */
+  examples: z.record(z.string().trim().min(1).max(1000)).default({}),
+});
+export type TemplateDraft = z.infer<typeof templateDraftSchema>;
+
+/**
+ * Everything that would come back as a rejection, caught before submitting.
+ *
+ * A rejected template is not free: it is a round trip of up to a day, and a
+ * business that collects three of them has a quality problem with Meta rather
+ * than a typo. Each of these is a rule Meta states, checked here so the
+ * composer can say what is wrong while the author is still looking at it.
+ */
+export function validateDraft(draft: TemplateDraft): { name: string; errors: string[] } {
+  const errors: string[] = [];
+  const name = slugifyTemplateName(draft.name);
+  if (!name) errors.push('The name must contain at least one letter or number.');
+
+  const indexes = variablesIn(draft.bodyText);
+  /*
+   * Positional parameters are numbered in order of appearance. A body with
+   * {{1}} and {{3}} is not a template with a gap — Meta reads it as malformed
+   * and rejects it, so the gap is caught here instead.
+   */
+  const sequential = indexes.every((value, position) => value === position + 1);
+  if (!sequential) {
+    errors.push(`Placeholders must run 1, 2, 3… without gaps. Found ${indexes.map((i) => `{{${i}}}`).join(', ')}.`);
+  }
+  for (const index of indexes) {
+    if (!(draft.examples[String(index)] ?? '').trim()) {
+      errors.push(`{{${index}}} has no example. Meta will not approve a template whose placeholders are unexplained.`);
+    }
+  }
+  if (variablesIn(draft.headerText ?? '').length) {
+    errors.push('The header cannot contain a placeholder here. Put variable text in the body.');
+  }
+  if (variablesIn(draft.footerText ?? '').length) {
+    errors.push('The footer cannot contain a placeholder.');
+  }
+  return { name, errors };
+}
+
+/** The template as Meta's API wants it. */
+function componentsFor(draft: TemplateDraft): RawComponent[] {
+  const components: RawComponent[] = [];
+  if (draft.headerText?.trim()) {
+    components.push({ type: 'HEADER', format: 'TEXT', text: draft.headerText.trim() });
+  }
+  const indexes = variablesIn(draft.bodyText);
+  components.push({
+    type: 'BODY',
+    text: draft.bodyText,
+    ...(indexes.length
+      ? { example: { body_text: [indexes.map((index) => draft.examples[String(index)] ?? '')] } }
+      : {}),
+  });
+  if (draft.footerText?.trim()) {
+    components.push({ type: 'FOOTER', text: draft.footerText.trim() });
+  }
+  return components;
+}
+
+/** The access the Business Management API needs, or a reason it is missing. */
+async function metaCredentials(accountId: string, organizationId: string) {
+  const account = await loadAccount(accountId, organizationId);
+  const metadata = (account.metadata ?? {}) as Record<string, unknown>;
+  const wabaId = typeof metadata.wabaId === 'string' ? metadata.wabaId : null;
+  if (!wabaId || !account.credentialsEnc) {
+    throw new AppError('CHANNEL_MISCONFIGURED', 400, 'This WhatsApp channel has no Business Account to manage templates on.');
+  }
+  const credentials = JSON.parse(decrypt(account.credentialsEnc)) as { accessToken?: string };
+  if (!credentials.accessToken) {
+    throw new AppError('CHANNEL_MISCONFIGURED', 400, 'This WhatsApp channel has no usable access token.');
+  }
+  return { account, metadata, wabaId, accessToken: credentials.accessToken };
+}
+
+/**
+ * Meta's refusals, in words the person who wrote the template can act on.
+ *
+ * Error 80008 is the one that matters most: it is not a fault in the template
+ * at all, it is the per-account creation rate, and telling someone their
+ * template is wrong when it is merely too soon sends them rewriting good copy.
+ */
+function createFailure(code: number | undefined, message: string | undefined): AppError {
+  if (code === 80008) {
+    return new AppError('TEMPLATE_RATE_LIMITED', 429,
+      'Meta is limiting how many templates this WhatsApp account can create right now. Wait a few minutes and submit again — nothing is wrong with the template.');
+  }
+  if (code === 100 && /name/i.test(message ?? '')) {
+    return new AppError('TEMPLATE_NAME_REJECTED', 400,
+      `Meta would not accept that name: ${message}. A template with this name may already exist in this language.`);
+  }
+  return new AppError('TEMPLATE_CREATE_FAILED', 502, `Meta would not accept the template: ${message ?? 'no reason given'}`);
+}
+
+
+/** One decision Meta made about one template. */
+export interface TemplateStatusUpdate {
+  name: string;
+  language: string | null;
+  /** APPROVED, REJECTED, PAUSED, DISABLED, FLAGGED, REINSTATED… */
+  event: string;
+  reason: string | null;
+}
+
+/**
+ * The template decisions inside a Meta webhook delivery, if any.
+ *
+ * These arrive on the same callback as inbound messages, told apart only by
+ * the change's `field`. Everything else in the delivery is left alone, so a
+ * payload carrying both a message and a template decision still does both.
+ */
+export function parseTemplateStatusUpdates(body: unknown): TemplateStatusUpdate[] {
+  const payload = body as {
+    entry?: Array<{ changes?: Array<{ field?: string; value?: Record<string, unknown> }> }>;
+  };
+  const out: TemplateStatusUpdate[] = [];
+  for (const entry of payload?.entry ?? []) {
+    for (const change of entry.changes ?? []) {
+      if (change.field !== 'message_template_status_update') continue;
+      const value = change.value ?? {};
+      const name = typeof value.message_template_name === 'string' ? value.message_template_name : '';
+      if (!name) continue;
+      const rejection = value.rejection_info as { reason?: string } | undefined;
+      const reason = rejection?.reason
+        ?? (typeof value.reason === 'string' && value.reason !== 'NONE' ? value.reason : null);
+      out.push({
+        name,
+        language: typeof value.message_template_language === 'string' ? value.message_template_language : null,
+        event: String(value.event ?? 'UNKNOWN').toUpperCase(),
+        reason: reason ?? null,
+      });
+    }
+  }
+  return out;
+}
+
 export const whatsappTemplateService = {
   /** Templates as last synced, without contacting Meta. */
   async list(accountId: string, organizationId: string): Promise<WhatsAppTemplate[]> {
@@ -146,22 +325,171 @@ export const whatsappTemplateService = {
       throw new AppError('CHANNEL_MISCONFIGURED', 400, 'This WhatsApp channel has no usable access token.');
     }
     const fields = 'id,language,name,rejected_reason,status,category,sub_category,last_updated_time,components,quality_score';
+    /*
+     * `summary=true` returns how many templates this account holds and how
+     * many it may hold. The cap is 250 for an unverified business and is
+     * reached sooner than people expect, so the composer shows the headroom
+     * rather than letting Meta refuse the 251st with a bare error.
+     */
     const res = await fetch(
-      `${env.meta.graphUrl}/${wabaId}/message_templates?fields=${encodeURIComponent(fields)}&limit=200`,
+      `${env.meta.graphUrl}/${wabaId}/message_templates?fields=${encodeURIComponent(fields)}&limit=200&summary=true`,
       { headers: { Authorization: `Bearer ${credentials.accessToken}` }, signal: AbortSignal.timeout(15_000) },
     );
-    const json = (await res.json().catch(() => ({}))) as { data?: RawTemplate[]; error?: { message?: string } };
+    const json = (await res.json().catch(() => ({}))) as {
+      data?: RawTemplate[];
+      summary?: { message_template_count?: number; message_template_limit?: number; total_count?: number };
+      error?: { message?: string };
+    };
     if (!res.ok) {
       logger.warn({ accountId, status: res.status }, 'WhatsApp template refresh failed');
       throw new AppError('TEMPLATE_SYNC_FAILED', 502, `Meta would not return templates: ${json.error?.message ?? res.status}`);
     }
     const items = json.data ?? [];
+    const count = json.summary?.message_template_count ?? json.summary?.total_count ?? null;
+    const limit = json.summary?.message_template_limit ?? null;
     await prismaUnscoped.channelAccount.update({
       where: { id: accountId },
-      data: { metadata: { ...metadata, messageTemplates: items, templateSyncStatus: 'READY', templateSyncedAt: new Date().toISOString() } as object },
+      data: {
+        metadata: {
+          ...metadata, messageTemplates: items,
+          templateSyncStatus: 'READY', templateSyncedAt: new Date().toISOString(),
+          /* Absent when Meta omits the summary; never overwritten with null. */
+          ...(count === null && limit === null ? {} : { templateQuota: { count, limit } }),
+        } as object,
+      },
     });
     logger.info({ accountId, count: items.length }, 'WhatsApp templates refreshed');
     return items.map(shape).filter((item) => item.name);
+  },
+
+
+  /**
+   * Submit a new template to Meta for review.
+   *
+   * The template comes back PENDING and is stored immediately, so it appears
+   * in the campaign builder — greyed out, with its status on it — rather than
+   * vanishing until someone remembers to refresh. Meta decides later, and
+   * `applyStatusUpdate` records what it decided.
+   */
+  async create(accountId: string, organizationId: string, draft: TemplateDraft): Promise<WhatsAppTemplate> {
+    const { name, errors } = validateDraft(draft);
+    if (errors.length) throw new ValidationError(errors.join(' '));
+
+    const { metadata, wabaId, accessToken } = await metaCredentials(accountId, organizationId);
+    const payload = {
+      name,
+      language: draft.language,
+      category: draft.category,
+      /*
+       * Meta re-files a template it judges miscategorised instead of refusing
+       * it outright. Without this, a marketing message written as a utility
+       * one comes back REJECTED a day later for a reason the author cannot
+       * see; with it, Meta simply corrects the category and approves.
+       */
+      allow_category_change: true,
+      components: componentsFor(draft),
+    };
+    const res = await fetch(`${env.meta.graphUrl}/${wabaId}/message_templates`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(20_000),
+    });
+    const json = (await res.json().catch(() => ({}))) as {
+      id?: string; status?: string; category?: string; error?: { code?: number; message?: string };
+    };
+    if (!res.ok || !json.id) {
+      logger.warn({ accountId, status: res.status, metaCode: json.error?.code }, 'WhatsApp template creation refused');
+      throw createFailure(json.error?.code, json.error?.message);
+    }
+
+    const stored: RawTemplate = {
+      name,
+      language: draft.language,
+      category: json.category ?? draft.category,
+      status: json.status ?? 'PENDING',
+      components: componentsFor(draft),
+    };
+    const existing = Array.isArray(metadata.messageTemplates) ? metadata.messageTemplates as RawTemplate[] : [];
+    const items = [
+      ...existing.filter((item) => !(item.name === name && sameLanguage(item.language ?? '', draft.language))),
+      stored,
+    ];
+    await prismaUnscoped.channelAccount.update({
+      where: { id: accountId },
+      data: { metadata: { ...metadata, messageTemplates: items } as object },
+    });
+    logger.info({ accountId, name, category: stored.category, status: stored.status }, 'WhatsApp template submitted for review');
+    return shape(stored);
+  },
+
+  /**
+   * Withdraw a template from the WhatsApp Business Account.
+   *
+   * Meta deletes every language variant sharing the name, which is why the
+   * name alone identifies it. A template still being reviewed can be removed
+   * the same way, so a mistake does not have to wait out its own approval.
+   */
+  async remove(accountId: string, organizationId: string, name: string): Promise<void> {
+    const { metadata, wabaId, accessToken } = await metaCredentials(accountId, organizationId);
+    const res = await fetch(
+      `${env.meta.graphUrl}/${wabaId}/message_templates?name=${encodeURIComponent(name)}`,
+      { method: 'DELETE', headers: { Authorization: `Bearer ${accessToken}` }, signal: AbortSignal.timeout(15_000) },
+    );
+    const json = (await res.json().catch(() => ({}))) as { success?: boolean; error?: { message?: string } };
+    if (!res.ok) {
+      throw new AppError('TEMPLATE_DELETE_FAILED', 502, `Meta would not delete the template: ${json.error?.message ?? res.status}`);
+    }
+    const existing = Array.isArray(metadata.messageTemplates) ? metadata.messageTemplates as RawTemplate[] : [];
+    await prismaUnscoped.channelAccount.update({
+      where: { id: accountId },
+      data: { metadata: { ...metadata, messageTemplates: existing.filter((item) => item.name !== name) } as object },
+    });
+    logger.info({ accountId, name }, 'WhatsApp template deleted');
+  },
+
+  /**
+   * Record what Meta decided, from the `message_template_status_update` hook.
+   *
+   * Approval arrives on Meta's schedule — minutes, or the better part of a
+   * day. Without this the only way to learn the outcome is for somebody to
+   * reopen the campaign builder and press refresh, so a template approved
+   * overnight sits unusable until it is noticed.
+   *
+   * Returns false when the update names a template this account does not hold,
+   * which is normal: one WABA can be shared, and not every change is ours.
+   */
+  async applyStatusUpdate(
+    accountId: string,
+    update: { name: string; language: string | null; event: string; reason: string | null },
+  ): Promise<boolean> {
+    const account = await prismaUnscoped.channelAccount.findFirst({
+      where: { id: accountId, channelType: 'WHATSAPP', deletedAt: null },
+      select: { id: true, metadata: true },
+    });
+    if (!account) return false;
+    const metadata = (account.metadata ?? {}) as Record<string, unknown>;
+    const items = Array.isArray(metadata.messageTemplates) ? metadata.messageTemplates as RawTemplate[] : [];
+    let touched = false;
+    const next = items.map((item) => {
+      const matches = item.name === update.name
+        && (!update.language || sameLanguage(item.language ?? '', update.language));
+      if (!matches) return item;
+      touched = true;
+      return {
+        ...item,
+        status: update.event,
+        /* REJECTED carries the reason; anything else clears a stale one. */
+        rejected_reason: update.event === 'REJECTED' ? update.reason ?? undefined : undefined,
+      };
+    });
+    if (!touched) return false;
+    await prismaUnscoped.channelAccount.update({
+      where: { id: account.id },
+      data: { metadata: { ...metadata, messageTemplates: next } as object },
+    });
+    logger.info({ accountId, name: update.name, event: update.event }, 'WhatsApp template status updated by Meta');
+    return true;
   },
 
   /** The one template a campaign names, or a clear refusal. */
