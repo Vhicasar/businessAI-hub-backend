@@ -298,6 +298,30 @@ export function parseTemplateStatusUpdates(body: unknown): TemplateStatusUpdate[
   return out;
 }
 
+
+/**
+ * Meta's read refusals, in terms of what to do about them.
+ *
+ * Code 3 and code 200 both mean the Meta app itself is missing something —
+ * usually Advanced Access to `whatsapp_business_management` — rather than
+ * anything being wrong with this WhatsApp account. Repeating Meta's wording
+ * alone ("Application does not have the capability…") sends people looking in
+ * the wrong place.
+ */
+function templateReadFailure(code: number | undefined, message: string | undefined, status: number): string {
+  if (code === 3 || code === 200) {
+    return 'Meta refused the request because the connected Meta app is missing the '
+      + 'whatsapp_business_management permission. Templates already synced are still shown; '
+      + 'granting that permission to the app restores refreshing and in-app template creation. '
+      + `Meta said: ${message ?? `HTTP ${status}`}`;
+  }
+  if (code === 190) {
+    return 'Meta rejected the stored access token. Reconnect this WhatsApp channel in '
+      + `Settings → Channels to issue a new one. Meta said: ${message ?? `HTTP ${status}`}`;
+  }
+  return `Meta would not return templates: ${message ?? status}`;
+}
+
 export const whatsappTemplateService = {
   /** Templates as last synced, without contacting Meta. */
   async list(accountId: string, organizationId: string): Promise<WhatsAppTemplate[]> {
@@ -325,24 +349,41 @@ export const whatsappTemplateService = {
       throw new AppError('CHANNEL_MISCONFIGURED', 400, 'This WhatsApp channel has no usable access token.');
     }
     const fields = 'id,language,name,rejected_reason,status,category,sub_category,last_updated_time,components,quality_score';
-    /*
-     * `summary=true` returns how many templates this account holds and how
-     * many it may hold. The cap is 250 for an unverified business and is
-     * reached sooner than people expect, so the composer shows the headroom
-     * rather than letting Meta refuse the 251st with a bare error.
-     */
-    const res = await fetch(
-      `${env.meta.graphUrl}/${wabaId}/message_templates?fields=${encodeURIComponent(fields)}&limit=200&summary=true`,
-      { headers: { Authorization: `Bearer ${credentials.accessToken}` }, signal: AbortSignal.timeout(15_000) },
-    );
-    const json = (await res.json().catch(() => ({}))) as {
+    const base = `${env.meta.graphUrl}/${wabaId}/message_templates?fields=${encodeURIComponent(fields)}&limit=200`;
+    const headers = { Authorization: `Bearer ${credentials.accessToken}` };
+
+    type TemplatePage = {
       data?: RawTemplate[];
       summary?: { message_template_count?: number; message_template_limit?: number; total_count?: number };
-      error?: { message?: string };
+      error?: { message?: string; code?: number };
     };
+    const read = async (url: string): Promise<{ res: Response; json: TemplatePage }> => {
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
+      return { res, json: (await res.json().catch(() => ({}))) as TemplatePage };
+    };
+
+    /*
+     * `summary=true` reports how many templates the account holds and may hold,
+     * which is what the composer shows as headroom. Reading the cap is its own
+     * capability, though, and an app that lacks it fails the WHOLE request with
+     * "(#3) Application does not have the capability to make this API call" —
+     * so asking for the headroom cost the business its template list entirely,
+     * while the connect-time sync (which never asked) kept working.
+     *
+     * The quota is a nicety. The list is not. So it is asked for once and
+     * dropped the moment it gets in the way.
+     */
+    let { res, json } = await read(`${base}&summary=true`);
     if (!res.ok) {
-      logger.warn({ accountId, status: res.status }, 'WhatsApp template refresh failed');
-      throw new AppError('TEMPLATE_SYNC_FAILED', 502, `Meta would not return templates: ${json.error?.message ?? res.status}`);
+      logger.info(
+        { accountId, status: res.status, metaCode: json.error?.code },
+        'WhatsApp template refresh with summary refused; retrying without it',
+      );
+      ({ res, json } = await read(base));
+    }
+    if (!res.ok) {
+      logger.warn({ accountId, status: res.status, metaCode: json.error?.code }, 'WhatsApp template refresh failed');
+      throw new AppError('TEMPLATE_SYNC_FAILED', 502, templateReadFailure(json.error?.code, json.error?.message, res.status));
     }
     const items = json.data ?? [];
     const count = json.summary?.message_template_count ?? json.summary?.total_count ?? null;

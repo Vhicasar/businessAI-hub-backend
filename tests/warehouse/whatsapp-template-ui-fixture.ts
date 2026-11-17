@@ -49,7 +49,7 @@ function startStubMeta() {
 
 async function teardown(orgId: string) {
   const users = await db.membership.findMany({ where: { organizationId: orgId }, select: { userId: true } });
-  for (const t of ['channelAccount', 'membership', 'rolePermission', 'activity', 'auditLog', 'usageCounter', 'subscription'] as const) {
+  for (const t of ['campaignRecipient', 'campaign', 'customer', 'channelAccount', 'membership', 'rolePermission', 'activity', 'auditLog', 'usageCounter', 'subscription'] as const) {
     if (t === 'rolePermission') {
       const roles = await db.role.findMany({ where: { organizationId: orgId }, select: { id: true } });
       await db.rolePermission.deleteMany({ where: { roleId: { in: roles.map((r) => r.id) } } }).catch(() => {});
@@ -107,6 +107,13 @@ async function main() {
       },
     },
   });
+
+  // A few opted-in customers, so the Review step has an audience to price.
+  for (const [firstName, phone] of [['Ada', '08030000011'], ['Bola', '08030000012'], ['Chidi', '08030000013']]) {
+    await db.customer.create({
+      data: { organizationId: orgId, firstName, lastName: 'Test', phone, marketingOptIn: true },
+    });
+  }
 
   console.log('\n──────────────────────────────────────────────');
   console.log(`  org      ${orgId}`);

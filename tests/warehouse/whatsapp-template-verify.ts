@@ -48,6 +48,8 @@ let appPort = 0;
 const asOrg = <T>(fn: () => Promise<T>, organizationId = orgId) =>
   requestContext.run({ requestId: `wat-${stamp}`, organizationId, userId }, fn);
 
+/** Whether the stub honours `summary=true` or refuses it the way Meta did. */
+let summaryMode: 'ok' | 'refused' = 'ok';
 /** What the stub does on the next create: accept, or refuse with a code. */
 let createMode: 'ok' | 'rate_limit' | 'duplicate_name' = 'ok';
 /** Every create body the stub was handed, so the request itself can be read. */
@@ -79,6 +81,24 @@ async function startStubMeta() {
       if (req.method === 'DELETE' && url.includes('/message_templates')) {
         deleteCalls.push(decodeURIComponent(new URL(url, 'http://x').searchParams.get('name') ?? ''));
         return res.end(JSON.stringify({ success: true }));
+      }
+
+      /*
+       * Meta refuses `summary=true` outright when the app lacks the
+       * capability to read the template cap — the whole request fails, not
+       * just the summary. This is the live fault the fallback exists for.
+       */
+      if (summaryMode === 'refused' && url.includes('summary=true')) {
+        res.statusCode = 400;
+        return res.end(JSON.stringify({
+          error: { code: 3, type: 'OAuthException', message: '(#3) Application does not have the capability to make this API call.' },
+        }));
+      }
+      if (summaryMode === 'refused') {
+        return res.end(JSON.stringify({ data: [{
+          name: 'synced_offer', language: 'en_US', category: 'MARKETING', status: 'APPROVED',
+          components: [{ type: 'BODY', text: 'Hello {{1}}', example: { body_text: [['Ada']] } }],
+        }] }));
       }
 
       // GET list, with the summary the quota display depends on.
@@ -313,6 +333,22 @@ async function main() {
   const accounts = await asOrg(() => whatsappCampaignService.sendingAccounts());
   const account = accounts.find((a) => a.id === accountId);
   check('a refresh records the account’s template cap', account?.templateLimit === 250, String(account?.templateLimit));
+
+  /*
+   * The regression this guards: asking for the quota made the whole refresh
+   * fail for any app without the capability to read it, so a business whose
+   * templates had synced at connect time could never refresh them again.
+   */
+  console.log('\nWhen Meta refuses the quota but not the templates');
+  summaryMode = 'refused';
+  const resilient = await asOrg(() => whatsappTemplateService.refresh(accountId, orgId));
+  check('the templates still come back', resilient.some((t) => t.name === 'synced_offer'),
+    `${resilient.length} templates`);
+  const afterRefusal = await asOrg(() => whatsappCampaignService.sendingAccounts());
+  check('the previously known cap is not wiped',
+    afterRefusal.find((a) => a.id === accountId)?.templateLimit === 250,
+    String(afterRefusal.find((a) => a.id === accountId)?.templateLimit));
+  summaryMode = 'ok';
 
   let crossTenant = false;
   await asOrg(() => whatsappTemplateService.create(otherAccountId, orgId, DRAFT))

@@ -9,10 +9,15 @@ import { getWorkspaceConfig } from '../settings/workspace-config';
  * price from first principles — and inventing one would be worse than saying
  * nothing, because a business would plan around a number we made up.
  *
- * So: rates are supplied by the platform administrator, stamped with the date
- * they were taken from Meta's published pricing, and anything not covered is
- * reported as unavailable rather than estimated. Every figure here is Meta's
- * charge to the business, which is separate from their Vhicasar subscription.
+ * So: Meta's published rates are mirrored into workspace config, stamped with
+ * the date they were taken, and anything not covered is reported as unavailable
+ * rather than estimated.
+ *
+ * Nothing here is a charge this product makes. Every figure is Meta's, billed
+ * by Meta to the business's own WhatsApp Business Account, and the copy says so
+ * — an earlier version told businesses that "the platform administrator" had
+ * not published a rate card, which reads as though Vhicasar were the one
+ * charging them and withholding the price.
  */
 
 export type MessageCategory = 'MARKETING' | 'UTILITY' | 'AUTHENTICATION' | 'SERVICE';
@@ -34,10 +39,25 @@ export interface RateCard {
   source: string;
 }
 
+/**
+ * Why no figure is shown.
+ *
+ * `NO_RATES` is not a fault and should not be presented as one: it simply
+ * means this deployment does not mirror Meta's rate card, so there is nothing
+ * to estimate from. The others describe a campaign we genuinely cannot price.
+ */
+export type EstimateUnavailable =
+  | 'NO_RATES'
+  | 'UNCOVERED_COUNTRIES'
+  | 'MIXED_CURRENCIES'
+  | 'SERVICE_CATEGORY';
+
 export interface CostEstimate {
   available: boolean;
   /** Why no figure is shown, when none is. */
   unavailableReason: string | null;
+  /** The same, as something the UI can branch on. */
+  reasonCode: EstimateUnavailable | null;
   currency: string | null;
   total: number | null;
   recipients: number;
@@ -87,7 +107,7 @@ export const whatsappPricingService = {
    */
   async estimate(waIds: string[], category: MessageCategory = 'MARKETING'): Promise<CostEstimate> {
     const empty: CostEstimate = {
-      available: false, unavailableReason: null, currency: null, total: null,
+      available: false, unavailableReason: null, reasonCode: null, currency: null, total: null,
       recipients: waIds.length, unpriced: waIds.length, byCountry: [], category,
       effectiveDate: null, source: null,
       assumptions: [],
@@ -95,11 +115,18 @@ export const whatsappPricingService = {
 
     const card = await this.rateCard();
     if (!card) {
-      return { ...empty, unavailableReason: 'No WhatsApp rate card has been published by the platform administrator, so no cost can be estimated.' };
+      return {
+        ...empty,
+        reasonCode: 'NO_RATES',
+        unavailableReason: 'Meta prices each message by the recipient\'s country and does not expose '
+          + 'those rates through its API, so no estimate is shown here. Meta bills your WhatsApp '
+          + 'Business Account directly.',
+      };
     }
     if (category === 'SERVICE') {
       return {
         ...empty,
+        reasonCode: 'SERVICE_CATEGORY',
         unavailableReason: 'Service messages are priced differently and may fall inside Meta\'s free allowance, so no per-message estimate is shown.',
         effectiveDate: card.effectiveDate, source: card.source,
       };
@@ -139,7 +166,8 @@ export const whatsappPricingService = {
     if (priced === 0) {
       return {
         ...empty, byCountry, unpriced,
-        unavailableReason: 'The published rate card does not cover these recipients\' countries.',
+        reasonCode: 'UNCOVERED_COUNTRIES',
+        unavailableReason: 'No Meta rate is on record for these recipients\' countries, so no estimate can be shown.',
         effectiveDate: card.effectiveDate, source: card.source,
       };
     }
@@ -147,7 +175,8 @@ export const whatsappPricingService = {
       // Summing across currencies would produce a meaningless number.
       return {
         ...empty, byCountry, unpriced,
-        unavailableReason: 'The rate card mixes currencies, so a single total cannot be shown. The per-country rates are listed instead.',
+        reasonCode: 'MIXED_CURRENCIES',
+        unavailableReason: 'These recipients are in countries Meta prices in different currencies, so a single total cannot be shown. The per-country rates are listed instead.',
         effectiveDate: card.effectiveDate, source: card.source,
       };
     }
@@ -155,6 +184,7 @@ export const whatsappPricingService = {
     return {
       available: true,
       unavailableReason: null,
+      reasonCode: null,
       currency: [...currencies][0] ?? null,
       total: Number(total.toFixed(4)),
       recipients: waIds.length,

@@ -114,8 +114,32 @@ check('and sits behind the marketing plan feature',
 check('both writes need permission to change how the business sends',
   (routes.match(/requirePermission\('marketing\.update'\),\n\s*(validate|wrap)/g) ?? []).length >= 2);
 
-console.log('\n=== 7. THE HEADROOM IS REAL, NOT GUESSED ===');
+console.log('\n=== 7. MONEY IS ATTRIBUTED TO META, NOT TO US ===');
+{
+  const pricing = readFileSync(`${API}/application/messaging/whatsapp-pricing.service.ts`, 'utf8');
+  const userFacing = pricing.split('export const whatsappPricingService')[1] ?? '';
+  check('no cost message blames the platform administrator',
+    !/platform administrator/.test(userFacing),
+    'a user-facing string still names the platform administrator');
+  check('having no rates is its own case, not a generic failure',
+    /reasonCode: 'NO_RATES'/.test(pricing) && /reasonCode === 'NO_RATES'/.test(dialog));
+  check('and reads as Meta charging rather than something being unavailable',
+    /Meta charges for this campaign/.test(dialog));
+  check('every cost message offers the way to Meta\u2019s payment settings',
+    (dialog.match(/<MetaPaymentLink billing=/g) ?? []).length === 3,
+    `${(dialog.match(/<MetaPaymentLink billing=/g) ?? []).length} of 3 link out`);
+  check('the link opens in its own tab, safely',
+    /target="_blank"/.test(dialog) && /rel="noopener noreferrer"/.test(dialog));
+  check('aimed at the URL the server supplies, not one hard-coded in the screen',
+    /href=\{billing\.setupUrl\}/.test(dialog) && !/business\.facebook\.com/.test(dialog));
+}
+
+console.log('\n=== 8. THE HEADROOM IS REAL, NOT GUESSED ===');
 check('the cap comes from Meta’s own summary', /summary=true/.test(svc));
+check('but asking for it can never cost us the template list',
+  /retrying without it/.test(svc) && /await read\(base\)/.test(svc));
+check('and a capability refusal names the missing permission',
+  /whatsapp_business_management permission/.test(svc) && /code === 3 \|\| code === 200/.test(svc));
 check('it is stored only when Meta reports it',
   /count === null && limit === null \? \{\} : \{ templateQuota/.test(svc));
 check('the account list carries it', /templateLimit: quotaLimit\(metadata\)/.test(campaigns));
