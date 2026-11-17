@@ -506,6 +506,60 @@ export const whatsappCampaignService = {
     return updated;
   },
 
+
+  /**
+   * Record what Meta later said about a message this campaign sent.
+   *
+   * "Sent" only ever meant Meta accepted the message for delivery — it returns
+   * a message id immediately and decides afterwards. Everything it says next
+   * arrives on the webhook, and until now none of it reached the campaign:
+   * `applyStatus` looks for a Message row, campaign dispatch writes none, so
+   * every receipt matched nothing and was dropped. A campaign that Meta
+   * accepted and then failed to deliver read as fully sent for ever.
+   *
+   * Returns false when the receipt belongs to something else — an ordinary
+   * inbox message, or another business — which is the normal case.
+   */
+  async applyDeliveryReceipt(
+    organizationId: string,
+    update: { providerMessageId: string; status: 'SENT' | 'DELIVERED' | 'READ' | 'FAILED'; occurredAt?: Date; error?: string },
+  ): Promise<boolean> {
+    if (!update.providerMessageId) return false;
+    const recipient = await prismaUnscoped.campaignRecipient.findFirst({
+      where: { providerMessageId: update.providerMessageId, campaign: { organizationId } },
+      select: { id: true, status: true, campaignId: true },
+    });
+    if (!recipient) return false;
+
+    /*
+     * Receipts arrive out of order, so a late "sent" must not undo a "read".
+     * FAILED is ranked above the lot deliberately: it is the one that changes
+     * what somebody needs to do about it.
+     */
+    const RANK: Record<string, number> = {
+      PENDING: 0, SENT: 1, DELIVERED: 2, OPENED: 3, CLICKED: 4, FAILED: 5, BOUNCED: 5, UNSUBSCRIBED: 5,
+    };
+    const next = update.status === 'READ' ? 'OPENED' : update.status;
+    if ((RANK[next] ?? 0) <= (RANK[recipient.status] ?? 0)) return true;
+
+    const at = update.occurredAt ?? new Date();
+    await prismaUnscoped.campaignRecipient.update({
+      where: { id: recipient.id },
+      data: {
+        status: next as 'SENT' | 'DELIVERED' | 'OPENED' | 'FAILED',
+        ...(next === 'OPENED' ? { openedAt: at } : {}),
+        ...(next === 'FAILED' ? { error: (update.error ?? 'Meta could not deliver this message').slice(0, 500) } : {}),
+      },
+    });
+    if (next === 'FAILED') {
+      logger.warn(
+        { campaignId: recipient.campaignId, organizationId, providerMessageId: update.providerMessageId, reason: update.error },
+        'WhatsApp campaign message failed after Meta accepted it',
+      );
+    }
+    return true;
+  },
+
   /**
    * Pick a halted campaign back up.
    *

@@ -11,6 +11,7 @@ import { markInboundMessageReceived, markWebhookReceived } from '../../applicati
 import { env } from '../../shared/config/env';
 import { enrichInboundProfiles } from '../../application/inbox/profile-enrichment.service';
 import { parseTemplateStatusUpdates, whatsappTemplateService } from '../../application/messaging/whatsapp-template.service';
+import { whatsappCampaignService } from '../../application/messaging/whatsapp-campaign.service';
 
 /**
  * Stable Meta receivers live at /whatsapp, /messenger and /instagram.
@@ -107,8 +108,33 @@ async function processForAccount(account: NonNullable<WebhookAccount>, body: unk
         logger.info({ event: channelType === 'WHATSAPP' ? 'WHATSAPP_REALTIME_EMITTED' : undefined, correlationId, accountId: account.id, tenantId: account.organizationId, channelType, phase: 'realtime_emitted' }, channelType === 'WHATSAPP' ? '[WhatsAppWebhook] REALTIME_EMITTED' : 'Webhook lifecycle');
       }
       for (const update of statuses) {
-        await inboxService.applyStatus({ id: account.id, organizationId: account.organizationId }, update)
-          .catch((err) => logger.warn({ err, providerMessageId: update.providerMessageId }, 'Delivery receipt could not be applied'));
+        /*
+         * A receipt belongs to an inbox message or to a campaign recipient —
+         * they are different tables, and only the inbox one was ever consulted.
+         * Campaign sends write no Message row, so every receipt for a campaign
+         * matched nothing and was discarded, which is how a campaign Meta
+         * accepted and then failed to deliver stayed "sent" for ever.
+         */
+        const matchedInbox = await inboxService
+          .applyStatus({ id: account.id, organizationId: account.organizationId }, update)
+          .then(() => true)
+          .catch((err) => {
+            logger.warn({ err, providerMessageId: update.providerMessageId }, 'Delivery receipt could not be applied');
+            return false;
+          });
+        const matchedCampaign = await whatsappCampaignService
+          .applyDeliveryReceipt(account.organizationId, update)
+          .catch((err) => {
+            logger.warn({ err, providerMessageId: update.providerMessageId }, 'Campaign delivery receipt could not be applied');
+            return false;
+          });
+        if (!matchedCampaign && !matchedInbox) {
+          /* Never silent again: an unrecognised receipt is now visible. */
+          logger.info(
+            { providerMessageId: update.providerMessageId, status: update.status, error: update.error },
+            'Delivery receipt matched no message or campaign recipient',
+          );
+        }
       }
     },
   );

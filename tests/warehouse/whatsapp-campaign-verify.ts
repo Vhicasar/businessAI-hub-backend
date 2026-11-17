@@ -35,6 +35,12 @@ let metaMode: 'ok' | 'billing' | 'billing_after_first' | 'template' | 'rate_limi
 let sendCount = 0;
 /** Every message body the stub was handed, so the payload can be read back. */
 const sendBodies: Array<Record<string, any>> = [];
+/*
+ * `sendCount` is reset between phases to count sends per phase, so it cannot
+ * also mint message ids — two recipients would end up sharing a wamid, and a
+ * delivery receipt could not tell them apart. This one never resets.
+ */
+let wamidSeq = 0;
 
 const asOrg = <T>(fn: () => Promise<T>, organizationId = orgId) =>
   requestContext.run({ requestId: `wac-${stamp}`, organizationId, userId }, fn);
@@ -68,7 +74,8 @@ async function startStubMeta() {
           res.statusCode = 429;
           return res.end(JSON.stringify({ error: { code: 131048, message: 'Spam rate limit hit', type: 'OAuthException' } }));
         }
-        return res.end(JSON.stringify({ messages: [{ id: `wamid.stub${sendCount}` }] }));
+        wamidSeq += 1;
+        return res.end(JSON.stringify({ messages: [{ id: `wamid.stub${wamidSeq}` }] }));
       }
       res.end(JSON.stringify({ data: TEMPLATES, account_review_status: 'APPROVED' }));
     });
@@ -294,6 +301,48 @@ async function main() {
     JSON.stringify(second.stats));
   check('and the record agrees with the response',
     launchStats.haltReason === templateReport.haltReason);
+
+  /*
+   * "Sent" only ever meant Meta accepted the message. What Meta said next
+   * arrived on the webhook, was looked up against the Message table that
+   * campaign dispatch never writes to, matched nothing, and was discarded — so
+   * a campaign Meta accepted and then failed to deliver read as fully sent.
+   */
+  console.log('\nWhat Meta says after accepting a campaign message');
+  {
+    const delivered = await asOrg(() => whatsappCampaignService.report(campaign.id));
+    const wamid = delivered.recipients.find((r) => r.providerMessageId)?.providerMessageId as string;
+    check('a sent recipient has Meta\u2019s message id to match on', Boolean(wamid), String(wamid));
+
+    const matched = await whatsappCampaignService.applyDeliveryReceipt(orgId, {
+      providerMessageId: wamid, status: 'DELIVERED', occurredAt: new Date(),
+    });
+    check('a delivery receipt now finds its campaign recipient', matched === true);
+    const afterDelivered = await asOrg(() => whatsappCampaignService.report(campaign.id));
+    check('and moves the recipient on from sent',
+      afterDelivered.recipients.find((r) => r.providerMessageId === wamid)?.status === 'DELIVERED',
+      afterDelivered.recipients.find((r) => r.providerMessageId === wamid)?.status);
+
+    /* A late "sent" must not undo a "delivered". */
+    await whatsappCampaignService.applyDeliveryReceipt(orgId, { providerMessageId: wamid, status: 'SENT' });
+    const afterLate = await asOrg(() => whatsappCampaignService.report(campaign.id));
+    check('an out-of-order receipt does not move it backwards',
+      afterLate.recipients.find((r) => r.providerMessageId === wamid)?.status === 'DELIVERED');
+
+    /* The one that matters: accepted, then refused. */
+    await whatsappCampaignService.applyDeliveryReceipt(orgId, {
+      providerMessageId: wamid, status: 'FAILED', error: 'Message undeliverable',
+    });
+    const afterFail = await asOrg(() => whatsappCampaignService.report(campaign.id));
+    const failedRow = afterFail.recipients.find((r) => r.providerMessageId === wamid);
+    check('a later failure is recorded instead of staying sent', failedRow?.status === 'FAILED', failedRow?.status);
+    check('with the reason Meta gave', /undeliverable/i.test(failedRow?.error ?? ''), failedRow?.error ?? '');
+
+    const foreign = await whatsappCampaignService.applyDeliveryReceipt(orgId, {
+      providerMessageId: 'wamid.not-ours', status: 'DELIVERED',
+    });
+    check('a receipt for something else is left alone', foreign === false);
+  }
 
   // ── 9. Cancellation ──────────────────────────────────────────────────────
   console.log('\nCancellation');

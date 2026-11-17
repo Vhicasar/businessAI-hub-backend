@@ -22,6 +22,8 @@ const composer = readFileSync(`${WEB}/features/marketing/TemplateComposerDialog.
 const dialog = readFileSync(`${WEB}/features/marketing/WhatsAppCampaignDialog.tsx`, 'utf8');
 const routes = readFileSync(`${API}/presentation/http/v1/marketing.routes.ts`, 'utf8');
 const svc = readFileSync(`${API}/application/messaging/whatsapp-template.service.ts`, 'utf8');
+const marketingPage = readFileSync(`${WEB}/features/marketing/MarketingPage.tsx`, 'utf8');
+const adapter = readFileSync(`${API}/infrastructure/channels/whatsapp.adapter.ts`, 'utf8');
 const campaigns = readFileSync(`${API}/application/messaging/whatsapp-campaign.service.ts`, 'utf8');
 const webhooks = readFileSync(`${API}/presentation/http/webhooks.routes.ts`, 'utf8');
 
@@ -146,6 +148,36 @@ check('the account list carries it', /templateLimit: quotaLimit\(metadata\)/.tes
 check('and the screen shows it against the count',
   /\{selectedAccount\.templateCount\} of \{selectedAccount\.templateLimit\} used/.test(dialog));
 check('a missing cap simply shows nothing', /selectedAccount\?\.templateLimit != null &&/.test(dialog));
+
+console.log('\n=== 9. A CAMPAIGN CAN BE ACTED ON AFTER THE DIALOG CLOSES ===');
+check('the list offers a retry for a stalled WhatsApp campaign',
+  /Retry failed/.test(marketingPage)
+  && /\['PARTIALLY_SENT', 'PAUSED', 'FAILED'\]\.includes\(c\.status\)/.test(marketingPage));
+check('only for the campaigns the WhatsApp dispatcher can resume',
+  /c\.type === 'WHATSAPP'/.test(marketingPage));
+check('and it calls the resume endpoint that retries failures',
+  /whatsapp\/campaigns\/\$\{id\}\/resume/.test(marketingPage)
+  && /status: 'FAILED'[\s\S]{0,120}data: \{ status: 'PENDING'/.test(campaigns));
+check('the list can delete a campaign', /method: 'DELETE'/.test(marketingPage)
+  && /marketingRoutes\.delete\(\s*'\/campaigns\/:id'/.test(routes));
+check('deleting needs its own permission', /requirePermission\('marketing\.delete'\)/.test(routes));
+check('and is refused while a campaign is still sending',
+  /still sending\. Cancel it first/.test(readFileSync(`${API}/application/messaging/campaign.service.ts`, 'utf8')));
+check('a delete keeps the record of who was messaged',
+  /deletedAt: new Date\(\)/.test(readFileSync(`${API}/application/messaging/campaign.service.ts`, 'utf8')));
+
+console.log('\n=== 10. META IS TOLD WHAT IT ASKED FOR ===');
+check('template parameters are sent one per placeholder',
+  /templateParameters\?: string\[\]/.test(readFileSync(`${API}/application/inbox/channel-adapter.ts`, 'utf8'))
+  && /templateParameters: rendered\.parameters/.test(campaigns));
+check('and the rendered sentence is never sent as a parameter',
+  !/parameters: \[\{ type: 'text', text: payload\.text \}\]/.test(adapter));
+check('a template with no placeholders is sent with no body component',
+  /if \(!values\.length\) return \{\};/.test(adapter));
+check('delivery receipts reach campaign recipients, not only the inbox',
+  /applyDeliveryReceipt/.test(webhooks) && /applyDeliveryReceipt/.test(campaigns));
+check('an unmatched receipt is logged rather than dropped silently',
+  /matched no message or campaign recipient/.test(webhooks));
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

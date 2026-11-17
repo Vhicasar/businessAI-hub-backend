@@ -104,6 +104,30 @@ const campaignSelect = {
 } as const;
 
 export const campaignService = {
+  /**
+   * Remove a campaign from the business's list.
+   *
+   * Soft, because the recipient rows are the record of who was actually
+   * messaged and what Meta charged for — deleting that outright would destroy
+   * the only proof a business has of a send it paid for. The row is hidden
+   * everywhere instead: every read already filters on `deletedAt`.
+   *
+   * A campaign mid-flight is refused rather than hidden, since dispatch would
+   * carry on messaging people from a campaign that appears to be gone.
+   */
+  async remove(id: string) {
+    const campaign = await prisma.campaign.findFirst({
+      where: { id, deletedAt: null },
+      select: { id: true, name: true, status: true },
+    });
+    if (!campaign) throw new NotFoundError('Campaign');
+    if (campaign.status === 'SENDING') {
+      throw new ConflictError('This campaign is still sending. Cancel it first, then delete it.');
+    }
+    await prisma.campaign.update({ where: { id }, data: { deletedAt: new Date() } });
+    return { id: campaign.id, name: campaign.name, deleted: true };
+  },
+
   async list() {
     const rows = await prisma.campaign.findMany({
       where: { deletedAt: null },

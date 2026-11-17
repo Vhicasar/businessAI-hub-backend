@@ -101,6 +101,14 @@ marketingRoutes.patch(
   })
 );
 
+marketingRoutes.delete(
+  '/campaigns/:id',
+  requirePermission('marketing.delete'),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await campaignService.remove(req.params.id as string) });
+  })
+);
+
 marketingRoutes.post(
   '/campaigns/:id/send',
   requirePermission('marketing.send'),
