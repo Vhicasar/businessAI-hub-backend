@@ -2,6 +2,9 @@ import { Prisma } from '@prisma/client';
 import { prismaUnscoped } from '../../infrastructure/database/prisma';
 import { NotFoundError } from '../../shared/errors';
 import { emitEvent } from '../../shared/domain-events';
+import { decrypt } from '../../shared/crypto';
+import { logger } from '../../shared/logger';
+import { unsubscribeWebhooks } from '../inbox/channel-oauth.service';
 
 /**
  * Platform-wide (cross-tenant) monitoring for the Super Admin Portal (System
@@ -638,5 +641,90 @@ export const platformAdminService = {
       select: { occurredAt: true, name: true },
     });
     return { pending, failed, published, oldestPending };
+  },
+};
+
+/**
+ * Meta subscriptions a business has disconnected but Meta may still hold.
+ *
+ * Until the disconnect learned to detach at Meta, removing a channel here left
+ * the app attached to the WABA or Page over there: Meta kept delivering
+ * webhooks nobody consumed, and the business saw a channel they had removed
+ * still listed in Business Settings. Those are invisible from inside any one
+ * business — the row is soft-deleted and filtered out of its own channel list
+ * — so clearing them belongs to whoever can see across tenants.
+ *
+ * "Orphaned" is a candidacy, not a certainty: the only way to know Meta still
+ * holds a subscription is to ask Meta, which is what `detach` does. This lists
+ * the channels that could be in that state and lets an operator act on them.
+ */
+export const platformChannelService = {
+  async orphanedMetaSubscriptions() {
+    const rows = await prismaUnscoped.channelAccount.findMany({
+      where: {
+        channelType: { in: ['WHATSAPP', 'FACEBOOK_MESSENGER', 'INSTAGRAM'] },
+        deletedAt: { not: null },
+        credentialsEnc: { not: null },
+      },
+      select: {
+        id: true, organizationId: true, name: true, channelType: true,
+        credentialsEnc: true, deletedAt: true, metadata: true,
+      },
+      orderBy: { deletedAt: 'desc' },
+      take: 200,
+    });
+
+    const orgs = rows.length
+      ? await prismaUnscoped.organization.findMany({
+          where: { id: { in: [...new Set(rows.map((r) => r.organizationId))] } },
+          select: { id: true, name: true },
+        })
+      : [];
+    const orgName = new Map(orgs.map((o) => [o.id, o.name]));
+
+    return rows.flatMap((row) => {
+      let credentials: Record<string, string | undefined>;
+      try {
+        credentials = JSON.parse(decrypt(row.credentialsEnc!)) as Record<string, string | undefined>;
+      } catch {
+        return [];
+      }
+      const providerId = credentials.wabaId ?? credentials.pageId ?? credentials.instagramAccountId ?? null;
+      /* No provider id means there was never a subscription to leave behind. */
+      if (!providerId) return [];
+      const metadata = (row.metadata ?? {}) as Record<string, unknown>;
+      return [{
+        channelId: row.id,
+        organizationId: row.organizationId,
+        organizationName: orgName.get(row.organizationId) ?? 'Unknown business',
+        name: row.name,
+        channelType: row.channelType,
+        providerId,
+        providerLabel: typeof metadata.wabaName === 'string' ? metadata.wabaName
+          : typeof metadata.displayPhoneNumber === 'string' ? metadata.displayPhoneNumber : null,
+        disconnectedAt: row.deletedAt,
+        /* Without a token Meta cannot be told; the operator must use Business Settings. */
+        hasUsableToken: Boolean(credentials.accessToken ?? credentials.pageAccessToken),
+      }];
+    });
+  },
+
+  /** Ask Meta to detach one of them. Reports what Meta said; never throws for it. */
+  async detachMetaSubscription(channelId: string) {
+    const row = await prismaUnscoped.channelAccount.findUnique({
+      where: { id: channelId },
+      select: { id: true, name: true, organizationId: true, channelType: true, credentialsEnc: true },
+    });
+    if (!row) throw new NotFoundError('Channel account');
+    if (!row.credentialsEnc) {
+      return { channelId, ok: false, detail: 'This channel holds no credentials, so Meta cannot be told.' };
+    }
+    const credentials = JSON.parse(decrypt(row.credentialsEnc)) as Record<string, string | undefined>;
+    const remote = await unsubscribeWebhooks({ channelType: row.channelType, credentials });
+    logger.info(
+      { channelId, organizationId: row.organizationId, ok: remote.ok },
+      'Platform operator detached a Meta subscription',
+    );
+    return { channelId, name: row.name, organizationId: row.organizationId, ...remote };
   },
 };

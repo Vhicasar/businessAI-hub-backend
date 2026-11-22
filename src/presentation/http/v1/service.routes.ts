@@ -11,7 +11,7 @@ import { migrationSchema, planMigrationService } from '../../../application/bill
 import { newVersionSchema, planVersionAdmin } from '../../../application/billing/plan-version-admin.service';
 import { getActivePaymentProvider } from '../../../infrastructure/payments';
 import { mailer } from '../../../infrastructure/mail/mailer';
-import { platformMonitoringService, platformAdminService } from '../../../application/monitoring/platform-monitoring.service';
+import { platformMonitoringService, platformAdminService, platformChannelService } from '../../../application/monitoring/platform-monitoring.service';
 import { kycService } from '../../../application/identity/kyc.service';
 import { reviewKycSchema } from '../../../application/identity/identity.dto';
 import { rewardCampaigns } from '../../../application/rewards/reward-campaign.service';
@@ -713,6 +713,15 @@ serviceRoutes.post(
     res.json({ success: true, data });
   }),
 );
+
+// ── Meta subscriptions left behind by a disconnect (cross-tenant) ─────────
+serviceRoutes.get('/channels/meta-subscriptions', wrap(async (_req, res) => {
+  res.json({ success: true, data: await platformChannelService.orphanedMetaSubscriptions() });
+}));
+
+serviceRoutes.post('/channels/meta-subscriptions/:id/detach', wrap(async (req, res) => {
+  res.json({ success: true, data: await platformChannelService.detachMetaSubscription(req.params.id as string) });
+}));
 
 // ── AI monitoring, compliance, feature flags, support (System Bible II §3) ─
 

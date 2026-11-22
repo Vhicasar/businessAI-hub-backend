@@ -20,6 +20,7 @@ import { prismaUnscoped as db } from '../../src/infrastructure/database/prisma';
 import { requestContext } from '../../src/shared/context';
 import { encrypt } from '../../src/shared/crypto';
 import { channelsService } from '../../src/application/inbox/channels.service';
+import { platformChannelService } from '../../src/application/monitoring/platform-monitoring.service';
 
 let passed = 0, failed = 0;
 const check = (n: string, ok: boolean, d = '') => {
@@ -175,6 +176,28 @@ async function main() {
   ).catch(() => { crossTenant = true; });
   check('and another business cannot detach this one\u2019s account', crossTenant);
   await db.organization.delete({ where: { id: otherOrg.id } }).catch(() => {});
+
+  // ── What the platform operator sees across every business ─────────────
+  console.log('\nThe cross-tenant view the Super Admin acts on');
+  deletes.length = 0;
+  const listed = await platformChannelService.orphanedMetaSubscriptions();
+  const mine = listed.filter((r) => r.organizationId === orgId);
+  check('disconnected channels that still hold credentials are listed',
+    mine.length >= 2, `${mine.length} listed for this org`);
+  check('each carries the business it belongs to',
+    mine.every((r) => r.organizationName && r.organizationName !== 'Unknown business'));
+  check('and the account id Meta knows it by',
+    mine.every((r) => typeof r.providerId === 'string' && r.providerId.length > 0));
+  check('a channel that never had a provider id is left out',
+    !mine.some((r) => r.name === 'bare'),
+    mine.map((r) => r.name).join(','));
+  check('whether a token is still usable is stated, not guessed',
+    mine.every((r) => typeof r.hasUsableToken === 'boolean'));
+
+  const target = mine.find((r) => r.name === 'wa');
+  const detached = await platformChannelService.detachMetaSubscription(target!.channelId);
+  check('the operator can detach one by channel, across tenants', detached.ok === true, detached.detail);
+  check('and Meta was actually asked', deletes.length === 1, `${deletes.length} calls`);
 
   await cleanup();
   console.log(`\n${passed} passed, ${failed} failed`);
