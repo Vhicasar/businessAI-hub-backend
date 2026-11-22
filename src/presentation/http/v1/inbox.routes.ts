@@ -364,7 +364,30 @@ inboxRoutes.delete(
   '/channels/:id',
   requirePermission('inbox.manage_channels', 'settings.manage_integrations'),
   wrap(async (req, res) => {
-    await channelsService.disconnect(req.params.id as string);
-    res.json({ success: true, data: { message: 'Channel disconnected' } });
+    /*
+     * The outcome is returned, not swallowed: disconnecting always succeeds
+     * locally, but Meta may refuse to detach the app, and the business needs
+     * to be told so they can finish the job in Business Settings.
+     */
+    const result = await channelsService.disconnect(req.params.id as string);
+    res.json({
+      success: true,
+      data: {
+        ...result,
+        message: result.metaDetached
+          ? 'Channel disconnected'
+          : 'Channel disconnected here, but still attached at Meta',
+      },
+    });
+  })
+);
+
+/** Clear an app Meta still lists against a WABA, Page or Instagram account. */
+inboxRoutes.post(
+  '/channels/meta/detach',
+  requirePermission('inbox.manage_channels', 'settings.manage_integrations'),
+  validate({ body: z.object({ providerId: z.string().trim().min(1).max(100) }) }),
+  wrap(async (req, res) => {
+    res.json({ success: true, data: await channelsService.detachMetaSubscription(req.body) });
   })
 );

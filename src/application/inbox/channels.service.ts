@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
-import { ConflictError, NotFoundError } from '../../shared/errors';
+import { ConflictError, NotFoundError, ValidationError } from '../../shared/errors';
 import { prisma, prismaUnscoped } from '../../infrastructure/database/prisma';
 import { decrypt, encrypt } from '../../shared/crypto';
 import { env } from '../../shared/config/env';
@@ -9,6 +9,7 @@ import {
   oauthUnavailableReason,
   subscribeWebhooks,
   supportsOAuth,
+  unsubscribeWebhooks,
   type ResolvedConnection,
 } from './channel-oauth.service';
 import { capabilitiesFor } from './channel-capabilities';
@@ -634,11 +635,71 @@ export const channelsService = {
     return updated;
   },
 
+  /**
+   * Detach an app that is still attached at Meta after the fact.
+   *
+   * For the connections disconnected before the unsubscribe existed, and for
+   * the ones where Meta was unreachable at the time. Both leave the same
+   * residue: the business removed the channel here, Meta still lists the app
+   * against their WABA or Page, and nothing in the product can clear it.
+   *
+   * The stored credentials are reused rather than asking anyone to paste a
+   * token — a disconnected row keeps them, which is exactly what makes this
+   * possible. The search is scoped to the caller's own organization, so one
+   * business cannot detach another's account by guessing an id.
+   */
+  async detachMetaSubscription(input: { providerId: string }) {
+    const providerId = input.providerId.trim();
+    if (!providerId) throw new ValidationError('Give the WhatsApp Business Account, Page or Instagram account id to detach.');
+
+    /*
+     * The scoped client injects organizationId but not deletedAt, so this
+     * sees disconnected rows — which is the whole point here.
+     */
+    const accounts = await prisma.channelAccount.findMany({
+      select: { id: true, name: true, channelType: true, credentialsEnc: true, metadata: true },
+    });
+
+    for (const account of accounts) {
+      if (!account.credentialsEnc) continue;
+      let credentials: Record<string, string | undefined>;
+      try {
+        credentials = JSON.parse(decrypt(account.credentialsEnc)) as Record<string, string | undefined>;
+      } catch {
+        continue;
+      }
+      const matches = [credentials.wabaId, credentials.pageId, credentials.instagramAccountId]
+        .some((id) => id === providerId);
+      if (!matches) continue;
+
+      const remote = await unsubscribeWebhooks({ channelType: account.channelType, credentials });
+      await recordChannelEvent(account.id, `Meta detach retried — ${account.name}`, {
+        body: remote.detail,
+        metadata: { channelType: account.channelType, providerId, metaDetached: remote.ok },
+      });
+      return { matched: true, channelId: account.id, name: account.name, ...remote };
+    }
+
+    throw new NotFoundError(
+      'A channel of this business holding that WhatsApp Business Account, Page or Instagram account id',
+    );
+  },
+
   async disconnect(accountId: string) {
     const account = await prisma.channelAccount.findFirst({
       where: { id: accountId, deletedAt: null },
     });
     if (!account) throw new NotFoundError('Channel account');
+
+    /*
+     * Read the credentials before the row is torn down — the update below
+     * clears the routing ids, and the unsubscribe needs the WABA or Page id
+     * that identifies this connection to Meta.
+     */
+    const credentials = account.credentialsEnc
+      ? (JSON.parse(decrypt(account.credentialsEnc)) as Record<string, string | undefined>)
+      : {};
+
     await prisma.channelAccount.update({
       where: { id: accountId },
       data: {
@@ -656,13 +717,36 @@ export const channelsService = {
         metaInstagramAccountId: null,
       },
     });
+    /*
+     * Detach the app at Meta too.
+     *
+     * Done after the local state is settled, and never allowed to fail the
+     * disconnect: somebody who has asked to end a connection must not be held
+     * in it because Meta is unreachable or the token has already expired. What
+     * actually happened is reported back so the screen can say whether there
+     * is anything left to do by hand.
+     */
+    const remote = await unsubscribeWebhooks({ channelType: account.channelType, credentials });
+
     await recordChannelEvent(accountId, `Channel disconnected — ${account.name}`, {
-      body: 'Messages will no longer arrive from this channel. Its conversation history is kept.',
+      body: remote.ok
+        ? `Messages will no longer arrive from this channel. Its conversation history is kept. ${remote.detail}`
+        : `Messages will no longer arrive from this channel. Its conversation history is kept. ${remote.detail} `
+          + 'Remove it in Meta Business Settings to detach it completely.',
       metadata: {
         previous: { isActive: true },
         next: { isActive: false },
         channelType: account.channelType,
+        metaDetached: remote.ok,
       },
     });
+
+    return {
+      id: accountId,
+      status: 'DISCONNECTED' as const,
+      /** Whether Meta was told, so the UI can ask for a manual tidy-up when not. */
+      metaDetached: remote.ok,
+      metaDetail: remote.detail,
+    };
   },
 };

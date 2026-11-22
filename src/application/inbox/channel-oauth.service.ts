@@ -794,6 +794,69 @@ async function resolvePage(
  * Without this Meta accepts the connection and then sends nothing, which is
  * the failure mode that looks exactly like "it is connected but not working".
  */
+/**
+ * Tell Meta to stop sending us this account's messages.
+ *
+ * The mirror of `subscribeWebhooks`, and it was missing: disconnecting a
+ * channel cleared our own routing ids and nothing else, so the app stayed
+ * attached to the WABA in Meta's Business Settings. The business saw a channel
+ * they had removed still listed as connected, Meta kept delivering webhooks we
+ * then dropped as unknown, and they had no way to detach it except by hand.
+ *
+ * Deliberately best-effort. A business must always be able to disconnect:
+ * the token may already be dead, the app may already have been removed at
+ * Meta, or Meta may simply be down. None of that should trap somebody in a
+ * connection they have asked to end, so this reports what happened and never
+ * throws.
+ *
+ * The access token is NOT revoked. One Meta token can cover several WABAs and
+ * Pages, so revoking it to disconnect one channel would silently break the
+ * others that share it.
+ */
+export async function unsubscribeWebhooks(input: {
+  channelType: ChannelType;
+  credentials: Record<string, string | undefined>;
+}): Promise<{ ok: boolean; detail: string }> {
+  const { channelType, credentials } = input;
+
+  const target =
+    channelType === 'WHATSAPP' && credentials.wabaId
+      ? { url: `${graph()}/${credentials.wabaId}/subscribed_apps`, token: credentials.accessToken, label: 'WhatsApp Business Account' }
+      : channelType === 'FACEBOOK_MESSENGER' && credentials.pageId
+        ? { url: `${graph()}/${credentials.pageId}/subscribed_apps`, token: credentials.pageAccessToken ?? credentials.accessToken, label: 'Facebook Page' }
+        : channelType === 'INSTAGRAM' && credentials.instagramAccountId
+          ? { url: `${env.instagram.graphUrl}/${credentials.instagramAccountId}/subscribed_apps`, token: credentials.accessToken, label: 'Instagram account' }
+          : null;
+
+  if (!target) return { ok: true, detail: 'This channel has nothing subscribed at Meta.' };
+  if (!target.token) {
+    return { ok: false, detail: `No usable access token, so the app is still attached to your ${target.label} at Meta.` };
+  }
+
+  try {
+    const res = await fetch(`${target.url}?access_token=${encodeURIComponent(target.token)}`, {
+      method: 'DELETE',
+      signal: AbortSignal.timeout(10_000),
+    });
+    const json = (await res.json().catch(() => ({}))) as { success?: boolean; error?: { message?: string; code?: number } };
+    if (!res.ok) {
+      logger.warn(
+        { channelType, status: res.status, metaCode: json.error?.code },
+        'Meta would not unsubscribe this channel',
+      );
+      return {
+        ok: false,
+        detail: `Meta would not detach the app from your ${target.label}: ${json.error?.message ?? `HTTP ${res.status}`}`,
+      };
+    }
+    logger.info({ channelType }, 'Unsubscribed from Meta webhooks');
+    return { ok: true, detail: `The app was detached from your ${target.label} at Meta.` };
+  } catch (err) {
+    logger.warn({ err, channelType }, 'Could not reach Meta to unsubscribe');
+    return { ok: false, detail: `Could not reach Meta, so the app is still attached to your ${target.label}.` };
+  }
+}
+
 export async function subscribeWebhooks(connection: ResolvedConnection): Promise<void> {
   const { channelType, credentials } = connection;
   const verifySubscription = async (url: string, token: string, errorCode: string) => {
